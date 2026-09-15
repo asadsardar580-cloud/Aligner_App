@@ -1,0 +1,87 @@
+name: CI
+
+# Fast gate on every push. The AI path is NOT here: ToothGroupNetwork needs a
+# 64MB checkpoint that is gitignored, and a build must not depend on a binary
+# no one can fetch. Anything requiring it belongs in ai-integration.yml, run
+# deliberately on a machine that has the weights.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: Python — syntax, structure, geometry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"     # what the project is developed against
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          # Everything the headless suite actually touches. Verified by
+          # inspection: no test file imports torch, open3d or PyQt6 at module
+          # level, so the ~200MB AI wheels are not pulled for a fast gate.
+          # manifold3d and trimesh ARE required — the staged manufacturing
+          # export booleans through them, and three test files exercise it.
+          pip install numpy scipy fastapi uvicorn python-multipart manifold3d trimesh
+          pip install -r requirements-dev.txt
+
+      - name: Syntax — every file must compile
+        run: python -m compileall -q .
+
+      - name: Structure — undefined names, without importing
+        run: python check_structure.py
+
+      - name: Geometry suite
+        # The canonical runner. It forces UTF-8 on its children, which matters:
+        # a test printing "mm³" once died with UnicodeEncodeError AFTER every
+        # assertion in it had passed, reporting a green file as a failure.
+        run: python run_all_tests.py
+
+      - name: pytest
+        run: python -m pytest -q
+
+  frontend:
+    name: Frontend — lint, build, SSR smoke, kinematics pin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # ci, not install: it installs exactly the lockfile and fails if
+      # package.json and the lockfile have drifted, which is the point of
+      # having a lockfile at all.
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run build
+
+      - name: SSR smoke
+        # A `vite build` succeeds on code that throws during RENDER. A
+        # dependency array referencing a const declared further down the
+        # component has white-screened this app three times, and only this
+        # catches it.
+        run: npm run smoke
+
+      - name: Cross-language kinematics pin
+        # Asserts the browser's gizmo algebra still reproduces the backend's
+        # golden matrices to 1e-12, that every staging frame stays rigid, and
+        # that the naive 4x4 lerp alternative MEASURABLY FAILS - proving the
+        # claim rather than asserting it. If this drifts, the viewport and the
+        # exported STL disagree and nothing else would notice.
+        run: node verify-kinematics.mjs

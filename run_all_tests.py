@@ -19,6 +19,7 @@ TESTS = [
     ("label adapter",        os.path.join("tooth_segmentation","tests","test_label_adapter.py")),
     ("api core",             "test_api_core.py"),
     ("case hydration",       "test_hydration.py"),
+    ("clinical validation",  "test_validation.py"),
     ("face order",           "test_face_order.py"),
     ("auto colour",          "test_auto_color.py"),
     ("bleed fix",            "test_bleed_fix.py"),

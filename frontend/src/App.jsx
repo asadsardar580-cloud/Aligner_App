@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
@@ -8,6 +8,7 @@ import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
          toothAxes, deltaFromClinical, clinicalAtStage, stagingFor } from "./toothGizmo";
 import StagingTimeline from "./StagingTimeline";
 import { useStagePlayback } from "./useStagePlayback";
+import ValidationPanel, { PASS, REVIEW, UNKNOWN } from "./ValidationPanel";
 import { PanelGroup, Panel } from "./Panel";
 
 /** Which Wheeler class an FDI number belongs to, for the label next to the slider. */
@@ -571,6 +572,109 @@ export default function App() {
     for (const vId of vertexIds) SELECTED.toArray(attr.array, vId * 3);
     attr.needsUpdate = true;
   };
+
+  /**
+   * The case validation rows, derived from live state.
+   *
+   * Every row must be able to say "not determined". The temptation is to show a
+   * tick when nothing is wrong, but "nothing is wrong" and "nothing was checked"
+   * are different findings and only one of them is reassuring. The antagonist
+   * row is the sharp case: it is UNKNOWN until an opposing arch is loaded, and
+   * a green tick there would claim the bite was verified.
+   */
+  const caseChecks = useMemo(() => {
+    const rows = [];
+    const archNames = Object.keys(sessions);
+    const toothList = Object.values(teeth.current);
+
+    rows.push(archNames.length
+      ? { id: "scans", state: PASS, label: `${archNames.length} arch scan(s) loaded`,
+          detail: archNames.join(", ") }
+      : { id: "scans", state: UNKNOWN, label: "No arch loaded" });
+
+    const health = sessions[active]?.scan_health;
+    if (health) {
+      const nm = health.nonmanifold_edges ?? 0;
+      rows.push({
+        id: "mesh",
+        state: nm > 0 ? REVIEW : PASS,
+        label: nm > 0 ? "Scan has non-manifold edges" : "Mesh integrity",
+        detail: `${health.open_edges ?? 0} open, ${nm} non-manifold. An intraoral scan is an `
+              + `open shell by nature — open edges are its perimeter, not damage.`,
+      });
+    } else {
+      rows.push({ id: "mesh", state: UNKNOWN, label: "Mesh integrity not measured" });
+    }
+
+    rows.push(archFrame
+      ? { id: "reference", state: PASS, label: "Occlusal reference established" }
+      : { id: "reference", state: UNKNOWN,
+          label: "Occlusal reference not set",
+          detail: "Required before any cut — C_res is extrapolated along an axis "
+                + "reconciled against it." });
+
+    rows.push(labels.current[active]
+      ? { id: "segmentation", state: REVIEW, label: "Segmentation present — review advised",
+          detail: "AI tooth identification has no validated accuracy figure in this build. "
+                + "Confirm each FDI before relying on a per-tooth root length.",
+          basis: "software heuristic" }
+      : { id: "segmentation", state: UNKNOWN, label: "Segmentation not run",
+          detail: "FDI is unknown, so root length falls back to the session slider." });
+
+    if (!toothList.length) {
+      rows.push({ id: "teeth", state: UNKNOWN, label: "No teeth extracted yet" });
+    } else {
+      const unnamed = toothList.filter((t) => t.fdi == null).length;
+      rows.push({
+        id: "teeth",
+        state: unnamed ? REVIEW : PASS,
+        label: unnamed ? `${unnamed} of ${toothList.length} teeth unidentified`
+                       : `${toothList.length} tooth/teeth identified`,
+        detail: unnamed ? "An unidentified tooth used the session default root length."
+                        : undefined,
+      });
+      rows.push({ id: "cres", state: PASS, label: "C_res defined for every extracted tooth",
+                  detail: "Each pivot was checked to sit inside the alveolus at cut time." });
+    }
+
+    // Antagonist: UNKNOWN unless an opposing arch exists AND a check has run.
+    const opposing = active === "maxillary" ? "mandibular" : "maxillary";
+    const measured = toothList.filter((t) => t.occlusion);
+    if (!sessions[opposing]) {
+      rows.push({ id: "antagonist", state: UNKNOWN, label: "Antagonist check not available",
+                  detail: `No ${opposing} arch is loaded. This is NOT a finding of no interference.` });
+    } else if (!measured.length) {
+      rows.push({ id: "antagonist", state: UNKNOWN, label: "Antagonist not yet checked",
+                  detail: "Commit a movement to measure clearance against the opposing arch." });
+    } else {
+      const worst = measured.reduce(
+        (m, t) => Math.max(m, t.occlusion?.max_penetration_mm ?? 0), 0);
+      rows.push({
+        id: "antagonist",
+        state: worst > 0.1 ? REVIEW : PASS,
+        label: worst > 0.1 ? `Occlusal interference ${worst.toFixed(2)}mm`
+                           : "No antagonist interference detected",
+        detail: "Nearest-vertex signed distance — approximate, and it cannot see an "
+              + "intersection between sampled vertices.",
+        basis: "software heuristic",
+      });
+    }
+
+    if (staging.total > 0) {
+      rows.push({ id: "staging", state: PASS,
+                  label: `${staging.total} stages planned`,
+                  detail: "Each stage is the prescription scaled and rebuilt, never an "
+                        + "interpolated matrix." });
+    }
+    return rows;
+    // activeTooth and kinematics look unnecessary to the linter and are not.
+    // This reads teeth.current, a REF — React cannot see it mutate, so cutting
+    // or moving a tooth would leave the panel stale forever. These two are the
+    // change signals for exactly those events. eslint cannot know that a ref
+    // read needs an external trigger, so the rule is disabled here rather than
+    // the dependency removed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, active, archFrame, staging, activeTooth, kinematics]);
 
   /**
    * Case stage count = MAX over committed teeth, plus who binds each one.
@@ -1624,6 +1728,8 @@ export default function App() {
             </button>
           </Panel>
         )}
+
+        <ValidationPanel checks={caseChecks} />
 
         {Object.keys(teeth.current).length > 0 && (
           <Panel id="export" step="5" title="Export">

@@ -20,6 +20,20 @@ import stl_io
 from session_store import STORE, SessionExpired
 import cut_guard
 import arch_frame
+import validation
+
+
+def _structured(result):
+    """A refusal that carries its numbers.
+
+    FastAPI serialises a dict detail as {"detail": {...}}, so a client gets the
+    failing check, the metric it measured and the threshold it compared against
+    — instead of a sentence it can only print. Success responses here have
+    always been richly structured; failures collapsing to a bare string was
+    exactly backwards.
+    """
+    return result.as_dict()
+
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 CKPT_FPS = os.path.join(CURRENT_DIR, "ToothGroupNetwork", "ckpts", "0707_cosannealing_val.h5")
@@ -359,8 +373,32 @@ def cut(sid: str, req: CutRequest):
         if extracted is None:
             extracted = np.zeros(len(f), bool)
 
+        # BOUNDS-CHECK BEFORE INDEXING. `sel[ids] = True` with a negative id
+        # silently wraps and selects from the END of the array — a crown built
+        # from the wrong side of the arch, reported as success. An out-of-range
+        # id raised an opaque 500. Both are now a message naming the offender.
+        ids = np.asarray(req.vertex_ids, np.int64)
+        if ids.size:
+            bad = ids[(ids < 0) | (ids >= len(v))]
+            if bad.size:
+                raise HTTPException(422, _structured(
+                    validation.Result("selection").error(
+                        "vertex_ids_in_range", False,
+                        f"{bad.size} vertex id(s) are outside 0..{len(v)-1} "
+                        f"(e.g. {int(bad[0])}). A negative id would wrap and select "
+                        f"from the far end of the arch.",
+                        {"out_of_range_count": int(bad.size),
+                         "first_offender": int(bad[0]),
+                         "mesh_vertices": int(len(v))})))
+
+        root_check = validation.validate_root_length(req.root_length_mm)
+        land_check = validation.validate_landmarks(req.mesial_pt, req.distal_pt)
+        if not (root_check.ok and land_check.ok):
+            raise HTTPException(422, _structured(
+                validation.merge(root_check, land_check, subject="cut request")))
+
         sel = np.zeros(len(v), bool)
-        sel[np.asarray(req.vertex_ids, np.int64)] = True
+        sel[ids] = True
         face_mask = sel[f].all(axis=1)
         if not face_mask.any():
             raise HTTPException(400, "Selection covers no complete face; widen it.")
@@ -375,7 +413,25 @@ def cut(sid: str, req: CutRequest):
                 f"This selection lies entirely inside a tooth that has already been "
                 f"extracted ({overlap} faces). Select a tooth still on the cast.")
 
+        # Measure the selection BEFORE largest_face_component discards the
+        # islands, so the client can be told what was thrown away. This used to
+        # be a silent prune — a selection in five pieces became a crown built
+        # from one of them, with nothing in the response saying so.
+        faces_before_prune = int(face_mask.sum())
         face_mask = cg.largest_face_component(f, face_mask)
+        faces_after_prune = int(face_mask.sum())
+
+        sel_verts = np.unique(f[face_mask])
+        labels_arr = STORE.get(sid, "labels")
+        hist = None
+        if labels_arr is not None and len(labels_arr) == len(v):
+            vals, counts = np.unique(np.asarray(labels_arr)[sel_verts], return_counts=True)
+            hist = {int(k): int(c) for k, c in zip(vals, counts)}
+        selection_check = validation.validate_selection(
+            n_selected_vertices=int(ids.size), n_vertices=int(len(v)),
+            n_selected_faces=faces_before_prune,
+            largest_component_faces=faces_after_prune, label_histogram=hist)
+
         used_verts = np.unique(f[face_mask])
         (cv, cf), (bv, bf) = cg.split_by_face_mask(v, f, face_mask)
 
@@ -425,9 +481,11 @@ def cut(sid: str, req: CutRequest):
         if not cg.is_edge_manifold_closed(cf):
             raise HTTPException(422, "Crown did not close watertight.")
 
+        # Reporting, not gating — see cut_guard.check_crown's docstring. Its two
+        # thresholds have never been measured against real cuts, so they are
+        # surfaced as `crown_advisory` in the response and promoted to refusals
+        # only once there are numbers behind them.
         verdict = cut_guard.check_crown(cv, cf, rim_global_idx, conc)
-        if not verdict["ok"]:
-            raise HTTPException(422, verdict["diagnosis"])
 
         # The arch frame is what makes this biological rather than geometric:
         # the long axis is signed and reconciled against the occlusal plane, so
@@ -449,13 +507,13 @@ def cut(sid: str, req: CutRequest):
         depth = float(-(d @ u_occ))
         lateral = float(np.linalg.norm(d - (d @ u_occ) * u_occ))
         max_lateral = depth * np.tan(np.radians(cg.MAX_AXIS_DEVIATION_DEG)) + 1.0
-        if depth <= 0 or lateral > max_lateral:
-            raise HTTPException(422,
-                f"Derived pivot is not inside the alveolus: C_res sits {depth:.1f}mm "
-                f"apical of the cervical margin and {lateral:.1f}mm off to the side "
-                f"(limit {max_lateral:.1f}mm). Rotating about it would swing the tooth "
-                f"through the arch rather than seating it in the socket. Re-check the "
-                f"selection and the occlusal plane landmarks.")
+        # Finiteness is checked SEPARATELY and FIRST inside validate_pivot.
+        # `depth <= 0 or lateral > max_lateral` looks exhaustive and is not:
+        # every comparison against NaN is False, so a NaN pivot passed straight
+        # through this gate and into a transform matrix.
+        pivot_check = validation.validate_pivot(depth, lateral, max_lateral)
+        if not pivot_check.ok:
+            raise HTTPException(422, _structured(pivot_check))
 
         # Independent second opinion — reconcile_tooth_frame measures the same
         # disagreement without sharing any code with the correction above.
@@ -530,6 +588,13 @@ def cut(sid: str, req: CutRequest):
         STORE.put(sid, f"tooth:{tid}", _rec)
 
         return {"tooth_id": tid, "watertight": True,
+                # What the cut measured but did not refuse over. Warnings here
+                # are real findings — a selection in pieces, a crown that is
+                # mostly gingiva, two labelled teeth in one flood — and the UI
+                # is expected to show them rather than treat success as silence.
+                "validation": _structured(validation.merge(
+                    selection_check, pivot_check, subject="cut")),
+                "crown_advisory": verdict,
                 "fdi": _rec["fdi"],
                 "root_length_mm": float(req.root_length_mm),
                 # THE ROOT IS FABRICATED AND THE CLIENT MUST SHOW IT THAT WAY.
@@ -615,6 +680,17 @@ def kinematics(sid: str, tid: str, req: KinematicsRequest):
             "axis_deviation_deg": t["frame"].get("axis_deviation_deg"),
             "u_bl_points_buccal": t["frame"].get("u_bl_points_buccal"),
             "occlusion": occlusal,
+            # An EXPLICIT state, because `checked: false` was being read as
+            # "no interference" — which is a clinical claim the software never
+            # made. NOT_CHECKED, CLEAR, WARNING, INTERFERENCE and
+            # COMPUTATION_ERROR are five different things and the UI must be
+            # able to tell them apart.
+            "occlusion_state": validation.occlusion_state(
+                checked=occlusal is not None,
+                max_penetration_mm=(occlusal or {}).get("max_penetration_mm"),
+                # The check reports the threshold it actually applied, rather
+                # than the caller assuming a constant that could drift from it.
+                threshold_mm=(occlusal or {}).get("threshold_mm", 0.1)),
             "occlusal_warning": (ANTAGONIST_WARNING if occlusal and occlusal["collides"]
                                  else None)}
 
