@@ -741,7 +741,32 @@ MIN_RIM_RING_RATIO = 0.15     # s1/s0: below this the rim is a LINE, not a ring,
                               # purpose -- see below for why it is the only
                               # singular-value gate here.
 MAX_AXIS_DEVIATION_DEG = 20.0 # how far a tooth may lean from the arch apical
-                              # direction before the software pulls it back.
+
+
+# HOW THE TOOTH'S LONG AXIS IS DERIVED. Two formulations exist and they are NOT
+# equivalent; this selects between them.
+#
+#   "rim_plane"     (DEFAULT, and what every measurement in CLAUDE.md was taken
+#                   against) u_OA is the normal of the best-fit plane through
+#                   the cervical rim, signed occlusally and clamped to
+#                   MAX_AXIS_DEVIATION_DEG of the arch apical direction. u_BL is
+#                   then u_OA x u_MD.
+#
+#   "cross_product" u_MD and u_BL are primary and u_OA = u_MD x u_BL, which is
+#                   the textbook definition of an anatomical triad.
+#
+# WHY THE DEFAULT IS NOT THE TEXTBOOK ONE. u_BL has no independent landmark in a
+# two-click cut - it is derived from the arch frame's buccal direction, which is
+# an ARCH-level quantity, not a per-tooth one. Deriving the per-tooth long axis
+# from it therefore imports the arch's average inclination into every tooth and
+# discards the tooth's own cervical rim, which is the one piece of per-tooth
+# anatomy actually present in the scan. The rim-normal formulation was adopted
+# after the tetherball glitch (CLAUDE.md §5), where an axis taken from crown
+# geometry collapsed on a short broad molar and put C_res outside the tooth.
+#
+# Both are available so the difference can be MEASURED on a real case rather
+# than argued. Change the default only with numbers.
+LONG_AXIS_MODE = "rim_plane"                              # direction before the software pulls it back.
                               # A genuinely tipped molar keeps its inclination;
                               # a noise-dominated axis cannot survive.
 
@@ -1745,6 +1770,7 @@ def derive_frame_from_region(
     rim_verts: np.ndarray,
     arch_frame: dict | None = None,
     max_axis_deviation_deg: float = MAX_AXIS_DEVIATION_DEG,
+    long_axis_mode: str | None = None,
 ) -> dict:
     """
     Anatomical frame needing only TWO clicks, both on the visible labial side.
@@ -1787,6 +1813,45 @@ def derive_frame_from_region(
 
     u_bl = np.cross(u_oa, u_md)
     u_bl = u_bl / np.linalg.norm(u_bl)
+
+    if (long_axis_mode or LONG_AXIS_MODE) == "cross_product":
+        # The textbook triad: u_OA = u_MD x u_BL. u_BL is taken from the arch
+        # frame's buccal direction rather than the rim, so the tooth's own
+        # cervical anatomy does not enter the long axis at all. Re-orthogonalise
+        # in the same order so the basis stays right-handed and unit.
+        # buccal_direction() gives the PER-TOOTH outward radial direction at this
+        # rim. The arch-level u_tra is NOT a substitute and using it was measured
+        # to put the long axis 90 degrees out: buccal for a molar is roughly
+        # +/-u_tra, for an incisor roughly u_sag, and no single arch vector is
+        # buccal for every tooth. Buccal is radial, and radial is per-tooth.
+        u_bl_ref = buccal_direction(rim_centroid, arch_frame)
+        if u_bl_ref is not None:
+            u_bl_ref = np.asarray(u_bl_ref, float)
+            nb = np.linalg.norm(u_bl_ref)
+            if nb > 1e-9:
+                u_bl_ref = u_bl_ref / nb
+                u_bl_ref = u_bl_ref - np.dot(u_bl_ref, u_md) * u_md
+                nb = np.linalg.norm(u_bl_ref)
+                if nb > 1e-9:
+                    u_bl = u_bl_ref / nb
+                    alt = np.cross(u_md, u_bl)
+                    na = np.linalg.norm(alt)
+                    if na > 1e-9:
+                        alt = alt / na
+                        # Keep the occlusal sign the rim established; flipping it
+                        # would put C_res above the crown.
+                        if np.dot(alt, u_oa) < 0:
+                            alt = -alt
+                            u_bl = -u_bl
+                        axis_info = dict(axis_info)
+                        axis_info["axis_mode"] = "cross_product"
+                        axis_info["axis_shift_deg"] = round(float(np.degrees(
+                            np.arccos(np.clip(np.dot(alt, u_oa), -1.0, 1.0)))), 3)
+                        u_oa = alt
+    else:
+        axis_info = dict(axis_info)
+        axis_info["axis_mode"] = "rim_plane"
+        axis_info["axis_shift_deg"] = 0.0
 
     # PIN u_BL TO ANATOMY, NOT TO CLICK ORDER.
     #

@@ -16,13 +16,13 @@ Teeth must move biologically. Meshes must be mathematically watertight for 3D pr
 
 | | Live |
 |---|---|
-| API | **`api_core.py`** — `uvicorn api_core:app`, 14 routes. Launched by `start_backend.bat`. |
+| API | **`api_core.py`** — `uvicorn api_core:app`, 21 routes. Launched by `start_backend.bat`. |
 | Client | **`frontend/src/App.jsx`** — `npm run dev`, launched by `start_frontend.bat`. |
 | Geometry | **`core_geometry.py`** — pure NumPy/SciPy, headless, the engine. |
 | Docs | **`CLAUDE.md`** (this file) and **`README.md`**. No other document is authoritative. |
 
 `app_ui.py` is a legacy PyQt6 desktop shell over the same engine — it runs, but it is not the
-product. **`_archive/` is dead code** (see `_archive/README.md`); as of 2026-09-15 it holds
+product. **`_archive/` is dead code** (see `_archive/README.md`); as of 2026-09-16 it holds
 `server.py`, `HANDOVER.md`, two stale `App.jsx` copies, and the empty root `config.py`/`models.py`
 that used to shadow the real `tooth_segmentation/` modules.
 
@@ -30,8 +30,8 @@ that used to shadow the real `tooth_segmentation/` modules.
 
 ```
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names without importing (61 files)
-python run_all_tests.py                 # CANONICAL runner — 24 entries
+python check_structure.py               # undefined names without importing (67 files)
+python run_all_tests.py                 # CANONICAL runner — 27 entries
 python -m pytest -q                     # runs alongside; both must pass
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 cd frontend && npm run lint && npm run build && npm run smoke
@@ -39,7 +39,9 @@ cd frontend && npm run lint && npm run build && npm run smoke
 
 `npm run smoke` is not optional: a `vite build` succeeds on code that throws during render, and a
 dependency array referencing a later `const` has already white-screened this app twice.
-**Three of the 24 suite entries assert nothing** — treat it as 21 enforcing tests plus 3 reports.
+**Three of the 27 suite entries assert nothing** — treat it as 24 enforcing tests plus 3 reports.
+`npx playwright test` (in `frontend/`) drives the production build; `node frontend/verify-kinematics.mjs`
+pins the browser against the backend at 1e-12 (observed 1.78e-15).
 
 ## 3. ARCHITECTURAL NON-NEGOTIABLES
 Read these rules carefully before writing any code:
@@ -552,7 +554,74 @@ and measured **15.8 s to first paint**, which turns every timeout into a coin fl
 | CI | none | 2 jobs, AI path excluded by design |
 | API routes | 14 | **17** |
 
-## 15. KNOWN OPEN ISSUES
+## 15. RESOLVED: DOMAIN MODEL, CASE FILES, BVH, SELECTABLE LONG AXIS
+
+**three-mesh-bvh was declared and imported nowhere; it is now real, and the number
+says why it had to be.** On 204,800 faces at real arch density, 300 raycasts,
+identical hit results both ways:
+
+| | ms per raycast |
+|---|---|
+| three.js default | **12.974** |
+| three-mesh-bvh | **0.023** (555x) |
+| bounds tree build | 133.4 ms, once per mesh load |
+
+12.97 ms is **78% of a 16.7 ms frame budget** and the hover handler raycasts on
+every pointer move, so the default path could not hold 60 FPS on a real arch
+however fast the renderer was. **Rebuild the tree wherever `setIndex` is called** —
+extraction rewrites the arch index in place, and a stale tree keeps reporting hits
+on triangles that are no longer drawn. The tree is also a separate allocation that
+`geometry.dispose()` does not free. The brush keeps its uniform grid: that answers
+"which vertices lie within r of this point", which a raycast BVH does not accelerate.
+
+**The "< 1e-15" acceptance bar was unachievable and is now 1e-12.** Observed
+agreement is 1.78e-15 — about **8 ULP of 1.0 in float64**, the noise floor for a
+chain of 4x4 products, not slack better code could remove. A bar of 1e-15 fails a
+CORRECT implementation. 1e-12 mm is three orders below any clinical tolerance and
+still catches what this check is for: a convention drift (row vs column major,
+Euler order, pivot handling) moves the error by **orders of magnitude, never by a
+few ULP**. Every run now prints the observed value and its ULP count.
+
+**The domain model is treatment state, and it is kept apart from geometry on
+purpose.** Three layers: the scan (memory-only, never on disk), the plan
+(`domain.py` — prescriptions, FDI, C_res, review flags), and derived visuals
+(crowns, cups, cones — all rederivable, none persisted). **A full case is 602
+bytes with zero geometry keys**, asserted against the real payload rather than
+promised in a comment. A prescription is six numbers and a tooth id; a mesh of
+somebody's dentition is biometric data whether or not a name is attached.
+
+`Case.opposing()` resolves the antagonist **server-side**. It only means anything
+because scanner coordinates are sacred: both arches sit in the same raw R^3 space.
+Had either been re-centred on its own origin — the obvious tidy-up — the collision
+result would be noise that looks like a measurement.
+
+**Case files are Fernet-encrypted, and the threat model is stated rather than
+implied.** It protects a case file copied somewhere it should not be — email,
+synced folder, USB, backup. It does **not** protect against someone with this
+workstation: the key lives beside the data. It is **not** a regulatory control.
+A tampered or truncated file is **refused by the HMAC**, not half-loaded — a
+treatment plan missing teeth is more dangerous than one that will not open.
+
+**Session eviction is no longer silent.** Loading a fifth arch destroyed a case
+and the only evidence was a 404 on the next request, which reads as "expired" and
+sends people to the TTL. `STORE.evictions()` records the last 16.
+
+**Both long-axis derivations now exist, and the naive reading of the textbook one
+is 90 degrees wrong.** `LONG_AXIS_MODE` selects `"rim_plane"` (DEFAULT, unchanged,
+what every measurement here was taken against) or `"cross_product"` (u_OA = u_MD x
+u_BL). Measured on the flat-molar fixture:
+
+* using the arch-level `u_tra` as the buccal reference: **90.000 deg out**
+* using the per-tooth `buccal_direction()`: **0.644 deg** from rim_plane
+
+**Buccal is radial, and radial is per-tooth.** It is roughly ±u_tra for a molar and
+roughly u_sag for an incisor; no single arch-level vector is buccal for every
+tooth. That is why the textbook triad needs a per-tooth reference the arch frame
+alone does not provide — and why the rim-normal form, which uses the tooth's own
+cervical anatomy, was adopted after the tetherball glitch (§5). **Change the
+default only with numbers.**
+
+## 16. KNOWN OPEN ISSUES
 * **RESOLVED 2026-09-15 — the suite is 24/24.** `test_api_core.py` was rewritten against the
   current endpoints and `test_face_order.py` took the one-line `stl_io.parse_stl_bytes` fix. Both
   had been red on a **stale API surface**, never on geometry, which is why nothing downstream ever

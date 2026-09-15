@@ -20,6 +20,7 @@ TESTS = [
     ("api core",             "test_api_core.py"),
     ("case hydration",       "test_hydration.py"),
     ("clinical validation",  "test_validation.py"),
+    ("domain + case file",   "test_domain.py"),
     ("face order",           "test_face_order.py"),
     ("auto colour",          "test_auto_color.py"),
     ("bleed fix",            "test_bleed_fix.py"),

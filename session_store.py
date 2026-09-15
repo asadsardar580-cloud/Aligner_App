@@ -58,6 +58,7 @@ class SessionStore:
         self._max = max_sessions
         self._clock = clock
         self._lock = threading.RLock()
+        self._evictions = []
         self._sessions = {}
 
     # -- lifecycle ---------------------------------------------------------
@@ -75,13 +76,24 @@ class SessionStore:
         with self._lock:
             self._reap()
             if len(self._sessions) >= self._max:
-                # drop the least recently touched rather than refusing —
-                # a clinician mid-case should never be blocked by a stale tab.
+                # Drop the least recently touched rather than refusing — a
+                # clinician mid-case should never be blocked by a stale tab.
                 # `created` breaks ties so eviction is deterministic when two
                 # sessions were touched in the same clock tick.
                 oldest = min(self._sessions.values(),
                              key=lambda s: (s.touched, s.created))
                 self._sessions.pop(oldest.id, None)
+                # RECORD IT. Eviction used to be completely silent, so loading a
+                # fifth arch destroyed a case and the only evidence was a 404 on
+                # the next request that touched it — which reads as "expired"
+                # and sends people looking at the TTL. Treatment state that was
+                # saved to a case file survives this; the scan does not.
+                self._evictions.append({
+                    "session_id": oldest.id, "arch": oldest.arch,
+                    "evicted_at": self._clock(), "reason": "max_sessions",
+                    "max_sessions": self._max,
+                })
+                del self._evictions[:-16]   # keep the tail, not a growing log
             sid = uuid.uuid4().hex
             self._sessions[sid] = _Session(sid, arch, self._clock())
             return sid
@@ -141,6 +153,16 @@ class SessionStore:
             self._sessions.pop(sid, None)
 
     # -- introspection -----------------------------------------------------
+
+    def evictions(self):
+        """Sessions dropped to stay under max_sessions, most recent last.
+
+        Exposed so a client can say "your other arch was closed to make room"
+        instead of letting the user discover it as a 404 that reads like an
+        expiry. Bounded to the last 16 - this is a symptom trail, not a log.
+        """
+        with self._lock:
+            return list(self._evictions)
 
     def stats(self):
         """Serialisable, and deliberately free of anything patient-identifying."""

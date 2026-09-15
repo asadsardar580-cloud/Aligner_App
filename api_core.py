@@ -21,6 +21,8 @@ from session_store import STORE, SessionExpired
 import cut_guard
 import arch_frame
 import validation
+import domain
+import case_store
 
 
 def _structured(result):
@@ -720,6 +722,99 @@ def _jsonable(o):
     if isinstance(o, (list, tuple)):
         return [_jsonable(v) for v in o]
     return o
+
+
+class CaseSaveRequest(BaseModel):
+    """Which live sessions belong to this case, plus an optional label.
+
+    The label is the clinician's own note and MUST NOT be a patient name — the
+    whole persistence design turns on the file carrying a plan, not a person.
+    """
+    case_id: str | None = None
+    label: str = ""
+    sessions: dict[str, str] = {}      # {'upper': sid, 'lower': sid}
+
+
+def _case_from_sessions(sessions: dict, case_id=None, label="") -> domain.Case:
+    """Build a Case by reading what the live sessions already know.
+
+    Nothing new is computed and no geometry is copied — this reads the session
+    keys that already exist and lifts the clinical decisions out of them.
+    """
+    c = domain.Case(label=label)
+    if case_id:
+        c.case_id = case_id
+    for arch_name, sid in (sessions or {}).items():
+        try:
+            v = STORE.require(sid, "verts")
+            f = STORE.require(sid, "faces")
+        except SessionExpired:
+            continue
+        a = domain.Arch(
+            arch=STORE.arch(sid), session_id=sid,
+            has_occlusal_frame=STORE.get(sid, "arch_frame") is not None,
+            has_segmentation=STORE.get(sid, "labels") is not None,
+            scan_vertex_count=int(len(v)), scan_face_count=int(len(f)))
+        for key in STORE.keys(sid):
+            if not key.startswith("tooth:"):
+                continue
+            t = STORE.get(sid, key)
+            clin = t.get("clinical") or {}
+            a.teeth[key.split(":", 1)[1]] = domain.Tooth(
+                tooth_id=key.split(":", 1)[1], arch=a.arch, fdi=t.get("fdi"),
+                root_length_mm=float(t["root_length_mm"]),
+                c_res=np.asarray(t["c_res"], float).tolist(),
+                prescription=domain.Prescription(**{
+                    k: float(clin.get(k, 0.0)) for k in
+                    ("tip_deg", "torque_deg", "rotation_deg", "d_md", "d_bl", "d_oa")}))
+        c.arches[a.arch] = a
+    return c
+
+
+@app.post("/api/case")
+def save_case(req: CaseSaveRequest):
+    """Persist TREATMENT STATE to an encrypted local file. Opt-in, never automatic.
+
+    The scan is not written and never will be: restoring re-attaches it by
+    reloading the STL. See case_store.py for what the encryption does and does
+    not protect against — it is stated there rather than implied.
+    """
+    c = _case_from_sessions(req.sessions, req.case_id, req.label)
+    if not c.arches:
+        raise HTTPException(404, "None of those sessions are still live; nothing to save.")
+    try:
+        path = case_store.save(c)
+    except OSError as e:
+        raise HTTPException(500, f"Could not write the case file: {e}")
+    return {"case_id": c.case_id, "saved": True, "bytes": os.path.getsize(path),
+            "tooth_count": len(c.all_teeth()), "stage_count": c.stage_count(),
+            "scan_persisted": False,
+            "note": "Treatment state only. Reload the arch scans to continue."}
+
+
+@app.get("/api/case")
+def list_cases():
+    return {"cases": case_store.list_cases()}
+
+
+@app.get("/api/case/{case_id}")
+def get_case(case_id: str):
+    try:
+        c = case_store.load(case_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No saved case {case_id!r}.")
+    except ValueError as e:
+        # Failed its integrity check, or a newer schema. Refuse loudly.
+        raise HTTPException(422, str(e))
+    d = c.to_dict()
+    d["binding_teeth"] = c.binding_teeth()
+    d["needs_scan_reload"] = True
+    return d
+
+
+@app.delete("/api/case/{case_id}")
+def delete_case(case_id: str):
+    return {"deleted": bool(case_store.delete(case_id))}
 
 
 @app.get("/api/session/{sid}")
