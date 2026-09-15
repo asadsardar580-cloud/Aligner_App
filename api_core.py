@@ -23,6 +23,7 @@ import arch_frame
 import validation
 import domain
 import case_store
+import space_analysis
 
 
 def _structured(result):
@@ -851,6 +852,52 @@ def get_session(sid: str):
         "tooth_count": n_teeth,
         "extracted_face_count": 0 if extracted is None else int(extracted.sum()),
     }
+
+
+@app.get("/api/session/{sid}/space-analysis")
+def space_analysis_report(sid: str, tolerance_mm: float = space_analysis.DEFAULT_WIDTH_TOLERANCE_MM,
+                          noise_floor_mm: float = space_analysis.NOISE_FLOOR_MM,
+                          contact_mm: float = space_analysis.CONTACT_MM):
+    """Crown widths against Wheeler, and interproximal clearance between crowns.
+
+    Wires up measuring machinery that has existed since the caliper work and was
+    called by nothing but a test: local_arch_tangent, measure_mesiodistal_width
+    and validate_against_anatomy. The arithmetic is unchanged; this is the wiring.
+
+    Thresholds are query parameters because they are judgements about how much
+    individual variation to tolerate, not constants. Nothing here blocks an
+    export — a REVIEW flag means look at the segmentation.
+    """
+    try:
+        STORE.require(sid, "verts")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+
+    af = STORE.get(sid, "arch_frame")
+    if af is None:
+        raise HTTPException(409,
+            "Space analysis needs the occlusal reference: the mesiodistal "
+            "direction is derived per tooth from the arch curve, which is "
+            "defined in that frame. Establish the occlusal plane first.")
+
+    teeth = []
+    for key in STORE.keys(sid):
+        if not key.startswith("tooth:"):
+            continue
+        t = STORE.get(sid, key)
+        teeth.append({"tooth_id": key.split(":", 1)[1], "fdi": t.get("fdi"),
+                      "verts": t["cv"]})
+    if not teeth:
+        return {"crowns_measured": 0, "widths": {"teeth": []},
+                "interproximal": {"contacts": []},
+                "summary": "No crowns have been extracted yet."}
+
+    v = STORE.require(sid, "verts")
+    out = space_analysis.analyse(
+        teeth, STORE.arch(sid), np.asarray(af["u_occ"], float), v.mean(axis=0),
+        tolerance_mm=tolerance_mm, noise_floor_mm=noise_floor_mm,
+        contact_mm=contact_mm)
+    return _jsonable(out)
 
 
 @app.get("/api/session/{sid}/frame")
