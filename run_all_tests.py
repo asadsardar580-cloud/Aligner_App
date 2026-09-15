@@ -22,6 +22,8 @@ TESTS = [
     ("clinical validation",  "test_validation.py"),
     ("domain + case file",   "test_domain.py"),
     ("space analysis/IPR",   "test_space_analysis.py"),
+    ("segmentation review",  "test_segmentation_review.py"),
+    ("attachments + CBCT",   "test_attachments.py"),
     ("face order",           "test_face_order.py"),
     ("auto colour",          "test_auto_color.py"),
     ("bleed fix",            "test_bleed_fix.py"),

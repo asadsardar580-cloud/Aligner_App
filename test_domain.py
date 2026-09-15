@@ -280,6 +280,65 @@ def test_both_long_axis_derivations_are_available_and_measured():
           f"fixture, default stays rim_plane")
 
 
+
+# ------------------------------------------------------------ audit trail ---
+
+def test_audit_records_decisions_and_refuses_patient_data():
+    """An entry says WHAT changed and by how much. It cannot be made to say
+    who the patient is, and that is enforced at runtime, not by convention."""
+    import audit
+    c = domain.Case()
+    c.record(audit.TOOTH_CUT, arch="lower", tooth_id="t1", fdi=36,
+             detail="wand flood", values={"root_length_mm": 9.0})
+    c.record(audit.PRESCRIPTION_COMMITTED, tooth_id="t1", fdi=36,
+             values={"tip_deg": 6.5, "d_md": 0.4})
+
+    assert len(c.audit_entries) == 2
+    assert c.trail().summary()["by_action"] == {
+        audit.TOOTH_CUT: 1, audit.PRESCRIPTION_COMMITTED: 1}
+    assert c.trail().summary()["telemetry"].startswith("none")
+
+    # Geometry and identifiers are refused, checked on the real payload.
+    for bad in ({"verts": [[0, 0, 0]]}, {"patient_name": "x"}, {"filename": "a.stl"}):
+        try:
+            c.record(audit.TOOTH_CUT, values=bad)
+            raise AssertionError(f"audit accepted {list(bad)}")
+        except ValueError as e:
+            assert "Refusing to audit" in str(e)
+
+    # An unknown verb is refused too: a typo must not create a silent category.
+    try:
+        c.record("deleted_everything")
+        raise AssertionError("an unknown audit action was accepted")
+    except ValueError as e:
+        assert "vocabulary is closed" in str(e)
+    print("PASS  audit records 2 decisions; geometry, identifiers and typos all refused")
+
+
+def test_audit_survives_the_encrypted_round_trip_and_is_bounded():
+    import audit
+    tmp = _isolated_store()
+    try:
+        c = _populated_case()
+        for i in range(5):
+            c.record(audit.PRESCRIPTION_COMMITTED, tooth_id="t1", fdi=33,
+                     values={"tip_deg": float(i)})
+        case_store.save(c)
+        back = case_store.load(c.case_id)
+        assert len(back.audit_entries) == 5, "the decision record did not persist"
+        assert back.trail().entries(action=audit.PRESCRIPTION_COMMITTED)[0].fdi == 33
+
+        # Bounded: a clinical workstation must not accumulate an unbounded log.
+        t = audit.AuditTrail(max_entries=3)
+        for i in range(10):
+            t.record(audit.TOOTH_RESET, tooth_id=f"t{i}")
+        assert len(t.to_list()) == 3, "the trail is not bounded"
+        assert t.entries()[-1].tooth_id == "t9", "bounding dropped the NEWEST entries"
+        print("PASS  audit persists through encryption and bounds to the newest entries")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_fdi_drives_tooth_class_and_wheeler_root()
     test_the_shipped_manifest_bug_is_now_detectable()
@@ -294,4 +353,6 @@ if __name__ == "__main__":
     test_listing_reports_that_a_scan_reload_is_required()
     test_session_eviction_is_recorded_instead_of_silent()
     test_both_long_axis_derivations_are_available_and_measured()
+    test_audit_records_decisions_and_refuses_patient_data()
+    test_audit_survives_the_encrypted_round_trip_and_is_bounded()
     print("\nALL DOMAIN + PERSISTENCE TESTS PASSED")

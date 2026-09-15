@@ -33,6 +33,8 @@ from __future__ import annotations
 import math
 import time
 import uuid
+
+import audit
 from dataclasses import dataclass, field, asdict
 
 SCHEMA_VERSION = 1
@@ -160,6 +162,20 @@ class Case:
     label: str = ""                        # clinician's own note. NEVER a name.
     arches: dict[str, Arch] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
+    # The decision record, persisted with the plan. Never leaves the machine.
+    audit_entries: list = field(default_factory=list)
+
+    # ---- audit -------------------------------------------------------------
+    def trail(self) -> "audit.AuditTrail":
+        return audit.AuditTrail.from_list(self.audit_entries)
+
+    def record(self, action: str, **fields):
+        """Append to the decision record and keep it on the case."""
+        t = self.trail()
+        e = t.record(action, **fields)
+        self.audit_entries = t.to_list()
+        self.updated = time.time()
+        return e
 
     # ---- relationships the server could not previously resolve -------------
     def opposing(self, arch: str) -> Arch | None:
@@ -244,4 +260,5 @@ class Case:
                     created=d.get("created", time.time()),
                     updated=d.get("updated", time.time()),
                     label=d.get("label", ""), arches=arches,
+                    audit_entries=d.get("audit_entries") or [],
                     schema_version=min(v, SCHEMA_VERSION))

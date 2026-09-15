@@ -24,6 +24,7 @@ import validation
 import domain
 import case_store
 import space_analysis
+import segmentation_review
 
 
 def _structured(result):
@@ -852,6 +853,42 @@ def get_session(sid: str):
         "tooth_count": n_teeth,
         "extracted_face_count": 0 if extracted is None else int(extracted.sum()),
     }
+
+
+@app.get("/api/session/{sid}/segmentation-review")
+def segmentation_review_report(sid: str):
+    """Per-tooth verdict on the last /segment run: PASS, REVIEW or FAIL.
+
+    /segment returns a per-vertex FDI array and the client colours the arch with
+    it. Until now nothing between the model and the clinician ever asked whether
+    a region is plausibly one tooth, and ToothCandidate.confidence - which has
+    existed since the segmentation package was written - is assigned nowhere, so
+    its needs_review flag was unconditionally True.
+
+    The confidence returned here is NOT a model probability. ToothGroupNetwork
+    emits no calibrated uncertainty and inventing one would be worse than having
+    none; this is weighted agreement over independently checkable geometric
+    facts, and every contributing factor comes back with the score.
+    """
+    try:
+        v = STORE.require(sid, "verts")
+        f = STORE.require(sid, "faces")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+
+    labels = STORE.get(sid, "labels")
+    if labels is None:
+        raise HTTPException(409,
+            "Segmentation has not been run for this session, so there is nothing "
+            "to review. POST /api/session/{sid}/segment first.")
+
+    af = STORE.get(sid, "arch_frame")
+    occ = np.asarray(af["u_occ"], float) if af else None
+    out = segmentation_review.review_segmentation(
+        labels, v, f, STORE.arch(sid),
+        arch_centre=(v.mean(axis=0) if af is not None else None),
+        occlusal_axis=occ)
+    return _jsonable(out)
 
 
 @app.get("/api/session/{sid}/space-analysis")

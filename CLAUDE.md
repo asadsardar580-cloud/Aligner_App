@@ -621,7 +621,62 @@ alone does not provide — and why the rim-normal form, which uses the tooth's o
 cervical anatomy, was adopted after the tetherball glitch (§5). **Change the
 default only with numbers.**
 
-## 16. KNOWN OPEN ISSUES
+## 16. RESOLVED: SPACE ANALYSIS, SEGMENTATION REVIEW, ATTACHMENTS, AUDIT, CBCT HOOKS
+
+**Phase 3 was wiring, not new geometry.** `local_arch_tangent`,
+`measure_mesiodistal_width`, `validate_against_anatomy` and Wheeler's tables had
+existed since the caliper work and were called by nothing but `test_caliper.py`.
+`GET /space-analysis` now reports per-crown mesiodistal width on the occlusal 40%
+along the tooth's OWN arch tangent. Measured: a 7.0mm block reads 7.0mm; a doubled
+crown reads 14.0mm against Wheeler's 6.5 and is flagged **REVIEW with the likely
+cause** ("often two teeth merged"), not just the number.
+
+**FOUR states, because two would lie.** `UNKNOWN` = no FDI, so no comparison is
+possible. `UNMEASURABLE` = the crown centroid coincides with the arch centre,
+where the radial direction and therefore the mesiodistal axis are undefined —
+**returning 0.0 there would read as a measured zero-width crown**. `reliable`
+stays False unless a full dentition was scored: a pass rate over four teeth is not
+a grade for an arch.
+
+**IPR measures a gap in a mesh; it does not prescribe enamel reduction.** Every
+contact row states that a vertex-to-vertex minimum **OVERESTIMATES** the true gap —
+on a triangulated surface the closest points generally lie inside faces, not at
+vertices. "IPR Contact 11-21: 0.22 mm" reads far more precise than it is.
+
+**Segmentation confidence is weighted agreement, NOT a model probability.**
+ToothGroupNetwork emits no calibrated uncertainty and inventing one would be worse
+than having none. `GET /segmentation-review` scores independently checkable facts —
+connectedness, size, extent, FDI-belongs-to-arch, width vs Wheeler — and **returns
+every contributing factor with the score**, so a clinician can disagree with a
+factor rather than only with a number. Measured: FDI 16 on a lower arch →
+REVIEW at 0.706 naming `fdi_belongs_to_arch`; a split label → 65% largest island.
+`ToothCandidate.confidence` had been assigned nowhere since the package was
+written, so its `needs_review` was unconditionally True — **a review flag that is
+always on is the same as no flag.**
+
+**An attachment's ORIENTATION is its function, so it is built in the tooth's
+frame.** A vertical rectangle resists rotation because it stands along u_OA.
+Measured: upright tooth extent `[2, 1, 3]`, same attachment on a 45° tooth
+`[2, 2.83, 2.83]` — it follows the tooth, not world Z. A world-axis block would be
+"vertical" only for teeth that happen to stand upright in scanner space, which is
+none of them. Fused through the same `manifold3d` path the export uses, with the
+same crumb filter; **two bodies means it is not bonded** and is refused.
+
+**The audit trail cannot be made to record a patient.** A closed action
+vocabulary (a typo cannot create a silent category) and a runtime denylist checked
+on every append: geometry keys, names, DOB, MRN and filenames are all refused.
+Bounded to the newest 500 entries — an unbounded log on a clinical workstation is
+a disk incident, and one nobody prunes is one nobody reads. Zero telemetry.
+
+**CBCT is an INTERFACE, and every entry point raises.** A stub returning a cone
+from `segment_roots` would be the most dangerous thing in this repo: the app draws
+Wheeler cones as translucent wireframe labelled *"virtual root (estimated)"*
+precisely so they cannot be mistaken for imaging, and output from a function of
+that name would reasonably be believed to come from a scanner. Registration must
+transform **the CBCT into scanner space, never the scan** — rule 3.1 — and a 2mm
+residual moves C_res by 2mm.
+
+## 17. KNOWN OPEN ISSUES
 * **RESOLVED 2026-09-15 — the suite is 24/24.** `test_api_core.py` was rewritten against the
   current endpoints and `test_face_order.py` took the one-line `stl_io.parse_stl_bytes` fix. Both
   had been red on a **stale API surface**, never on geometry, which is why nothing downstream ever
