@@ -1,148 +1,152 @@
-# Clinical Micro-Planner
+# Clinical Micro-Planner — Project Aligner
 
-Single-step clear aligner planning: load an arch scan, isolate one tooth,
-move it with C_res-pivoted biomechanics, export print-ready STLs.
+A clear aligner CAD workstation. Load an intraoral arch scan, establish an occlusal reference,
+isolate a tooth, move it with C_res-pivoted biomechanics, stage the movement, and export
+print-ready STLs.
+
+> **Status: clinical-planning prototype.** It is not a validated medical device and has not
+> undergone clinical verification, regulatory review, or evaluation against a real patient dataset.
+> Passing unit tests means the geometry is self-consistent — it does not mean a movement is
+> clinically correct. Treat every threshold in the UI as a software heuristic unless it is
+> explicitly labelled otherwise.
 
 ---
 
-## Quick start
+## Architecture
+
+```
+frontend/src/App.jsx          React 19 + three.js 0.185, built by Vite
+        |   HTTP to 127.0.0.1:8000, CORS-locked to :5173
+        v
+api_core.py                   THE live FastAPI app — 14 routes
+        |
+        +-- core_geometry.py      5,638 lines. Pure NumPy/SciPy. All geometry
+        |                         and kinematics. No UI imports, fully headless.
+        +-- arch_frame.py         Occlusal reference basis (u_occ/u_sag/u_tra)
+        +-- session_store.py      In-memory, TTL, PHI-conscious
+        +-- stl_io.py             Binary STL reader with exact vertex welding
+        +-- jaw_naming.py         FDI/jaw verification
+        +-- cut_guard.py          Pre-cut heuristics
+        +-- tgn_bridge.py ------> ToothGroupNetwork/   (vendored, PyTorch, CPU)
+        +-- tooth_segmentation/   Classical segmentation package
+```
+
+`app_ui.py` is a **legacy PyQt6 + PyVista desktop shell** over the same geometry engine. It still
+runs, but it is not the product path.
+
+**`_archive/` contains dead code and is not part of the application.** See `_archive/README.md`.
+
+## The invariants that are not negotiable
+
+1. **Scanner coordinates are sacred.** Raw STL vertices are never rotated, re-centred or rescaled.
+   Inter-arch bite registration depends on both arches sharing raw scanner space, and every vertex
+   id already sent to the browser must keep its meaning. "Up" comes from the occlusal reference
+   frame stored as session metadata — never by moving geometry.
+2. **Teeth pivot about the Centre of Resistance**, ~10-13 mm down the root, not about their
+   geometric centre.
+3. **Anatomical axes:** tip = about the buccolingual axis, torque = about the mesiodistal axis,
+   rotation = about the apical axis.
+4. **Matrix conventions:** three.js is column-major, NumPy is row-major. `verify-kinematics.mjs`
+   pins both sides to the same golden matrices — update it and `test_kinematics_frame.py` together.
+5. **Staging interpolates the prescription, never the 4×4.** A component-wise lerp of the matrix is
+   not a rotation; measured, it reaches 1.68e-2 orthogonality error against 4.44e-16 for the
+   parameter path.
+
+Full detail, including the measured regressions behind each one, is in **`CLAUDE.md`** — the
+authoritative architecture document.
+
+---
+
+## Install
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.txt          # runtime
+pip install -r requirements-dev.txt      # pytest, for development
 
-python run_all_tests.py     # confirm the install is sound
-python app_ui.py            # the actual application
+cd frontend
+npm install
 ```
 
----
+Python 3.12 is what this is developed against; 3.10 is the floor (bare PEP-604 unions are used
+without `from __future__ import annotations`).
 
-## What is tested and what is not
+## Run
 
-This distinction matters more than usual here, because the two halves were
-built under different conditions.
-
-**Verified** — `core_geometry.py` and everything in `tooth_segmentation/`.
-Pure NumPy/SciPy, no display required, covered by the suite in
-`run_all_tests.py`. If a result is geometrically wrong, the fault is almost
-certainly here, and you can reproduce it headlessly.
-
-**Not verified by automated test** — `app_ui.py` and `server.py`. PyQt6, VTK
-and Trimesh could not be installed in the environment where these were
-written, so no line of the GUI has ever been executed by their author. They
-are written carefully and instrumented heavily, but expect first-run
-friction there rather than in the geometry.
-
-`check_structure.py` closes part of that gap: it parses files with `ast` to
-catch undefined names without importing them, which `py_compile` cannot do.
-Run it after any edit to `app_ui.py`.
-
----
-
-## Using the application
-
-1. **Load Maxillary STL** — coordinates are never re-centred or rescaled, so
-   inter-arch bite registration is preserved exactly as exported.
-2. Wait for `ready to segment` in the status bar. Curvature analysis runs on
-   a background thread (~2.6s on a 360k-vertex scan).
-3. **Segment Tooth**, then **click once on the tooth**. A blue preview
-   appears immediately.
-4. **Drag "Selection spread"** and watch the preview grow or shrink. The
-   cervical groove acts as a barrier, so a wide range of values all stop at
-   the gumline. Status bar shows the selected fraction — **a single crown is
-   2-10% of the arch.**
-5. Click the **mesial** and **distal** contacts (both visible from one
-   labial view), then **Confirm & Cut**.
-6. Move the sliders. The tooth pivots about the white C_res sphere, not
-   about its own centre.
-
-Log file: `~/micro_planner.log` — records every press, release, cell ID and
-traceback.
-
----
-
-## Layout
+Two terminals, or double-click each script:
 
 ```
-app_ui.py              PyQt6 + PyVista application
-core_geometry.py       All geometry and kinematics. No UI imports.
-check_structure.py     AST-based undefined-name checker
-diagnose.py            Probes which VTK interactor accepts observers
-server.py              Optional FastAPI backend (see transport note below)
-run_all_tests.py       Runs everything
-
-tooth_segmentation/    Automatic multi-tooth segmentation (in progress)
-    config.py          All tunable weights, nothing hard-coded at call sites
-    models.py          PreprocessReport, ToothCandidate, ArchFrame
-    mesh_preprocessor.py
-    normals.py
-    curvature.py
-    arch_geometry.py   PCA orientation, no axis-alignment assumption
-    label_adapter.py   Bridges any pretrained model to the tested pipeline
+start_backend.bat     ->  uvicorn api_core:app on http://127.0.0.1:8000
+start_frontend.bat    ->  vite dev server on   http://localhost:5173
 ```
 
----
+`start_backend.bat` prefers `.venv\Scripts\python.exe`, preflights the required imports, the AI
+checkpoint and the port, and tells you which process holds :8000 if it is taken. A bare
+`python -m uvicorn api_core:app` will fail unless the venv is active — the system Python has none
+of the dependencies.
 
-## Findings worth keeping
+The API answers immediately; the segmentation model loads in a background thread. Watch the
+sidebar's connection badge, or poll `/api/ai/status`.
 
-**Tip and torque were swapped.** Tip rotated about the mesiodistal axis when
-it should rotate about buccolingual. Invisible on screen — the tooth moved
-smoothly and looked correct while pivoting about the wrong anatomical axis.
+## Workflow
 
-**Delaunay capping can produce non-manifold meshes.** On a non-planar margin
-loop it creates chords duplicating existing mesh edges, giving them four
-faces. The mesh then has no open boundary — it passes a naive hole check —
-while being unusable for boolean export. Caps are now validated, with a
-centroid fan as the structurally safe fallback.
+1. **Load** an arch STL (upper and/or lower).
+2. **Occlusal reference** — click left molar cusp, right molar cusp, anterior midline. Required:
+   `/cut` refuses with 409 without it, because C_res would otherwise be extrapolated along a
+   guessed axis.
+3. **Segment** — AI (ToothGroupNetwork, ~4 minutes on a full arch) or manual wand selection.
+4. **Select** a tooth with the wand or brush, set mesial/distal points.
+5. **Cut** — extraction is an index-buffer rewrite; the arch mesh itself is never rebuilt.
+6. **Move** — 3D gizmo or the numeric sidebar. Values are absolute from T0, not nudges.
+7. **Stage** — scrub the timeline from T0 to the planned setup.
+8. **Export** — `/export` for the planned setup, `/export/stages` for fused manufacturing solids.
 
-**Clicking a margin circuit is impossible.** A crown's margin wraps 360
-degrees but a camera sees one side; the picker returns the frontmost visible
-cell, so a "lingual" click silently lands on the labial surface. Replaced
-with region growing, which spreads through mesh connectivity and reaches
-surfaces the camera cannot see.
+## Testing
 
-**Deriving the buccolingual axis from the FA point tilted C_res by 38.7
-degrees** once that point moved to the margin. Measuring between opposing
-landmarks instead brings it to 0.0.
+```powershell
+python -m compileall .                  # syntax, whole tree
+python check_structure.py               # undefined names, without importing (61 files)
+python run_all_tests.py                 # canonical runner — 24 entries
+python -m pytest -q                     # runs alongside; both must pass
+node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 
-**VTK's LeftButtonReleaseEvent never fires** on PyQt6 6.11 / VTK 9.6.2 /
-pyvista 0.48.4. The interactor style claims the left button on press for
-camera rotation and consumes the release. Press comes from VTK, release from
-a Qt event filter.
+cd frontend
+npm run lint
+npm run build
+npm run smoke                           # SSR render of <App/>; catches TDZ crashes a build cannot
+```
 
-**Vectorisation took segmentation from ~8.5s to 0.46s** on a 360k-vertex
-mesh. `np.unique(axis=0)` alone accounted for 1.43s across three call sites;
-actual Dijkstra was 0.02s and was never the bottleneck.
+**`npm run smoke` earns its place.** A `vite build` succeeds on code that throws during render — a
+dependency array referencing a `const` declared further down the component crashed the app to a
+white screen while building cleanly. The smoke test renders `<App/>` in node and catches exactly
+that.
 
----
+**Read `24/24` with a caveat:** three entries (`test_interproximal.py`, `test_auto_color.py`,
+`test_incisal_edge.py`) contain no assertions. They are characterization scripts that print
+measurements and exit 0, so they report PASS regardless. The suite is 21 enforcing tests plus 3
+reports.
 
-## Two decisions to make deliberately
+## Current limitations
 
-**Client-server.** Measured: a full-arch scan is 34.2MB, and a naive
-per-click round trip costs 78s on clinic DSL against 0.46s of local compute
-— 170x slower. `transport_bench.py` reproduces this. If you go remote
-anyway, upload once per session and send only the click coordinates
-thereafter. That is what `server.py` implements.
+- **Segmentation is not solved.** No reproducible mm-accuracy figure exists for the AI path; the
+  numbers quoted in older documents describe the *classical* segmenter, which `/segment` does not
+  use. Do not treat any segmentation output as verified.
+- **Segmentation cannot be cancelled** — ~236 s on a real scan, and `asyncio.to_thread` gives no
+  cancellation point inside the model.
+- **A browser refresh loses the case.** The server holds nearly everything, but several keys are not
+  exposed by any endpoint and the session id lives only in React state. Sessions are in-memory with
+  a sliding 1-hour TTL and a 4-session cap, so a server restart is unrecoverable by design.
+- **The antagonist collision check has never run against a real opposing arch.** `checked: false`
+  means "not checked", never "no interference".
+- **`cut_guard.check_crown` is bypassed** — it computes its metrics and returns `ok=True`
+  unconditionally, so the `/cut` refusal that depends on it is unreachable.
+- No authentication, TLS, authorization or audit logging. **This is a localhost development
+  prototype**; do not expose it to a network.
 
-**Patient data.** Intraoral scans are PHI. A desktop tool keeps them on the
-clinician's machine; the moment they cross a network this becomes a system
-requiring encryption, retention limits, audit logging and a BAA with the
-host. `server.py` is a prototype and is production-ready on none of those
-axes. Also worth keeping the project and any scans out of cloud-synced
-folders such as OneDrive.
+## PHI
 
----
-
-## Not implemented, deliberately
-
-**AI auto-segmentation.** Needs trained weights and a GPU. `label_adapter.py`
-is the integration point: MeshSegNet, ToothGroupNetwork and
-DilatedToothSegNet all emit per-face labels, and everything downstream of
-that is already tested. Check each repository's LICENSE and the underlying
-dataset terms before integrating — academic dental models frequently carry
-non-commercial restrictions, and weights inherit dataset terms.
-
-**Clinical verdicts.** Staging returns numbers, never stoplights or
-recommendations. Every result is computationally generated and requires
-clinician verification. Nothing here claims clinical accuracy.
+Scans are held in memory only and never written to disk. Sessions expire on a timer. Original
+filenames are stored nowhere, because filenames routinely carry patient names. Exports run on
+127.0.0.1 and write only to the local `exports/` directory, with no patient name in any filename.
+`.gitignore` excludes every scan, mesh and derived label file from version control.

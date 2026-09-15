@@ -12,11 +12,37 @@ Not a full linter. It resolves module-level definitions, imports, function
 parameters, assignments, comprehension targets, and builtins, then reports
 any remaining referenced name. Run it after every edit:
 
-    python check_structure.py app_ui.py core_geometry.py server.py
+    python check_structure.py                 # every application file
+    python check_structure.py app_ui.py       # or just the ones you touched
+
+It used to default to two hard-coded files, which made it useless as the
+repo-wide gate it is invoked as. It now walks the tree, skipping the vendored
+network (not ours to police), the archive (dead by definition), and the
+generated export copy.
 """
 import ast
 import builtins
+import os
 import sys
+
+SKIP_DIRS = {
+    ".venv", "node_modules", "__pycache__", ".git", "dist", "ssr_out", "ssr_out2",
+    "_archive",               # dead code, kept for reference only
+    "Aligner_App_AI_Export",  # generated duplicate of the whole tree
+    "ToothGroupNetwork",      # vendored third party — never edited, never linted
+    "exports", "segmented",
+}
+
+
+def discover(root="."):
+    """Every application .py file, in a stable order."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for fn in sorted(filenames):
+            if fn.endswith(".py"):
+                found.append(os.path.normpath(os.path.join(dirpath, fn)))
+    return found
 
 
 def collect_bindings(node, names):
@@ -80,10 +106,14 @@ def check(path):
 
 
 if __name__ == "__main__":
-    files = sys.argv[1:] or ["app_ui.py", "core_geometry.py"]
-    print("Structural check (no imports, no display needed):")
-    if all(check(f) for f in files):
-        print("\nAll files structurally sound.")
-    else:
-        print("\nFIX THE ABOVE BEFORE RUNNING.")
+    files = sys.argv[1:] or discover()
+    print(f"Structural check of {len(files)} file(s) (no imports, no display needed):")
+    # all() short-circuits, which would stop at the first bad file and hide the
+    # rest — run every file, then decide.
+    results = [check(f) for f in files]
+    ok = sum(results)
+    print(f"\n  {ok}/{len(results)} files structurally sound")
+    if ok != len(results):
+        print("FIX THE ABOVE BEFORE RUNNING.")
         sys.exit(1)
+    print("All files structurally sound.")

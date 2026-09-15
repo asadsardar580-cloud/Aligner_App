@@ -12,6 +12,35 @@ Teeth must move biologically. Meshes must be mathematically watertight for 3D pr
 *   **Backend:** Python, FastAPI, NumPy. 
     *   *Key Logic:* AI segmentation (ToothGroupNetwork), geodesic flood-fill boundary detection, 4x4 homogeneous transformation matrices, boolean mesh sealing.
 
+### LIVE ENTRY POINTS — everything else is legacy or dead
+
+| | Live |
+|---|---|
+| API | **`api_core.py`** — `uvicorn api_core:app`, 14 routes. Launched by `start_backend.bat`. |
+| Client | **`frontend/src/App.jsx`** — `npm run dev`, launched by `start_frontend.bat`. |
+| Geometry | **`core_geometry.py`** — pure NumPy/SciPy, headless, the engine. |
+| Docs | **`CLAUDE.md`** (this file) and **`README.md`**. No other document is authoritative. |
+
+`app_ui.py` is a legacy PyQt6 desktop shell over the same engine — it runs, but it is not the
+product. **`_archive/` is dead code** (see `_archive/README.md`); as of 2026-09-15 it holds
+`server.py`, `HANDOVER.md`, two stale `App.jsx` copies, and the empty root `config.py`/`models.py`
+that used to shadow the real `tooth_segmentation/` modules.
+
+### TEST COMMANDS
+
+```
+python -m compileall .                  # syntax, whole tree
+python check_structure.py               # undefined names without importing (61 files)
+python run_all_tests.py                 # CANONICAL runner — 24 entries
+python -m pytest -q                     # runs alongside; both must pass
+node frontend/verify-kinematics.mjs     # cross-language kinematics pin
+cd frontend && npm run lint && npm run build && npm run smoke
+```
+
+`npm run smoke` is not optional: a `vite build` succeeds on code that throws during render, and a
+dependency array referencing a later `const` has already white-screened this app twice.
+**Three of the 24 suite entries assert nothing** — treat it as 21 enforcing tests plus 3 reports.
+
 ## 3. ARCHITECTURAL NON-NEGOTIABLES
 Read these rules carefully before writing any code:
 1.  **Scanner Coordinates are Sacred:** NEVER rotate, re-center, or re-scale the raw STL mesh vertices. Inter-arch bite registration depends on the raw scanner space. To establish "Up" and "Forward," we use an **Occlusal Plane Reference Frame** (`arch_frame.py`) stored as session metadata, not by shifting the geometry.
