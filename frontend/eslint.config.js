@@ -31,7 +31,7 @@ export default defineConfig([
   {
     // Node scripts, not browser code: the SSR smoke harness and the
     // cross-language kinematics verifier both run under node and use `process`.
-    files: ['ssr_smoke.jsx', 'verify-kinematics.mjs'],
+    files: ['ssr_smoke.jsx', 'verify-kinematics.mjs', 'playwright.config.js', 'e2e/**/*.js'],
     languageOptions: { globals: globals.node },
   },
 ])

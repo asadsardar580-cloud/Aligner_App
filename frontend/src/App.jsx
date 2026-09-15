@@ -4,6 +4,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { frameArch, attachResize, pickAcrossArches } from "./frameArch";
 import { BrushIndex, installBrush, CELL_FACTOR } from "./brush";
+import { installBVH, refreshBoundsTree, dropBoundsTree } from "./bvh";
 import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
          toothAxes, deltaFromClinical, clinicalAtStage, stagingFor } from "./toothGizmo";
 import StagingTimeline from "./StagingTimeline";
@@ -51,6 +52,11 @@ const CROWN_COL = new THREE.Color("#2ecc71");
 function disposeMesh(obj) {
   if (!obj) return;
   obj.traverse?.((n) => {
+    // The bounds tree is a separate allocation from the geometry buffers and
+    // is not freed by geometry.dispose(). Leaking one per loaded arch is how a
+    // long session ends up holding several hundred MB of stale acceleration
+    // structure.
+    dropBoundsTree(n.geometry);
     n.geometry?.dispose?.();
     const m = n.material;
     if (Array.isArray(m)) m.forEach((x) => x?.dispose?.());
@@ -165,6 +171,10 @@ function applyExtraction(archRec, removedFaces, socketCap, scene) {
     next[w++] = fullIndex[i * 3 + 2];
   }
   geom.setIndex(new THREE.BufferAttribute(next, 1));
+  // The index just changed. A stale tree would keep reporting hits on
+  // triangles that are no longer drawn — a click landing on a tooth that has
+  // already left the cast.
+  refreshBoundsTree(geom);
   geom.computeVertexNormals();          // orphaned vertices simply go unused
 
   // The brush must forget the tooth that just left the cast.
@@ -482,6 +492,7 @@ export default function App() {
     pmrem.dispose();
 
 
+    installBVH();   // patch three's raycast before anything is picked
     three.current = { scene, camera, renderer, controls, raycaster: new THREE.Raycaster() };
     const detach = attachResize(mount, camera, renderer);
 
@@ -745,6 +756,8 @@ export default function App() {
     geom.userData.liveFaces = new Uint8Array(fullIndex.length / 3).fill(1);
 
     geom.brushIndex = new BrushIndex(geom, CELL_FACTOR);
+    // 12.97ms -> 0.023ms per raycast on a 204,800-face mesh (see bvh.js).
+    refreshBoundsTree(geom);
 
     const { scene, camera, controls, renderer } = three.current;
     const prev = arches.current[archName];
@@ -829,6 +842,7 @@ export default function App() {
           g.setAttribute("position",
             new THREE.BufferAttribute(new Float32Array(t.crown.positions), 3));
           g.setIndex(new THREE.BufferAttribute(new Uint32Array(t.crown.indices), 1));
+          refreshBoundsTree(g);
           g.computeVertexNormals();
           const n = g.attributes.position.count;
           const c = new Float32Array(n * 3);
@@ -1124,6 +1138,7 @@ export default function App() {
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(data.crown.positions), 3));
       geom.setIndex(new THREE.BufferAttribute(new Uint32Array(data.crown.indices), 1));
+      refreshBoundsTree(geom);
       geom.computeVertexNormals();
 
       const nVerts = geom.attributes.position.count;
