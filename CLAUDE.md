@@ -424,7 +424,69 @@ so on a machine where the model failed to load, a 40s export read "AI unavailabl
 "Trimming the arch...". `segmentStartedAt` is a ref nulled *synchronously* when the run ends, so a
 poll still in flight cannot overwrite the completion message.
 
-## 13. KNOWN OPEN ISSUES
+## 13. RESOLVED: PHASE B — HARD FAILURES & REPOSITORY HYGIENE
+
+**The repository had no version control.** That was the real blocker, not any individual defect:
+every cleanup was irreversible and CI was impossible. `git init` + a baseline commit came first, and
+every change since is a separate revertible commit. **`.gitignore` excludes all patient-derived
+data** — scans, meshes, `*_output.json` label files — because nothing derived from a real patient
+belongs in version history.
+
+**One syntax error existed in the whole repo.** `tgn_find_width_config.py:161` ended
+`main()python tgn_find_width_config.py ToothGroupNetwork` — a shell command pasted onto the call.
+The usage line already existed in the module docstring, so it was a stray duplicate, not displaced
+documentation. Measured: **67 application files, 1 error; 97 vendored files, 0.** The two vendored
+`SyntaxWarning`s (invalid escape `'\d'`) stay — vendored code is not edited to silence warnings.
+
+**Half the lint problems were not real, and that is the interesting part.** eslint was linting
+`ssr_out/` — a build artifact — because `globalIgnores` covered `dist` but not it. Seven of fourteen
+reported problems were unactionable errors about generated bundle code, drowning the seven that
+mattered. **Linting generated output does not raise standards, it lowers signal.**
+
+**Adding a dependency the linter asked for would have white-screened the app.** `exhaustive-deps`
+wanted `refreshStaging` in the array at `App.jsx:997`; `refreshStaging` was declared at `:1015`.
+Dependency arrays are evaluated **during render**, so a `const` declared below is still in its
+temporal dead zone — the identical crash `opposingSessionId` caused. The declaration was moved above
+its user first. **This is now the second occurrence: treat any lint fix that adds a same-component
+value to a deps array as suspect until you have checked the declaration order.**
+
+**`useStagePlayback` wrote a ref during render** (`cur.current = stage`). React may render and then
+discard that render, publishing a value for a render that never committed. Moved into an effect; the
+tick only advances every 280 ms (~17 frames), so the post-commit write always lands first. The hook
+also moved to its own module — a file exporting both a component and a hook breaks Fast Refresh for
+both.
+
+**Two empty files were shadowing real modules.** Root `config.py` and `models.py` were 0 bytes, and
+`import config` from the repo root resolved to them, yielding zero symbols instead of
+`tooth_segmentation/config.py`. Verified before moving that neither the app nor the vendored tree
+does a bare `import config` / `import models` — every such import in ToothGroupNetwork is relative.
+Latent, never fired, now impossible.
+
+**`check_structure.py` was checking two hard-coded files** while being invoked as a repo-wide gate.
+It now walks the tree: **61/61 sound, no false positives** — a 30× increase in what the gate covers.
+
+**pytest could not collect at all before configuration** — 30 errors, from the generated
+`Aligner_App_AI_Export/` holding a second copy of every test file ("import file mismatch"), and from
+`_archive/test_stl_parser.py` opening `server.py` by relative path. Both excluded.
+**`run_all_tests.py` stays canonical**; pytest runs alongside it.
+
+**Measured, before → after:**
+
+| | before | after |
+|---|---|---|
+| version control | none | 6 commits |
+| syntax errors (app) | 1 | **0** |
+| `npm run lint` | 14 problems | **0** |
+| `check_structure.py` coverage | 2 files | **61 files** |
+| `pytest` | not installed, 30 collection errors | **112 passed** |
+| `run_all_tests.py` | 24/24 | **24/24** (unchanged) |
+| `verify-kinematics.mjs` | 1.78e-15 / 4.44e-16 | **identical** |
+| smoke markup | 7621 B | **identical** |
+
+The last two lines are the point: §25's protected paths were touched (`StagingTimeline`,
+`App.jsx` deps) and produced **byte-identical** numbers. Any drift there is a regression.
+
+## 14. KNOWN OPEN ISSUES
 * **RESOLVED 2026-09-15 — the suite is 24/24.** `test_api_core.py` was rewritten against the
   current endpoints and `test_face_order.py` took the one-line `stl_io.parse_stl_bytes` fix. Both
   had been red on a **stale API surface**, never on geometry, which is why nothing downstream ever
