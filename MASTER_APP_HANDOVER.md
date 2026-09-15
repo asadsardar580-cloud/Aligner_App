@@ -5,6 +5,30 @@ Clear aligner CAD workstation. Generated 2026-09-15 from a file-by-file scan of
 
 ---
 
+## 0a. WHAT CHANGED IN THE 2026-09-15 HARDENING PASS (read this first)
+
+This document was written against the repo as found. A six-phase pass has since changed the
+following, and **CLAUDE.md §13 and §14 are the authoritative record**:
+
+| | Then | Now |
+|---|---|---|
+| Version control | **none at all** | git, 9 commits, baseline first |
+| Syntax errors | 1 (`tgn_find_width_config.py:161`) | **0** |
+| `npm run lint` | 14 problems | **0** |
+| `check_structure.py` | 2 hard-coded files | **61 files, tree-wide** |
+| `run_all_tests.py` | 24/24 | **26/26** |
+| `pytest` | not installed | **131 passed** |
+| Browser E2E | none | **7/7 (Playwright)** |
+| CI | none | 2 jobs, AI path excluded by design |
+| API routes | 14 | **17** (hydration) |
+| Case survives a refresh | no | **yes** |
+| `cut_guard` | hard-bypassed, gate unreachable | un-bypassed, reports, does not yet gate |
+| Collision reporting | `checked: false` read as "clear" | **5 explicit states** |
+| Dead code | 9 files loose in the tree | quarantined to `_archive/` |
+
+**Superseded below:** §4.9's "LIVE BUG" is fixed; §4.10's `requirements.txt` row is fixed; §7's
+test counts are now 26/131/7; the dead files in §0 have moved to `_archive/`.
+
 ## 0. HOW TO READ THIS — AUTHORITATIVE FILES
 
 This repo contains several stale duplicates. **Read the LIVE column; ignore the DEAD column.**

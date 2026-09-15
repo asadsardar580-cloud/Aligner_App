@@ -486,7 +486,73 @@ It now walks the tree: **61/61 sound, no false positives** — a 30× increase i
 The last two lines are the point: §25's protected paths were touched (`StagingTimeline`,
 `App.jsx` deps) and produced **byte-identical** numbers. Any drift there is a regression.
 
-## 14. KNOWN OPEN ISSUES
+## 14. RESOLVED: PHASES C-F — RELOAD, VALIDATION, UI, CI
+
+**Case reload: the blocker was EXPOSURE, not storage.** The server already held the occlusal frame,
+the segmentation labels, every crown's geometry, its FDI and its root length — and no endpoint
+returned any of it. `GET /teeth` existed and the client never called it, because poses alone cannot
+rebuild a scene with no crowns in it. Four endpoints now expose what was always there
+(`GET /session/{sid}`, `/frame`, `/labels`, `/teeth?geometry=true`), `/teeth`'s default payload stays
+byte-compatible, and the session id — the one thing the server genuinely cannot recover — is kept in
+`localStorage`. Ids only; nothing patient-derived leaves memory.
+**A restored pose is REBUILT from the six clinical values via `deltaFromClinical`, not trusted as 16
+stored floats**, so it lands exactly where a staging frame would put it.
+
+**`_jsonable()` exists because the one-level numpy unwrap was not enough.** `socket_info` carries a
+`(3,)` normal two levels down, which FastAPI surfaces as an opaque 500. Caught by a `json.dumps`
+assertion in a test, not in production.
+
+**Three defects that produced wrong answers silently:**
+* **Negative vertex ids WRAPPED.** `sel[ids] = True` with a negative id selects from the END of the
+  array — a crown built from the far side of the arch, reported as success.
+* **`root_length_mm` was unbounded.** C_res is extrapolated along the long axis by exactly this
+  distance, so 0 or 100 is a wrong pivot, not a wrong number.
+* **A NaN C_res passed the alveolus gate.** `if depth <= 0 or lateral > max_lateral` looks
+  exhaustive and is not: **every comparison against NaN is False.** Finiteness must be its own
+  check, first. The test asserts the language behaviour so the reason cannot be forgotten.
+
+**`cut_guard.check_crown` was hard-bypassed and is now un-bypassed but still does not gate.** It
+computed both metrics then returned `ok=True` unconditionally, making the caller's 422 unreachable —
+the pre-cut guard did nothing for several phases while appearing to. `MIN_COMPACTNESS` (0.30) and
+`MIN_RIM_CONCAVITY` (0.05) have never been measured against real cuts, so they are reported as
+`crown_advisory`. **Promote a threshold to a refusal only with numbers behind it**, otherwise a
+rejected cut cannot be blamed on either the threshold or the cut.
+
+**Every threshold declares its provenance** — `software heuristic` or `literature/reference`. They
+are different kinds of claim and must never render alike. **A refusal now carries the value it
+measured, the threshold, and where that threshold came from**; success responses were always richly
+structured while failures collapsed to a bare string, which is backwards.
+
+**`NOT_CHECKED` is not `CLEAR`.** Five explicit collision states
+(`NOT_CHECKED / CLEAR / WARNING / INTERFERENCE / COMPUTATION_ERROR`). `checked: false` was being read
+as "no interference", a clinical claim the software never made. Every measured state also states in
+plain language that nearest-vertex signed distance is **approximate** and cannot see an intersection
+between sampled vertices. The validation panel renders three visual states, and **"not determined" is
+grey with a dash, never a green tick.**
+
+**Two things E2E found that nothing else would have:**
+1. **A stale `--reload` spawn child held port 8000 while its parent was gone.** `tasklist` showed no
+   such PID, `netstat` showed it LISTENING, a bind failed with `WinError 10048`. Its command line
+   contains **`spawn_main`, not `uvicorn`** — so a filter on "uvicorn" misses it, which is how a
+   server running OLD CODE survived two restarts and served 14 routes while the module defined 17.
+   **Kill on `spawn_main` too.**
+2. **CORS did not allow the preview origin (4173).** A CORS block and a refused connection both
+   reject `fetch()` with the same `TypeError`, so the connection badge reported "Backend not running"
+   for a server running perfectly. **The badge cannot distinguish the two** — remember that before
+   trusting it.
+
+E2E runs against the **production build**, not the dev server: dev serves ~1,900 unbundled modules
+and measured **15.8 s to first paint**, which turns every timeout into a coin flip.
+
+| | before | after |
+|---|---|---|
+| `run_all_tests.py` | 24/24 | **26/26** (+ hydration, validation) |
+| `pytest` | 112 | **131** |
+| browser E2E | none | **7/7** |
+| CI | none | 2 jobs, AI path excluded by design |
+| API routes | 14 | **17** |
+
+## 15. KNOWN OPEN ISSUES
 * **RESOLVED 2026-09-15 — the suite is 24/24.** `test_api_core.py` was rewritten against the
   current endpoints and `test_face_order.py` took the one-line `stl_io.parse_stl_bytes` fix. Both
   had been red on a **stale API surface**, never on geometry, which is why nothing downstream ever
