@@ -158,4 +158,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()python tgn_find_width_config.py ToothGroupNetwork
+    main()
