@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import core_geometry as cg; print\\(cg.__file__\\); print\\(hasattr\\(cg,'build_socket_cup'\\), hasattr\\(cg,'_floor_triangulation'\\)\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe _diag_cup.py 2>&1)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe test_socket_cup.py 2>&1)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe test_cut_endpoint.py 2>&1)",
+      "Bash(python -c ' *)",
+      "Bash(sed -i 's/bv, bf, binfo = cg.build_cast_base\\(tv, tf, af\\)/bv, bf, binfo = cg.build_cast_base\\(tv, tf, af, rim=tinfo[\"rim_loop\"]\\)/' \"C:/Users/Lenovo/AppData/Local/Temp/claude/c--Users-Lenovo-OneDrive-Desktop-Aligner-App/9b320812-6c83-445f-85e6-cab7ef366b30/scratchpad/probe_base.py\")",
+      "Bash(python \"C:/Users/Lenovo/AppData/Local/Temp/claude/c--Users-Lenovo-OneDrive-Desktop-Aligner-App/9b320812-6c83-445f-85e6-cab7ef366b30/scratchpad/probe_base.py\")",
+      "Bash(python run_all_tests.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe test_cast_base.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe test_cut_endpoint.py)"
+    ]
+  }
+}

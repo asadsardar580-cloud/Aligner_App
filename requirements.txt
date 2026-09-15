@@ -1,0 +1,44 @@
+# --- Desktop application (legacy app_ui.py) ---
+PyQt6
+pyvista
+pyvistaqt
+vtk
+
+# --- Core geometry engine (required by everything) ---
+numpy
+scipy
+
+# --- API backend (required for the current UI) ---
+# start_backend.bat runs: python -m uvicorn api_core:app --host 127.0.0.1 --port 8000 --reload
+fastapi
+uvicorn
+python-multipart
+
+# --- Boolean STL export (required by POST /api/session/{sid}/export/stages) ---
+# manifold3d was commented out while the whole file claimed to be installable.
+# It is not optional: api_core._to_manifold imports it and the staged
+# manufacturing export cannot build a fused solid without it, so three test
+# files (staging export, occlusal collision, cut endpoint) fail without it too.
+manifold3d
+
+# --- AI segmentation, ToothGroupNetwork (required by POST .../segment) ---
+# All four are on the live inference path, verified by import, not assumed:
+#   inference_pipelines/inference_pipeline_tgn.py imports gen_utils and open3d,
+#   and gen_utils imports trimesh; sklearn is used across gen_utils, ops_utils
+#   and the pipeline itself.
+# Omitting any one of them means /segment returns "AI segmentation unavailable"
+# while the rest of the clinical loop still works — tgn_bridge is built so a
+# missing model can never take the server down.
+#
+# CPU-only by design: cpu_compat.py and pointops_cpu.py shim away the CUDA
+# assumptions in the vendored network. The default PyPI torch wheel is CPU;
+# only add the PyTorch CUDA index if you deliberately want GPU.
+torch
+scikit-learn
+trimesh
+open3d
+
+# Versions this was last verified against (2026-09-15), for reference:
+#   numpy 2.5.2 · scipy 1.18.1 · fastapi 0.141.1 · uvicorn 0.52.4
+#   python-multipart 0.0.32 · manifold3d 3.5.2 · torch 2.13.0+cpu
+#   scikit-learn 1.9.0 · trimesh 5.1.0 · open3d 0.19.0 · Python 3.12.7

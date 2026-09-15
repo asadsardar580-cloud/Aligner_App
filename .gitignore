@@ -1,0 +1,30 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+
+# --- Node / frontend build artifacts ---
+node_modules/
+frontend/dist/
+frontend/ssr_out/
+frontend/ssr_out2/
+
+# --- Patient-derived data (PHI). Scans are memory-only by design; nothing
+# derived from a real patient belongs in version history, and all of it is
+# regenerable from the source scan. ---
+*.stl
+*.obj
+*.ply
+*_output.json
+exports/
+segmented/
+
+# --- AI model checkpoints (64MB each, 12 of them) ---
+*.h5
+
+# --- Generated handover archive ---
+Aligner_App_AI_Export/
+Aligner_App_AI_Export.zip
+
+# --- Misc ---
+*.log
