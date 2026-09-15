@@ -21,6 +21,10 @@ function fdiClass(fdi) {
 
 const API = "http://127.0.0.1:8000";
 
+// Where the per-arch session ids are kept so a refresh can find the case again.
+// Ids only — the scan itself never leaves the server's memory.
+const CASE_KEY = "aligner.case.sessions";
+
 // Backend connection states. "offline" is the one that matters: without a
 // permanent indicator, an API that was simply never started is indistinguishable
 // from a broken app — you find out only when an upload fails.
@@ -568,6 +572,95 @@ export default function App() {
     attr.needsUpdate = true;
   };
 
+  /**
+   * Case stage count = MAX over committed teeth, plus who binds each one.
+   *
+   * MUST STAY ABOVE its callers — the restore effect and applyClinical both
+   * list it in a dependency array, and dependency arrays are evaluated DURING
+   * RENDER, while a `const` declared further down the component is still in its
+   * temporal dead zone. Declaring it below produced exactly the white-screen
+   * `ReferenceError: Cannot access 'X' before initialization` that
+   * opposingSessionId caused. This is the THIRD value to hit that trap; if you
+   * add a callback to a deps array, check where it is declared first.
+   */
+  const refreshStaging = useCallback(() => {
+    const rows = Object.entries(teeth.current).map(([tid, rec]) => {
+      const s = stagingFor(rec.clinical);
+      return { tid, fdi: rec.fdi, stages: s.stages, driver: s.driver, channel: s.channel,
+               occlusion: rec.occlusion || null };
+    }).filter((r) => r.stages > 0);
+    const total = rows.reduce((m, r) => Math.max(m, r.stages), 0);
+    rows.forEach((r) => { r.binds = r.stages === total; });
+    rows.sort((a, b) => b.stages - a.stages);
+    setStaging({ total, perTooth: rows });
+    return total;
+  }, []);
+
+  /**
+   * Remember which session belongs to which arch, across a refresh.
+   *
+   * This is the ONE thing the server genuinely cannot recover: everything else
+   * about a case is in the session, but the session id itself lived only in
+   * React state, so a refresh made all of it unreachable. Only the ids are
+   * stored — no geometry, no labels, nothing patient-derived leaves memory.
+   */
+  const rememberSessions = useCallback((next) => {
+    try {
+      const ids = Object.fromEntries(
+        Object.entries(next).filter(([, s]) => s?.session_id)
+                            .map(([arch, s]) => [arch, s.session_id]));
+      window.localStorage.setItem(CASE_KEY, JSON.stringify(ids));
+    } catch { /* private mode / storage disabled — restore is a convenience */ }
+    return next;
+  }, []);
+
+  /**
+   * Build the arch into the scene from a /mesh payload.
+   *
+   * Extracted so that uploading a scan and RESTORING one after a refresh walk
+   * the identical path. Two code paths producing "the same" arch is how a
+   * restored case quietly differs from the one that was planned.
+   */
+  const mountArch = useCallback((archName, m) => {
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(m.positions), 3));
+    const fullIndex = new Uint32Array(m.indices);
+    geom.setIndex(new THREE.BufferAttribute(fullIndex, 1));
+    geom.computeVertexNormals();
+
+    const nVerts = geom.attributes.position.count;
+    const colors = new Float32Array(nVerts * 3);
+    for (let i = 0; i < nVerts; i++) GINGIVA.toArray(colors, i * 3);
+    geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geom.userData.baseColors = Float32Array.from(colors);
+
+    // The pristine index buffer plus a per-face liveness flag. Extraction
+    // rewrites the INDEX only — positions, colours and therefore every
+    // vertex id the backend and the client exchange stay exactly as loaded.
+    geom.userData.fullIndex = fullIndex;
+    geom.userData.liveFaces = new Uint8Array(fullIndex.length / 3).fill(1);
+
+    geom.brushIndex = new BrushIndex(geom, CELL_FACTOR);
+
+    const { scene, camera, controls, renderer } = three.current;
+    const prev = arches.current[archName];
+    if (prev) {
+      disposeMesh(prev.mesh);
+      disposeMesh(prev.socketMesh);
+      for (const [tid, rec] of Object.entries(teeth.current)) {
+        if (rec.archName === archName) { disposeMesh(rec.mesh); disposeMesh(rec.rootMesh); delete teeth.current[tid]; }
+      }
+    }
+
+    const mesh = new THREE.Mesh(geom, tissueMaterial());
+    scene.add(mesh);
+
+    const view = frameArch(geom, camera, controls, renderer);
+    arches.current[archName] = { mesh, geometry: geom, view, brushIndex: geom.brushIndex,
+                                 socketMesh: null, socketVerts: [], socketFaces: [] };
+    return arches.current[archName];
+  }, []);
+
   const loadArch = useCallback(async (event, archName) => {
     const fileObj = event.target.files?.[0];
     if (!fileObj) return;
@@ -584,52 +677,139 @@ export default function App() {
 
       const resMesh = await fetch(`${API}/api/session/${s.session_id}/mesh`);
       const m = await resMesh.json();
-      
-      const geom = new THREE.BufferGeometry();
-      geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(m.positions), 3));
-      const fullIndex = new Uint32Array(m.indices);
-      geom.setIndex(new THREE.BufferAttribute(fullIndex, 1));
-      geom.computeVertexNormals();
 
-      const nVerts = geom.attributes.position.count;
-      const colors = new Float32Array(nVerts * 3);
-      for (let i = 0; i < nVerts; i++) GINGIVA.toArray(colors, i * 3);
-      geom.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-      geom.userData.baseColors = Float32Array.from(colors);
+      mountArch(archName, m);
 
-      // The pristine index buffer plus a per-face liveness flag. Extraction
-      // rewrites the INDEX only — positions, colours and therefore every
-      // vertex id the backend and the client exchange stay exactly as loaded.
-      geom.userData.fullIndex = fullIndex;
-      geom.userData.liveFaces = new Uint8Array(fullIndex.length / 3).fill(1);
-
-      geom.brushIndex = new BrushIndex(geom, CELL_FACTOR);
-
-      const { scene, camera, controls, renderer } = three.current;
-      const prev = arches.current[archName];
-      if (prev) {
-        disposeMesh(prev.mesh);
-        disposeMesh(prev.socketMesh);
-        for (const [tid, rec] of Object.entries(teeth.current)) {
-          if (rec.archName === archName) { disposeMesh(rec.mesh); disposeMesh(rec.rootMesh); delete teeth.current[tid]; }
-        }
-      }
-
-      const mesh = new THREE.Mesh(geom, tissueMaterial());
-      scene.add(mesh);
-
-      const view = frameArch(geom, camera, controls, renderer);
-      arches.current[archName] = { mesh, geometry: geom, view, brushIndex: geom.brushIndex,
-                                   socketMesh: null, socketVerts: [], socketFaces: [] };
-
-      setSessions((prev) => ({ ...prev, [archName]: s }));
+      setSessions((prev) => rememberSessions({ ...prev, [archName]: s }));
       setActive(archName);
       setArchFrame(null);
       setStatus(`Arch Loaded. Ready for AI Segmentation or Occlusal Plane definition.`);
     } catch (err) {
       setStatus(`Failed: ${err.message}`);
     } finally { setBusy(false); }
-  }, []);
+  }, [mountArch, rememberSessions]);
+
+  /**
+   * Rebuild one arch, and everything done to it, from its session id alone.
+   *
+   * The server held all of this the whole time; until the hydration endpoints
+   * existed none of it was reachable, so a refresh lost the case. Nothing here
+   * recomputes geometry — every crown, socket and pose is the one that was
+   * approved, fetched back verbatim.
+   */
+  const restoreArch = useCallback(async (archName, sid) => {
+    const summary = await fetch(`${API}/api/session/${sid}`);
+    if (!summary.ok) return null;           // expired or server restarted
+    const info = await summary.json();
+
+    const m = await (await fetch(`${API}/api/session/${sid}/mesh`)).json();
+    const archRec = mountArch(archName, m);
+
+    if (info.has_segmentation) {
+      const r = await fetch(`${API}/api/session/${sid}/labels`);
+      if (r.ok) labels.current[archName] = (await r.json()).labels;
+    }
+
+    let frame = null;
+    if (info.has_occlusal_frame) {
+      const r = await fetch(`${API}/api/session/${sid}/frame`);
+      if (r.ok) frame = await r.json();
+    }
+
+    if (info.tooth_count > 0) {
+      const r = await fetch(`${API}/api/session/${sid}/teeth?geometry=true`);
+      if (r.ok) {
+        const { teeth: rows } = await r.json();
+        for (const t of rows) {
+          const g = new THREE.BufferGeometry();
+          g.setAttribute("position",
+            new THREE.BufferAttribute(new Float32Array(t.crown.positions), 3));
+          g.setIndex(new THREE.BufferAttribute(new Uint32Array(t.crown.indices), 1));
+          g.computeVertexNormals();
+          const n = g.attributes.position.count;
+          const c = new Float32Array(n * 3);
+          for (let i = 0; i < n; i++) CROWN_COL.toArray(c, i * 3);
+          g.setAttribute("color", new THREE.BufferAttribute(c, 3));
+
+          const mesh = new THREE.Mesh(g, tissueMaterial());
+          mesh.userData.toothId = t.tooth_id;
+          mesh.matrixAutoUpdate = false;
+          three.current.scene.add(mesh);
+
+          const rootMesh = buildRootMesh(t.root_cone);
+          if (rootMesh) { rootMesh.matrixAutoUpdate = false; three.current.scene.add(rootMesh); }
+
+          // Re-apply the committed pose. The matrix is rebuilt from the six
+          // clinical values rather than trusted as 16 floats, so a restored
+          // tooth sits exactly where deltaFromClinical would put it — the same
+          // path every staging frame uses.
+          const delta = new THREE.Matrix4();
+          if (t.clinical) {
+            const axes = toothAxes(t.frame);
+            delta.copy(deltaFromClinical(axes, t.c_res, t.clinical));
+          }
+          mesh.matrix.copy(delta); mesh.matrixWorld.copy(delta);
+          if (rootMesh) { rootMesh.matrix.copy(delta); rootMesh.matrixWorld.copy(delta); }
+
+          teeth.current[t.tooth_id] = {
+            mesh, rootMesh, archName, frame: t.frame, cRes: t.c_res, delta,
+            clinical: t.clinical || {tip_deg:0, torque_deg:0, rotation_deg:0, d_md:0, d_bl:0, d_oa:0},
+            fdi: t.fdi ?? null,
+            rootLength: t.root_length_mm,
+            rootDefault: t.fdi != null ? rootDefaultForFDI(t.fdi) : null,
+          };
+
+          applyExtraction(archRec, t.removed_faces, t.socket_cap, three.current.scene);
+        }
+      }
+    }
+    return { info, frame, session: { session_id: sid, ...info } };
+  }, [mountArch]);
+
+  // Restore on mount. Runs once; a failed or expired session is dropped
+  // silently rather than leaving a dead id to fail every later request.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let saved;
+      try { saved = JSON.parse(window.localStorage.getItem(CASE_KEY) || "{}"); }
+      catch { return; }
+      const entries = Object.entries(saved).filter(([, sid]) => typeof sid === "string");
+      if (!entries.length) return;
+
+      setBusy(true);
+      setStatus("Restoring the previous case...");
+      const restored = {};
+      let frameSeen = null, teethSeen = 0;
+      for (const [archName, sid] of entries) {
+        try {
+          const out = await restoreArch(archName, sid);
+          if (cancelled) return;
+          if (out) {
+            restored[archName] = out.session;
+            if (out.frame) frameSeen = out.frame;
+            teethSeen += out.info.tooth_count;
+          }
+        } catch { /* one bad arch must not abort the other */ }
+      }
+      if (cancelled) return;
+      setBusy(false);
+
+      const names = Object.keys(restored);
+      if (!names.length) {
+        try { window.localStorage.removeItem(CASE_KEY); } catch { /* ignore */ }
+        setStatus("Previous case has expired. Load an arch to begin.");
+        return;
+      }
+      setSessions(rememberSessions(restored));
+      setActive(names.includes("mandibular") ? "mandibular" : names[0]);
+      if (frameSeen) setArchFrame(frameSeen);
+      setStage(refreshStaging());
+      setStatus(`Case restored — ${names.length} arch(es), ${teethSeen} tooth/teeth`
+                + `${frameSeen ? ", occlusal plane" : ""}. Nothing was recomputed.`);
+    })();
+    return () => { cancelled = true; };
+  }, [restoreArch, rememberSessions, refreshStaging]);
 
   useEffect(() => {
     let cancelled = false;
@@ -937,29 +1117,6 @@ export default function App() {
     const other = active === "maxillary" ? "mandibular" : "maxillary";
     return sessions[other]?.session_id ?? null;
   }, [sessions, active]);
-
-  /**
-   * Case stage count = MAX over committed teeth, plus who binds each one.
-   *
-   * MUST STAY ABOVE applyClinical. applyClinical calls this and therefore lists
-   * it in its dependency array — and dependency arrays are evaluated DURING
-   * RENDER, while a `const` declared further down the component is still in its
-   * temporal dead zone. Declaring it below produced exactly the white-screen
-   * `ReferenceError: Cannot access 'X' before initialization` that
-   * opposingSessionId caused, for the same reason. Keep both above their users.
-   */
-  const refreshStaging = useCallback(() => {
-    const rows = Object.entries(teeth.current).map(([tid, rec]) => {
-      const s = stagingFor(rec.clinical);
-      return { tid, fdi: rec.fdi, stages: s.stages, driver: s.driver, channel: s.channel,
-               occlusion: rec.occlusion || null };
-    }).filter((r) => r.stages > 0);
-    const total = rows.reduce((m, r) => Math.max(m, r.stages), 0);
-    rows.forEach((r) => { r.binds = r.stages === total; });
-    rows.sort((a, b) => b.stages - a.stages);
-    setStaging({ total, perTooth: rows });
-    return total;
-  }, []);
 
   /**
    * Sidebar -> tooth. The other half of the two-way binding.

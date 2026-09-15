@@ -507,6 +507,13 @@ def cut(sid: str, req: CutRequest):
                                         "root_length_mm": float(req.root_length_mm),
                                         "reconcile": reconcile, "dimensions": dims,
                                         "face_mask": face_mask,
+                                        # Cached, not recomputed on read. _tooth_fdi
+                                        # needs the ORIGINAL faces and the labels
+                                        # array; storing the answer at cut time means
+                                        # a reloaded client gets the same FDI the lab
+                                        # manifest carries, even if /segment is rerun
+                                        # afterwards with a different result.
+                                        "fdi": None,   # filled immediately below
                                         "socket_rim": socket_rim_global,
                                         # The cup's own geometry, so /export can
                                         # replay it verbatim rather than rebuild
@@ -515,12 +522,15 @@ def cut(sid: str, req: CutRequest):
                                         "socket_cup_pts": cup_pts,
                                         "socket_cup_faces": cup_faces,
                                         "socket_info": cup_info})
+        # The server's own FDI, read through the crown's face mask rather than
+        # the raw selection, so the client's per-tooth root length and the lab
+        # manifest cannot disagree. None when /segment never ran — never a guess.
+        _rec = STORE.get(sid, f"tooth:{tid}")
+        _rec["fdi"] = _tooth_fdi(sid, _rec, f)
+        STORE.put(sid, f"tooth:{tid}", _rec)
+
         return {"tooth_id": tid, "watertight": True,
-                # The server's own FDI, read through the crown's face mask
-                # rather than the raw selection, so the client's per-tooth root
-                # length and the lab manifest cannot disagree. None when
-                # /segment never ran — never a guess.
-                "fdi": _tooth_fdi(sid, STORE.get(sid, f"tooth:{tid}"), f),
+                "fdi": _rec["fdi"],
                 "root_length_mm": float(req.root_length_mm),
                 # THE ROOT IS FABRICATED AND THE CLIENT MUST SHOW IT THAT WAY.
                 # There is no root in an intraoral scan — it stops at the
@@ -608,16 +618,119 @@ def kinematics(sid: str, tid: str, req: KinematicsRequest):
             "occlusal_warning": (ANTAGONIST_WARNING if occlusal and occlusal["collides"]
                                  else None)}
 
-@app.get("/api/session/{sid}/teeth")
-def list_teeth(sid: str):
-    """Every extracted tooth and its committed pose.
+def _jsonable(o):
+    """Recursively unwrap numpy so FastAPI can serialise a nested dict.
 
-    Lets a reloaded client restore the whole setup — which crowns exist, where
-    each was left, and which arch faces are gone — instead of losing the case
-    to a browser refresh.
+    The existing per-field `val.tolist() if hasattr(val, "tolist")` pattern
+    unwraps exactly ONE level, which is fine for a flat frame dict and wrong for
+    anything holding a dict of diagnostics — socket_info carries a (3,) normal
+    two levels down, and an un-unwrapped array surfaces as an opaque 500 rather
+    than a payload. Cheap, and it removes a whole class of that bug.
+    """
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, np.generic):       # np.float64, np.int64, np.bool_
+        return o.item()
+    if isinstance(o, dict):
+        return {k: _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    return o
+
+
+@app.get("/api/session/{sid}")
+def get_session(sid: str):
+    """Is this session still alive, and what does it already know?
+
+    The first call a reloading client makes. A browser refresh loses every
+    piece of React state but the session id can be persisted, and from that id
+    everything below is recoverable — so this answers "can I restore, and how
+    far along was I?" in one round trip.
+
+    Deliberately cheap: no geometry, no labels. Just the shape of the case.
+    """
+    try:
+        v = STORE.require(sid, "verts")
+        f = STORE.require(sid, "faces")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+
+    n_teeth = sum(1 for k in STORE.keys(sid) if k.startswith("tooth:"))
+    extracted = STORE.get(sid, "extracted_faces")
+    labels = STORE.get(sid, "labels")
+    return {
+        "session_id": sid,
+        "arch": STORE.arch(sid),
+        "vertex_count": int(len(v)),
+        "face_count": int(len(f)),
+        "bbox": [v.min(0).tolist(), v.max(0).tolist()],
+        "scan_health": STORE.get(sid, "scan_health"),
+        # What has been done to it so far. The client uses these to decide
+        # which workflow steps to mark complete without fetching the payloads.
+        "has_occlusal_frame": STORE.get(sid, "arch_frame") is not None,
+        "has_segmentation": labels is not None,
+        "tooth_count": n_teeth,
+        "extracted_face_count": 0 if extracted is None else int(extracted.sum()),
+    }
+
+
+@app.get("/api/session/{sid}/frame")
+def get_occlusal_frame(sid: str):
+    """The occlusal reference frame, if one has been established.
+
+    Stored since the plane was set, but until now only POST /occlusal-plane
+    ever returned it — so a refresh meant re-clicking three landmarks and
+    getting a DIFFERENT frame, which silently re-bases every long-axis
+    reconciliation in the case.
     """
     try:
         STORE.require(sid, "verts")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+    frame = STORE.get(sid, "arch_frame")
+    if frame is None:
+        raise HTTPException(404, "No occlusal plane has been established for this session.")
+    return arch_frame.to_json(frame)
+
+
+@app.get("/api/session/{sid}/labels")
+def get_labels(sid: str):
+    """Per-vertex FDI labels from the last /segment run.
+
+    Stored since segmentation, but only POST /segment ever returned them — so
+    a refresh cost a ~4 minute AI pass to recover data the server already had.
+    """
+    try:
+        STORE.require(sid, "verts")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+    labels = STORE.get(sid, "labels")
+    if labels is None:
+        raise HTTPException(404, "Segmentation has not been run for this session.")
+    return {"labels": np.asarray(labels).astype(int).tolist(),
+            "jaw": jaw_naming.jaw_for_arch(STORE.arch(sid))}
+
+
+@app.get("/api/session/{sid}/teeth")
+def list_teeth(sid: str, geometry: bool = False):
+    """Every extracted tooth and its committed pose.
+
+    `geometry=false` (default) is the light pose-only payload this endpoint has
+    always returned — kept byte-compatible so nothing that already calls it
+    breaks.
+
+    `geometry=true` adds everything a reloading client needs to REBUILD the
+    scene: crown meshes, the virtual root cone, the socket cup in the client's
+    own dual-index format, and the extracted face indices. Without it a refresh
+    could restore poses but had no crowns to apply them to, which is why the
+    client never called this endpoint at all.
+
+    It is heavy on purpose — a 14-crown case is several MB of JSON — so it is
+    opt-in and fetched once on restore, not polled.
+    """
+    try:
+        STORE.require(sid, "verts")
+        faces = STORE.require(sid, "faces")
     except SessionExpired as e:
         raise HTTPException(404, str(e))
 
@@ -628,16 +741,46 @@ def list_teeth(sid: str):
             continue
         t = STORE.get(sid, key)
         M = t.get("matrix")
-        out.append({
+        rec = {
             "tooth_id": key.split(":", 1)[1],
             "c_res": np.asarray(t["c_res"], float).tolist(),
             "clinical": t.get("clinical"),
             "matrix": None if M is None else np.asarray(M, float).ravel().tolist(),
             "frame": {k: (val.tolist() if hasattr(val, "tolist") else val)
                       for k, val in t["frame"].items()},
-        })
+        }
+        if geometry:
+            cv, cf = t["cv"], t["cf"]
+            rim_idx = np.asarray(t["socket_rim"], dtype=np.int64)
+            n_rim = len(rim_idx)
+            # socket_rim holds GLOBAL vertex ids into the original scan, which
+            # is never mutated — so this resolves the same rim the cut saw.
+            rim_xyz = STORE.require(sid, "verts")[rim_idx]
+            rec.update({
+                "fdi": t.get("fdi"),
+                "root_length_mm": float(t["root_length_mm"]),
+                "dimensions": _jsonable(t.get("dimensions")),
+                "reconcile": _jsonable(t.get("reconcile")),
+                "crown": {"positions": np.asarray(cv, np.float32).ravel().tolist(),
+                          "indices":   np.asarray(cf, np.uint32).ravel().tolist()},
+                "root_cone": _root_cone(rim_xyz, t["frame"], float(t["root_length_mm"])),
+                # Same dual-index convention /cut uses: a non-negative entry is
+                # an arch vertex id, -(k+1) is appended cup vertex k.
+                "socket_cap": {
+                    "vertices": np.asarray(t["socket_cup_pts"]).tolist(),
+                    "faces": [[int(rim_idx[i]) if i < n_rim else -(int(i) - n_rim + 1)
+                               for i in tri] for tri in t["socket_cup_faces"]],
+                    "info": _jsonable(t.get("socket_info")),
+                },
+                # WHICH faces this tooth removed, not just how many. The client
+                # rebuilds its liveFaces mask from these.
+                "removed_faces": np.where(np.asarray(t["face_mask"]))[0].astype(np.int64).tolist(),
+            })
+        out.append(rec)
+
     return {"teeth": out,
-            "extracted_face_count": 0 if extracted is None else int(extracted.sum())}
+            "extracted_face_count": 0 if extracted is None else int(extracted.sum()),
+            "face_count": int(len(faces))}
 
 
 def _root_cone(rim_xyz: np.ndarray, frame: dict, root_length_mm: float) -> dict:
