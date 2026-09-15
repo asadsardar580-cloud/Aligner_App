@@ -78,6 +78,18 @@ jobs:
         # catches it.
         run: npm run smoke
 
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser E2E
+        # Drives the PRODUCTION BUILD via `npm run preview`, not the dev server:
+        # dev mode serves ~1,900 unbundled modules and measured 15.8s to first
+        # paint, which turns every timeout into a coin flip. The backend is not
+        # started here, so the specs that need it skip themselves and the ones
+        # that assert the app's behaviour with the API DOWN still run — that is
+        # a real state users hit, and the one the connection badge exists for.
+        run: npm run e2e
+
       - name: Cross-language kinematics pin
         # Asserts the browser's gizmo algebra still reproduces the backend's
         # golden matrices to 1e-12, that every staging frame stays rigid, and

@@ -28,3 +28,8 @@ Aligner_App_AI_Export.zip
 
 # --- Misc ---
 *.log
+
+# --- Playwright ---
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/

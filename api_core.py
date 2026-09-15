@@ -43,7 +43,15 @@ app = FastAPI(title="Virtual Diagnostic Setup API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    # 5173 is `npm run dev`; 4173 is `npm run preview`, which serves the
+    # production build and is what the E2E suite drives. Without 4173 the
+    # preview server cannot reach the API at all, and the failure is
+    # indistinguishable from a dead backend: a CORS block and a refused
+    # connection both reject fetch() with the same TypeError, so the
+    # connection badge reports "Backend not running" for a server that is
+    # running perfectly. Local development origins only — no wildcard.
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173",
+                   "http://localhost:4173", "http://127.0.0.1:4173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
