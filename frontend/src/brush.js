@@ -21,7 +21,10 @@
 
 import * as THREE from "three";
 
-const CELL_FACTOR = 1.0;   // grid cell ~= brush radius
+// Grid cell ~= brush radius. Exported because both call sites in App.jsx had
+// hardcoded the same 1.0 literal instead, so the constant sat unused while its
+// value was duplicated twice. Changing this changes selection behaviour.
+export const CELL_FACTOR = 1.0;
 
 export class BrushIndex {
   /**

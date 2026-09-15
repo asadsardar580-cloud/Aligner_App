@@ -1,4 +1,3 @@
-import { useEffect, useRef, useState, useCallback } from "react";
 import * as Slider from "@radix-ui/react-slider";
 import { Play, Pause, SkipBack, SkipForward, ChevronLeft, ChevronRight } from "lucide-react";
 
@@ -104,43 +103,8 @@ const CHANNEL_LABEL = {
   d_md: "mesiodistal", d_bl: "buccolingual", d_oa: "intrusion/extrusion",
 };
 
-/**
- * Playback clock. Lives outside React state so a running animation does not
- * re-render the tree; the caller gets one callback per stage change, not per
- * frame.
- */
-export function useStagePlayback(totalStages, stage, setStage, msPerStage = 280) {
-  const [playing, setPlaying] = useState(false);
-  const raf = useRef(0);
-  const last = useRef(0);
-  const cur = useRef(stage);
-  cur.current = stage;
-
-  useEffect(() => {
-    if (!playing || !totalStages) return undefined;
-    last.current = performance.now();
-    const tick = (now) => {
-      if (now - last.current >= msPerStage) {
-        last.current = now;
-        const next = cur.current + 1;
-        if (next > totalStages) { setPlaying(false); return; }
-        setStage(next);
-      }
-      raf.current = requestAnimationFrame(tick);
-    };
-    raf.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf.current);
-  }, [playing, totalStages, msPerStage, setStage]);
-
-  const toggle = useCallback(() => {
-    setPlaying((p) => {
-      if (!p && cur.current >= totalStages) setStage(0);   // replay from T0
-      return !p;
-    });
-  }, [totalStages, setStage]);
-
-  return [playing, toggle, setPlaying];
-}
+// useStagePlayback moved to ./useStagePlayback.js — a module that exports both
+// a component and a hook breaks Fast Refresh for both.
 
 const S = {
   bar: {

@@ -3,10 +3,11 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { frameArch, attachResize, pickAcrossArches } from "./frameArch";
-import { BrushIndex, installBrush } from "./brush";
+import { BrushIndex, installBrush, CELL_FACTOR } from "./brush";
 import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
          toothAxes, deltaFromClinical, clinicalAtStage, stagingFor } from "./toothGizmo";
-import StagingTimeline, { useStagePlayback } from "./StagingTimeline";
+import StagingTimeline from "./StagingTimeline";
+import { useStagePlayback } from "./useStagePlayback";
 import { PanelGroup, Panel } from "./Panel";
 
 /** Which Wheeler class an FDI number belongs to, for the label next to the slider. */
@@ -162,7 +163,7 @@ function applyExtraction(archRec, removedFaces, socketCap, scene) {
   geom.computeVertexNormals();          // orphaned vertices simply go unused
 
   // The brush must forget the tooth that just left the cast.
-  archRec.brushIndex = new BrushIndex(geom, 1.0);
+  archRec.brushIndex = new BrushIndex(geom, CELL_FACTOR);
   geom.brushIndex = archRec.brushIndex;
 
   if (socketCap?.faces?.length) {
@@ -482,10 +483,10 @@ export default function App() {
     // Initialize the Deltaface-style 3D Gizmo
     gizmoRef.current = new ToothGizmo(
       scene, camera, renderer.domElement, controls,
-      (clinicalValues, matrixRowMajor) => {
+      (clinicalValues, _matrixRowMajor) => {
         setKinematics(clinicalValues); // Live UI update during drag
       },
-      async (clinicalValues, matrixRowMajor) => {
+      async (clinicalValues, _matrixRowMajor) => {
         setKinematics(clinicalValues);
         const st = stateRef.current;
         const sid = st.sessions[st.activeArch]?.session_id;
@@ -602,7 +603,7 @@ export default function App() {
       geom.userData.fullIndex = fullIndex;
       geom.userData.liveFaces = new Uint8Array(fullIndex.length / 3).fill(1);
 
-      geom.brushIndex = new BrushIndex(geom, 1.0);
+      geom.brushIndex = new BrushIndex(geom, CELL_FACTOR);
 
       const { scene, camera, controls, renderer } = three.current;
       const prev = arches.current[archName];
@@ -938,6 +939,29 @@ export default function App() {
   }, [sessions, active]);
 
   /**
+   * Case stage count = MAX over committed teeth, plus who binds each one.
+   *
+   * MUST STAY ABOVE applyClinical. applyClinical calls this and therefore lists
+   * it in its dependency array — and dependency arrays are evaluated DURING
+   * RENDER, while a `const` declared further down the component is still in its
+   * temporal dead zone. Declaring it below produced exactly the white-screen
+   * `ReferenceError: Cannot access 'X' before initialization` that
+   * opposingSessionId caused, for the same reason. Keep both above their users.
+   */
+  const refreshStaging = useCallback(() => {
+    const rows = Object.entries(teeth.current).map(([tid, rec]) => {
+      const s = stagingFor(rec.clinical);
+      return { tid, fdi: rec.fdi, stages: s.stages, driver: s.driver, channel: s.channel,
+               occlusion: rec.occlusion || null };
+    }).filter((r) => r.stages > 0);
+    const total = rows.reduce((m, r) => Math.max(m, r.stages), 0);
+    rows.forEach((r) => { r.binds = r.stages === total; });
+    rows.sort((a, b) => b.stages - a.stages);
+    setStaging({ total, perTooth: rows });
+    return total;
+  }, []);
+
+  /**
    * Sidebar -> tooth. The other half of the two-way binding.
    *
    * Values are ABSOLUTE from T0, so this is not an incremental nudge: the whole
@@ -993,7 +1017,7 @@ export default function App() {
         }
       }).catch(console.error);
     }
-  }, [activeTooth, kinematics, sessions, active, opposingSessionId]);
+  }, [activeTooth, kinematics, sessions, active, opposingSessionId, refreshStaging]);
 
   const resetTooth = () => {
     const rec = teeth.current[activeTooth];
@@ -1009,20 +1033,6 @@ export default function App() {
 
   const stagingRef = useRef(staging);
   stagingRef.current = staging;
-
-  /** Case stage count = MAX over committed teeth, plus who binds each one. */
-  const refreshStaging = useCallback(() => {
-    const rows = Object.entries(teeth.current).map(([tid, rec]) => {
-      const s = stagingFor(rec.clinical);
-      return { tid, fdi: rec.fdi, stages: s.stages, driver: s.driver, channel: s.channel,
-               occlusion: rec.occlusion || null };
-    }).filter((r) => r.stages > 0);
-    const total = rows.reduce((m, r) => Math.max(m, r.stages), 0);
-    rows.forEach((r) => { r.binds = r.stages === total; });
-    rows.sort((a, b) => b.stages - a.stages);
-    setStaging({ total, perTooth: rows });
-    return total;
-  }, []);
 
   /**
    * Pose every committed crown at stage k. NOT a React render path.
