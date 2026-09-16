@@ -1,0 +1,4 @@
+{
+    "gitlens.gitkraken.mcp.autoEnabled": false,
+    "gitlens.ai.defaultAgent": "claude-extension"
+}

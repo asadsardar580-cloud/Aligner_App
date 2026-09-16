@@ -747,6 +747,32 @@ def kinematics(sid: str, tid: str, req: KinematicsRequest):
     staging = cg.staging_estimate(req.tip_deg, req.torque_deg, req.rotation_deg,
                                   req.d_md, req.d_bl, req.d_oa)
 
+    # PER-STAGE interproximal, computed here rather than per scrub frame. The
+    # timeline needs a yellow chip on the stages where an embrasure closes, and
+    # measuring that during a scrub would put a KD-tree query inside a 60 FPS
+    # loop. This runs once per commit, the client indexes the array, and the
+    # per-frame path stays refs-and-rAF as it was.
+    #
+    # Stage k is the prescription x k/N rebuilt through kinematic_matrix — never
+    # an interpolation of M, which is not a rotation at any intermediate t.
+    n_stages = int(staging.get("stages_required") or 0)
+    stage_clearance = None
+    if n_stages > 0:
+        mats = []
+        for k in range(1, n_stages + 1):
+            frac = k / n_stages
+            mats.append(cg.kinematic_matrix(
+                t["frame"], t["c_res"],
+                req.tip_deg * frac, req.torque_deg * frac, req.rotation_deg * frac,
+                req.d_md * frac, req.d_bl * frac, req.d_oa * frac))
+        try:
+            stage_clearance = cg.sweep_interproximal_stages(
+                t["cv"], t["cf"], t["bv"], t["bf"], t["frame"]["u_md"], mats)
+        except Exception as e:                       # noqa: BLE001
+            # NEVER BLOCKING. A warning chip failing to compute must not stop a
+            # movement from committing.
+            stage_clearance = {"error": f"{type(e).__name__}: {e}", "stages": []}
+
     # Persist the committed pose on the tooth record. The browser owns the live
     # gizmo state, but the server must be able to rebuild the planned setup at
     # export without replaying the session, and a reloaded client must be able
@@ -760,6 +786,8 @@ def kinematics(sid: str, tid: str, req: KinematicsRequest):
     occlusal = _occlusal_check(req.opposing_session_id, cg.apply_matrix(t["cv"], M))
 
     return {"matrix": M.ravel().tolist(), "staging": staging, "clearance": pen,
+            # One row per stage. `stages_yellow` is what the timeline chips.
+            "stage_clearance": stage_clearance,
             "c_res": np.asarray(t["c_res"], float).tolist(),
             "axis_source": t["frame"].get("axis_source"),
             "axis_deviation_deg": t["frame"].get("axis_deviation_deg"),
@@ -1248,8 +1276,15 @@ def space_analysis_report(sid: str, tolerance_mm: float = space_analysis.DEFAULT
         if not key.startswith("tooth:"):
             continue
         t = STORE.get(sid, key)
+        # THE POSED CROWN, NOT T0. This read `t["cv"]` — the crown exactly as it
+        # was cut — so every contact reported here described the malocclusion the
+        # clinician started with, not the setup they were looking at. Space
+        # analysis exists to answer "does this plan fit", and measuring T0
+        # answers a question nobody asked while looking like it answered theirs.
+        M = t.get("matrix")
+        cv = t["cv"] if M is None else cg.apply_matrix(t["cv"], np.asarray(M, float))
         teeth.append({"tooth_id": key.split(":", 1)[1], "fdi": t.get("fdi"),
-                      "verts": t["cv"]})
+                      "verts": cv, "posed": M is not None})
     if not teeth:
         return {"crowns_measured": 0, "widths": {"teeth": []},
                 "interproximal": {"contacts": []},
@@ -1394,10 +1429,20 @@ def _root_cone(rim_xyz: np.ndarray, frame: dict, root_length_mm: float,
     out through the back of the model into empty space, and a violet cone hanging
     below the cast looks like a finding rather than an artefact.
 
-    The bound used is the deepest point the SCAN has data for, measured along
-    the tooth's own long axis from the rim centroid. It is not an alveolar
-    crest — nothing here can measure one — and `clamped` plus `requested_mm`
-    say exactly that, so the drawing never implies anatomy that was not imaged.
+    The bound used is the deepest point the SCAN has data for ANYWHERE, measured
+    along the tooth's own long axis from the rim centroid. It is not an alveolar
+    crest — nothing here can measure one — and `clamped` plus `requested_mm` say
+    exactly that, so the drawing never implies anatomy that was not imaged.
+
+    A GLOBAL EXTENT, NOT A LOCAL ONE, AND THAT WAS MEASURED. The obvious choice
+    is the scan's depth in a cylinder around this tooth, and it is wrong: on the
+    real mandibular scan, sampling 12 ridge points, the local depth within 6mm
+    is a median 12.24mm and would clamp SEVEN OF TWELVE canines at Wheeler's
+    13mm — it measures the vestibular depth, which is normal anatomy, not a
+    defect. The global extent is a median 14.58mm and clamps none of 12 at 9,
+    10 or 13mm. So it fires only when the scan genuinely holds no data that deep
+    anywhere, which is a cropped or shallow scan — the artefact actually worth
+    flagging. A warning that fires on healthy anatomy is the same as no warning.
 
     C_res IS NOT AFFECTED. The pivot is the biomechanical quantity and it is
     derived in core_geometry from the requested root length; clamping a drawing
@@ -2207,6 +2252,15 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
     # which is the ordinary single-arch case and skips the check entirely.
     ant = _antagonist(req.opposing_session_id)
     t_collide = 0.0
+    t_ipr = 0.0
+
+    # PER-STAGE INTERPROXIMAL, not once on the final pose. A tooth that is clear
+    # at T0 and clear at the setup can still close an embrasure to nothing in
+    # the middle, and the middle is where the trays are — measuring only the
+    # endpoint answers a question the clinician did not ask. This is the same
+    # measurement /export takes once; the cost of taking it every stage is
+    # reported in the manifest rather than assumed to be free.
+    IPR_WARN_MM = 0.5
 
     # --- one fused solid per stage ----------------------------------------
     blobs, stage_meta = {}, []
@@ -2214,10 +2268,29 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
     for k in range(1, total + 1):
         parts = [base_solid]
         interference = []
+        ipr_rows, ipr_worst = [], 0.0
         for t in teeth:
             rec, clinical = t["rec"], _stage_clinical(t["clinical"], k, total)
             M = cg.kinematic_matrix(rec["frame"], rec["c_res"], **clinical)
             parts.append(t["solid"].transform(np.asarray(M[:3, :4], float)))
+
+            # How far this tooth has closed its embrasures BY THIS STAGE.
+            # Measured against the tooth's own T0 crown, so it is a closure, not
+            # an absolute gap — the same convention /export uses.
+            ti = time.perf_counter()
+            try:
+                ipr = cg.measure_interproximal_penetration(
+                    rec["cv"], cg.apply_matrix(rec["cv"], M), rec["cf"],
+                    rec["bv"], rec["bf"], rec["frame"]["u_md"])
+            except Exception as e:                   # noqa: BLE001
+                # NEVER BLOCKING. This is a warning chip on a timeline; a
+                # measurement failing must not stop a stage from being built.
+                ipr = {"error": f"{type(e).__name__}: {e}"}
+            t_ipr += time.perf_counter() - ti
+            closure = float(ipr.get("max_closure_mm") or 0.0)
+            ipr_worst = max(ipr_worst, closure)
+            if closure > IPR_WARN_MM or ipr.get("over_threshold") or "error" in ipr:
+                ipr_rows.append({"tooth_id": t["tid"], "fdi": t["fdi"], **ipr})
 
             # NON-BLOCKING. A tooth may legitimately pass through contact on its
             # way somewhere — what the clinician needs is to be told, not
@@ -2331,6 +2404,19 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
             "fallback_detail": csg_info.get("fallback_detail"),
             "occlusal_interference": interference,
             "occlusal_warning": ANTAGONIST_WARNING if interference else None,
+            # YELLOW, not red, and deliberately: closing an embrasure is often
+            # the intent of the plan. What the clinician needs is to be told
+            # WHEN it happens, on which tooth, and by how much.
+            "interproximal_max_closure_mm": round(ipr_worst, 4),
+            "interproximal_state": ("YELLOW" if ipr_worst > IPR_WARN_MM else "GREEN"),
+            "interproximal_threshold_mm": IPR_WARN_MM,
+            "interproximal": ipr_rows,
+            "interproximal_warning": (
+                f"Interproximal closure reaches {ipr_worst:.2f}mm at this stage "
+                f"(threshold {IPR_WARN_MM}mm). This is a MEASURED GAP CLOSURE, "
+                f"not a prescription for enamel reduction, and a vertex-to-vertex "
+                f"minimum OVERESTIMATES the true clearance."
+                if ipr_worst > IPR_WARN_MM else None),
             "closed": True,
             "genus": int(solid.genus()),
             # Honest, per stage. See the note above for why this is reported
@@ -2377,6 +2463,23 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
             "seconds": round(t_collide, 3),
             "warning": ANTAGONIST_WARNING if any(
                 s["occlusal_interference"] for s in stage_meta) else None,
+        },
+        # Case-level interproximal summary, swept across every stage rather than
+        # sampled at the endpoint. The seconds are here so the cost of the sweep
+        # is a number in the manifest, not an assumption.
+        "interproximal": {
+            "threshold_mm": IPR_WARN_MM,
+            "stages_yellow": [s["stage"] for s in stage_meta
+                              if s["interproximal_state"] == "YELLOW"],
+            "worst_closure_mm": round(max(
+                (s["interproximal_max_closure_mm"] for s in stage_meta),
+                default=0.0), 4),
+            "seconds": round(t_ipr, 3),
+            "limitation": ("A vertex-to-vertex minimum OVERESTIMATES the true "
+                           "clearance: on a triangulated surface the closest "
+                           "points generally lie inside faces, not at vertices. "
+                           "This measures a gap closure and does not prescribe "
+                           "enamel reduction."),
         },
     }
 

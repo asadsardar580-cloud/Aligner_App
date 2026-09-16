@@ -5865,6 +5865,98 @@ def measure_interproximal_penetration(
                 noise_floor_mm=threshold_mm,
                 threshold_mm=threshold_mm, contact_mm=contact_mm, per_side=out)
 
+def sweep_interproximal_stages(
+    crown_verts_t0, crown_faces, base_verts, base_faces, mesiodistal_axis,
+    matrices, threshold_mm: float = 0.05, contact_mm: float = 0.30,
+    socket_exclusion_mm: float = 1.5, warn_mm: float = 0.5,
+):
+    """Interproximal closure at EVERY stage, not just the endpoint.
+
+    WHY THE ENDPOINT IS THE WRONG PLACE TO MEASURE. A tooth that is clear at T0
+    and clear at the planned setup can still close an embrasure to nothing
+    partway through — a rotation that swings a contact point past its neighbour
+    before bringing it back is the ordinary case, not a contrived one. The
+    clinician approves the scrub and the lab prints every stage, so the middle
+    is exactly where this has to be checked.
+
+    THE KD-TREES ARE BUILT ONCE. This is the same lesson the antagonist check
+    already learned (CLAUDE.md §11): rebuilding the tree per call was 43ms of
+    the 89ms a 2000-vertex crown cost, and a 31-stage sweep asks the same
+    question of a base that never changes. Here the base tree and the socket
+    exclusion both depend only on T0, so both hoist out of the loop entirely.
+
+    `matrices` is one 4x4 per stage, in order. Returns one row per stage plus a
+    summary. `state` is YELLOW above `warn_mm` and GREEN otherwise — never RED:
+    closing an embrasure is frequently the INTENT of the plan, and this software
+    measures a gap, it does not prescribe enamel reduction.
+
+    The measurement is a vertex-to-vertex minimum, which OVERESTIMATES the true
+    clearance: on a triangulated surface the closest points generally lie inside
+    faces rather than at vertices. Every row says so.
+    """
+    from scipy.spatial import cKDTree
+
+    axis = np.asarray(mesiodistal_axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+    t0 = np.asarray(crown_verts_t0, dtype=float)
+    base = np.asarray(base_verts, dtype=float)
+
+    proj = t0 @ axis
+    lo, hi = np.percentile(proj, 33), np.percentile(proj, 67)
+    sides = (("mesial", proj <= lo), ("distal", proj >= hi))
+
+    # Both of these depend only on T0, so they are computed once for the whole
+    # sweep instead of once per stage.
+    socket_tree = cKDTree(t0)
+    far_from_socket = socket_tree.query(base)[0] > socket_exclusion_mm
+    if not np.any(far_from_socket):
+        return {"stages": [], "worst_closure_mm": 0.0, "stages_yellow": [],
+                "threshold_mm": warn_mm,
+                "detail": "No base geometry outside the socket to measure against."}
+    tree = cKDTree(base[far_from_socket])
+
+    baseline = {name: float(tree.query(t0[sel])[0].min())
+                for name, sel in sides if np.any(sel)}
+
+    rows, worst, yellow = [], 0.0, []
+    for k, M in enumerate(matrices, start=1):
+        moved = apply_matrix(t0, np.asarray(M, float))
+        closure, per_side = 0.0, {}
+        for name, sel in sides:
+            if not np.any(sel):
+                continue
+            g1 = float(tree.query(moved[sel], workers=-1)[0].min())
+            c = max(0.0, baseline[name] - g1)
+            # The noise floor, applied here for the same reason it is applied in
+            # measure_interproximal_penetration: scanners resolve to 20-50
+            # microns, so a 0.001mm "closure" is the mesh, not the movement.
+            if c < threshold_mm:
+                c = 0.0
+            closure = max(closure, c)
+            per_side[name] = {"clearance_before_mm": round(baseline[name], 4),
+                              "clearance_after_mm": round(g1, 4),
+                              "closed_by_mm": round(c, 4),
+                              "in_contact": bool(g1 <= contact_mm)}
+        tightest = min((d["clearance_after_mm"] for d in per_side.values()),
+                       default=None)
+        state = "YELLOW" if closure > warn_mm else "GREEN"
+        if state == "YELLOW":
+            yellow.append(k)
+        worst = max(worst, closure)
+        rows.append({"stage": k, "max_closure_mm": round(closure, 4),
+                     "min_clearance_mm": tightest, "state": state,
+                     "over_threshold": bool(tightest is not None
+                                            and tightest <= contact_mm),
+                     "per_side": per_side})
+
+    return {"stages": rows, "worst_closure_mm": round(worst, 4),
+            "stages_yellow": yellow, "threshold_mm": warn_mm,
+            "contact_threshold_mm": contact_mm, "noise_floor_mm": threshold_mm,
+            "limitation": ("A vertex-to-vertex minimum OVERESTIMATES the true "
+                           "clearance. This measures a gap closure and does not "
+                           "prescribe enamel reduction.")}
+
+
 def export_planned_setup(
     crown_verts, crown_faces, base_verts, base_faces,
     mesiodistal_axis, out_dir: str, arch_name: str = "arch",

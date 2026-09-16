@@ -168,8 +168,19 @@ def test_teeth_with_geometry_restores_the_crown_exactly():
         assert len(t["socket_cap"]["faces"]) == len(cut["socket_cap"]["faces"]), \
             "socket cup triangle count differs"
         assert t["root_cone"]["vertices"], "no virtual root returned"
-        assert t["root_cone"]["length_mm"] == cut["root_length_mm"], \
-            "restored root cone has a different length from the one that was cut"
+        # The cone the CLIENT DRAWS may be shorter than the root requested: it is
+        # clamped to the scan's own apical extent so a violet cone cannot hang
+        # below the cast in space that was never imaged. This fixture is a 1.7mm
+        # dome, so the clamp fires here and would not on a real arch (measured:
+        # 0 of 12 ridge points on case_lower.stl clamp a 9, 10 or 13mm root).
+        #
+        # What must round-trip is the REQUESTED length, because that is what
+        # C_res was derived from - and a cone whose DRAWN length changed across a
+        # reload while its requested length did not is the real regression.
+        assert t["root_cone"]["requested_mm"] == cut["root_length_mm"],             "restored root cone requests a different length from the one cut"
+        assert t["root_cone"]["length_mm"] == cut["root_cone"]["length_mm"],             "restored root cone is drawn at a different length from the cut"
+        assert t["root_cone"]["clamped"] == cut["root_cone"]["clamped"]
+        assert t["root_cone"]["length_mm"] <= t["root_cone"]["requested_mm"] + 1e-9,             "a clamp must only ever shorten the drawn cone"
 
         import json
         json.dumps(full)

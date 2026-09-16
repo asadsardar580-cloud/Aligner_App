@@ -36,6 +36,20 @@ import validation
 # --- verdicts -------------------------------------------------------------
 PASS = "PASS"
 REVIEW = "REVIEW"
+
+# Below this, a label is not trustworthy enough to drive a cut on its own.
+#
+# WHY IT IS SEPARATE FROM THE PASS BAR. `verdict` is PASS only at >= 0.99,
+# because ANY disagreeing factor is worth a clinician's eye. That bar is
+# deliberately strict and would be useless as a blocking gate — nearly every
+# tooth would block. 0.70 is where the label stops being a usable default: it
+# means roughly a third of the checkable evidence disagrees, so the FDI (and
+# therefore the Wheeler root length derived from it, and the number on the lab
+# manifest) is more likely wrong than a coin toss on the failing factors.
+#
+# It does NOT refuse the cut. It refuses to let the MACHINE'S GUESS drive it:
+# the clinician places the two landmarks themselves and the cut proceeds.
+AUTO_CUT_MIN_CONFIDENCE = 0.70
 FAIL = "FAIL"
 
 # --- thresholds. All HEURISTIC: chosen from the cases in this repo. -------
@@ -162,6 +176,16 @@ def review_tooth(label, face_mask, verts, faces, arch, total_faces,
         "surface_area_mm2": round(area, 1),
         "width_mm": None if width is None else round(width, 2),
         "needs_review": verdict != PASS,
+        # A HARDER state than needs_review, and the two are not the same thing.
+        # needs_review says "look at this". This says "do not let it choose the
+        # root length or the landmarks for you".
+        "blocks_auto_cut": bool(verdict == FAIL
+                                or confidence < AUTO_CUT_MIN_CONFIDENCE),
+        "auto_cut_threshold": AUTO_CUT_MIN_CONFIDENCE,
+        "action": ("REVIEW REQUIRED — place the mesial and distal landmarks by "
+                   "hand; this label is not reliable enough to derive them from."
+                   if (verdict == FAIL or confidence < AUTO_CUT_MIN_CONFIDENCE)
+                   else None),
     }
 
 

@@ -379,6 +379,29 @@ export default function App() {
   // messages.
   const [health, setHealth] = useState({ state: "checking", detail: "" });
 
+  /**
+   * Arches whose scan could not be rehydrated, as a PERSISTENT banner.
+   *
+   * The server already told us this and nobody was listening: /api/case/restore
+   * returns a per-arch `missing[]` with a reason for each, and the session
+   * restore path knows exactly which saved ids came back 404. Both used to end
+   * up as one line in the status bar — which the very next setStatus overwrites,
+   * often within the same second. A clinician who has to supply a file needs the
+   * request to still be on screen when they go looking for it.
+   */
+  const [rehydrate, setRehydrate] = useState([]);
+
+  /**
+   * Per-FDI segmentation verdicts from the last /segment run, and the banner
+   * that fires when the selected tooth's label is not trustworthy.
+   *
+   * `reviewByFdi` is a ref, not state: it is read inside a pointer handler and
+   * changes only once per segmentation run, so putting it in state would
+   * re-render the sidebar for nothing.
+   */
+  const reviewByFdi = useRef({});
+  const [reviewFlag, setReviewFlag] = useState(null);
+
   // Attachment placement. Kept out of `tool` because it is a MODE over the
   // selected crown rather than another selection brush - the wand and brush
   // paint the arch, this one bonds to a tooth that has already been cut.
@@ -600,6 +623,18 @@ export default function App() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(clinicalValues)
+          }).then(async (r) => {
+            if (!r.ok) return;
+            const d = await r.json();
+            // A drag commits the same way a typed value does, so it must also
+            // refresh the per-stage interproximal chips. Leaving this out would
+            // make the timeline correct only for teeth moved by typing.
+            if (rec) rec.stageClearance = d.stage_clearance || null;
+            setStaging((prev) => ({ ...prev, perTooth: prev.perTooth.map((row) =>
+              row.tid === st.activeTooth
+                ? { ...row, yellowStages: d.stage_clearance?.stages_yellow || [],
+                    worstClosureMm: d.stage_clearance?.worst_closure_mm ?? null }
+                : row) }));
           }).catch(console.error);
         }
       }
@@ -934,7 +969,9 @@ export default function App() {
     const rows = Object.entries(teeth.current).map(([tid, rec]) => {
       const s = stagingFor(rec.clinical);
       return { tid, fdi: rec.fdi, stages: s.stages, driver: s.driver, channel: s.channel,
-               occlusion: rec.occlusion || null };
+               occlusion: rec.occlusion || null,
+               yellowStages: rec.stageClearance?.stages_yellow || [],
+               worstClosureMm: rec.stageClearance?.worst_closure_mm ?? null };
     }).filter((r) => r.stages > 0);
     const total = rows.reduce((m, r) => Math.max(m, r.stages), 0);
     rows.forEach((r) => { r.binds = r.stages === total; });
@@ -1147,6 +1184,13 @@ export default function App() {
       setBusy(false);
 
       const names = Object.keys(restored);
+      const lost = entries.filter(([archName]) => !(archName in restored))
+                          .map(([archName, sid]) => ({
+                            arch: archName, session_id: sid,
+                            reason: "the session expired on the backend "
+                                  + "(sessions are memory-only by design)" }));
+      if (lost.length) setRehydrate(lost);
+
       if (!names.length) {
         try { window.localStorage.removeItem(CASE_KEY); } catch { /* ignore */ }
         setStatus("Previous case has expired. Load an arch to begin.");
@@ -1279,6 +1323,26 @@ export default function App() {
       // in flight sees a null start and returns instead of overwriting it.
       segmentStartedAt.current = null;
       setStatus(`Segmentation complete${took} — root lengths will now default per tooth.`);
+
+      // Ask what the model's own output is worth. The endpoint has existed
+      // since the review work and nothing called it, so every label reached the
+      // clinician looking equally authoritative — including the ones where a
+      // third of the checkable evidence disagrees.
+      try {
+        const rr = await fetch(`${API}/api/session/${sid}/segmentation-review`);
+        if (rr.ok) {
+          const rev = await rr.json();
+          reviewByFdi.current = Object.fromEntries(
+            (rev.teeth || []).map((t) => [t.fdi, t]));
+          const blocked = (rev.teeth || []).filter((t) => t.blocks_auto_cut);
+          if (blocked.length) {
+            setStatus(`Segmentation complete${took} — ${blocked.length} of `
+              + `${rev.teeth.length} labels are below the `
+              + `${blocked[0].auto_cut_threshold} confidence needed to derive `
+              + `landmarks automatically. Those teeth need manual landmarks.`);
+          }
+        }
+      } catch { /* a review is advisory; its absence must not fail a segment */ }
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
       segmentStartedAt.current = null;
@@ -1530,6 +1594,14 @@ export default function App() {
           ? ` ${d.occlusal_warning} (${d.occlusion.max_penetration_mm}mm into the antagonist.)`
           : "";
         rec.occlusion = d.occlusion || null;
+        // One row per stage, computed server-side on this commit. The timeline
+        // indexes it; nothing measures interproximal during a scrub, which
+        // would put a KD-tree query inside a 60 FPS loop.
+        rec.stageClearance = d.stage_clearance || null;
+        setStaging((prev) => ({ ...prev, perTooth: prev.perTooth.map((r) =>
+          r.tid === tid ? { ...r, yellowStages: d.stage_clearance?.stages_yellow || [],
+                            worstClosureMm: d.stage_clearance?.worst_closure_mm ?? null }
+                        : r) }));
         if (d.clearance?.over_threshold) {
           setStatus(`Interproximal contact: ${d.clearance.min_clearance_mm}mm clearance. `
                     + `${d.staging.stages_required} stages required.${warn}`);
@@ -1868,6 +1940,29 @@ export default function App() {
       setSelection(data.vertex_ids);
       highlightSelection(arches.current[hit.archName].geometry, data.vertex_ids);
       setStatus(`Selected ${data.vertex_ids.length} vertices. (Auto-tolerance: ${data.tolerance.toFixed(1)})`);
+
+      // CONFIDENCE GATE. If the model's label for this region is below the
+      // auto-cut threshold, the FDI is not reliable enough to choose the root
+      // length or to stand on a lab manifest — so the landmarks are cleared and
+      // the two-click picker is ARMED, with the tooth already selected. The cut
+      // is not refused: the clinician places the landmarks and it proceeds.
+      // What is refused is letting the machine's guess do it for them.
+      const selFdi = fdiForSelection(data.vertex_ids);
+      const rev = selFdi == null ? null : reviewByFdi.current[selFdi];
+      if (rev?.blocks_auto_cut) {
+        setMesialPt(null);
+        setDistalPt(null);
+        setPickMode("mesial");
+        setReviewFlag({
+          fdi: selFdi,
+          confidence: rev.confidence,
+          threshold: rev.auto_cut_threshold,
+          failed: rev.failed_factors || [],
+          action: rev.action,
+        });
+      } else {
+        setReviewFlag(null);
+      }
       
       fetch(`${API}/api/session/${sid}/selection`, {
         method:"PUT", headers:{"Content-Type":"application/json"},
@@ -2074,6 +2169,61 @@ export default function App() {
         </PanelGroup>
       </aside>
       <main ref={mountRef} style={{...S.canvas, cursor: pickMode ? "crosshair" : (tool === "wand" ? "crosshair" : "cell")}} onPointerDown={onPointerDown} onPointerMove={onPointerMove}>
+        {/* PERSISTENT, not a status line. It stays until the scan is supplied
+            or the clinician dismisses it, because the next setStatus would
+            otherwise erase a request for a file within the second. */}
+        {rehydrate.length > 0 && (
+          <div style={S.rehydrate} data-testid="rehydrate-banner">
+            <div style={S.rehydrateHead}>
+              [Session Restored] Please select STL scan file to re-hydrate 3D viewport
+            </div>
+            <div style={S.rehydrateBody}>
+              The treatment plan is intact — prescriptions, occlusal reference and
+              stage counts are all held. What is missing is the mesh itself, which
+              is never written to disk unencrypted and is not recoverable from the
+              plan. Load the same file for{" "}
+              {rehydrate.map((m) => m.arch).join(" and ")}; the scan hash recorded
+              in the plan is checked against it, so the wrong file cannot be
+              accepted silently.
+              <ul style={S.rehydrateList}>
+                {rehydrate.map((m) => (
+                  <li key={m.arch}>
+                    <b>{m.arch}</b> — {m.reason}
+                    {m.scan_hash ? ` (scan ${m.scan_hash.slice(0, 12)}…)` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+            <button style={S.rehydrateDismiss} onClick={() => setRehydrate([])}
+                    data-testid="rehydrate-dismiss">Dismiss</button>
+          </div>
+        )}
+        {reviewFlag && (
+          /* Offset when the re-upload banner is also up, so one does not sit on
+             top of the other. Both are absolutely positioned over the canvas. */
+          <div style={{ ...S.reviewBanner,
+                        top: rehydrate.length > 0 ? 152 : 12 }}
+               data-testid="segmentation-review-banner">
+            <div style={S.reviewHead}>
+              REVIEW REQUIRED — FDI {reviewFlag.fdi} segmentation confidence{" "}
+              {reviewFlag.confidence.toFixed(2)} (below {reviewFlag.threshold})
+            </div>
+            <div style={S.rehydrateBody}>
+              {reviewFlag.action} The mesial and distal points have been cleared
+              and the picker is armed — click the tooth&rsquo;s mesial contact,
+              then its distal contact.
+              {reviewFlag.failed.length > 0 && (
+                <div style={{ marginTop: 6 }}>
+                  What disagrees: <b>{reviewFlag.failed.join(", ")}</b>. This is
+                  weighted agreement over independently checkable geometry, NOT a
+                  model probability — the model emits no calibrated uncertainty.
+                </div>
+              )}
+            </div>
+            <button style={S.rehydrateDismiss} onClick={() => setReviewFlag(null)}
+                    data-testid="segmentation-review-dismiss">Dismiss</button>
+          </div>
+        )}
         <StagingTimeline totalStages={staging.total} stage={stage} playing={playing}
                          perTooth={staging.perTooth}
                          onStage={goToStage} onPlayPause={togglePlay} />
@@ -2085,6 +2235,25 @@ export default function App() {
 
 const S = {
   app: { display: "grid", gridTemplateColumns: "300px 1fr", gridTemplateRows: "1fr auto", height: "100vh", background: "#0d0f12", color: "#e7ebee", fontFamily: "system-ui, sans-serif", fontSize: 13 },
+  rehydrate: { position: "absolute", top: 12, left: 12, right: 12, zIndex: 20,
+               background: "rgba(42,33,19,0.96)", border: "1px solid #5a4620",
+               borderRadius: 6, padding: "11px 14px", color: "#ffd9a0",
+               fontSize: 12, lineHeight: 1.5, backdropFilter: "blur(4px)" },
+  rehydrateHead: { color: "#ffa53c", fontWeight: 700, marginBottom: 5 },
+  // Stacked under the re-upload banner when both are live. Same amber family:
+  // both are "the software needs something from you", not "something is wrong
+  // with the patient".
+  reviewBanner: { position: "absolute", top: 12, left: 12, right: 12, zIndex: 19,
+                  marginTop: 0, background: "rgba(42,33,19,0.96)",
+                  border: "1px solid #5a4620", borderRadius: 6,
+                  padding: "11px 14px", color: "#ffd9a0", fontSize: 12,
+                  lineHeight: 1.5, backdropFilter: "blur(4px)" },
+  reviewHead: { color: "#ffa53c", fontWeight: 700, marginBottom: 5 },
+  rehydrateBody: { color: "#d9c9ad" },
+  rehydrateList: { margin: "7px 0 0", paddingLeft: 18 },
+  rehydrateDismiss: { marginTop: 9, background: "transparent", color: "#ffa53c",
+                      border: "1px solid #5a4620", borderRadius: 4,
+                      padding: "4px 10px", fontSize: 11, cursor: "pointer" },
   rail: { gridRow: "1 / 3", background: "#1a1d22", borderRight: "1px solid #2c313a", padding: 16, overflowY: "auto" },
   title: { fontSize: 15, fontWeight: 600, margin: "0 0 18px" },
   titleTight: { fontSize: 15, fontWeight: 600, margin: "0 0 10px" },

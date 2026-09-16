@@ -219,5 +219,18 @@ def analyse(teeth: list[dict], arch: str, occlusal_axis, arch_centre,
     else:
         summary = "No extracted crowns to measure yet."
 
+    # WHICH POSE WAS MEASURED, stated in the payload. A contact table is read as
+    # a statement about the plan, so it has to say whether it describes the
+    # planned setup or the untouched malocclusion. This used to measure T0 while
+    # the clinician was looking at the setup, and nothing in the response said so.
+    n_posed = sum(1 for t in teeth if t.get("posed"))
     return {"widths": widths, "interproximal": contacts, "summary": summary,
-            "crowns_measured": len(widths["teeth"])}
+            "crowns_measured": len(widths["teeth"]),
+            "teeth_posed": n_posed,
+            "pose": ("planned setup" if n_posed else "T0 (nothing committed yet)"),
+            "pose_note": (
+                f"Measured on {n_posed} of {len(teeth)} crowns in their committed "
+                f"pose; the rest have no prescription and sit at T0."
+                if n_posed else
+                "No prescription has been committed, so this describes the "
+                "malocclusion as scanned.")}

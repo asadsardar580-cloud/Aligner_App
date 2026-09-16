@@ -35,6 +35,15 @@ export default function StagingTimeline({ totalStages, stage, playing, perTooth,
   const pct = totalStages > 0 ? (stage / totalStages) * 100 : 0;
   const atEnd = stage >= totalStages;
 
+  // Stages where SOME tooth closes an embrasure by more than 0.5mm, measured
+  // server-side once per commit (never during a scrub — that would put a
+  // KD-tree query inside the 60 FPS path). Yellow, deliberately not red:
+  // closing a contact is frequently the intent of the plan. The clinician needs
+  // to know WHEN it happens and on which tooth, not to be stopped.
+  const yellowStages = new Set();
+  for (const t of perTooth) for (const k of t.yellowStages || []) yellowStages.add(k);
+  const hereYellow = perTooth.filter((t) => (t.yellowStages || []).includes(stage));
+
   return (
     <div style={S.bar}>
       <div style={S.controls}>
@@ -61,6 +70,17 @@ export default function StagingTimeline({ totalStages, stage, playing, perTooth,
           </Slider.Track>
           <Slider.Thumb style={S.sliderThumb} />
         </Slider.Root>
+        {/* One marker per flagged stage, positioned on the same 0..totalStages
+            scale the slider uses, so a clinician can see where the tight
+            stages are before scrubbing onto them. */}
+        {yellowStages.size > 0 && (
+          <div style={S.markers} aria-hidden="true">
+            {[...yellowStages].sort((a, b) => a - b).map((k) => (
+              <span key={k} style={{ ...S.marker,
+                                     left: `${(k / totalStages) * 100}%` }} />
+            ))}
+          </div>
+        )}
         <div style={S.ticks}>
           <span>T0</span>
           <span style={S.stageLabel}>
@@ -70,6 +90,17 @@ export default function StagingTimeline({ totalStages, stage, playing, perTooth,
           </span>
           <span>{totalStages}</span>
         </div>
+        {hereYellow.length > 0 && (
+          <div style={S.iprChip} data-testid="ipr-warning"
+               title={"MEASURED GAP CLOSURE, NOT A PRESCRIPTION. Enamel reduction "
+                    + "is a clinical decision; this is a vertex-to-vertex minimum, "
+                    + "which OVERESTIMATES the true clearance."}>
+            <span style={S.iprMark}>▲</span>
+            Interproximal closure &gt; 0.5 mm at stage {stage} —{" "}
+            {hereYellow.map((t) => `${t.fdi ?? t.tid.slice(0, 4)} `
+              + `(${(t.worstClosureMm ?? 0).toFixed(2)} mm)`).join(", ")}
+          </div>
+        )}
       </div>
 
       <div style={S.legend}>
@@ -121,7 +152,17 @@ const S = {
     borderRadius: 5, cursor: "pointer",
   },
   play: { background: "linear-gradient(#3fc6d4,#2a8b96)", color: "#0d0f12", width: 34 },
-  track: { display: "flex", flexDirection: "column", gap: 3 },
+  track: { display: "flex", flexDirection: "column", gap: 3, position: "relative" },
+  markers: { position: "absolute", left: 0, right: 0, top: 13, height: 6,
+             pointerEvents: "none" },
+  marker: { position: "absolute", width: 2, height: 6, marginLeft: -1,
+            background: "#e8a06a", borderRadius: 1 },
+  // Amber. A red chip here would read as a clinical finding about the tooth,
+  // and this is a measurement about a gap.
+  iprChip: { marginTop: 3, display: "flex", alignItems: "center", gap: 6,
+             padding: "3px 8px", borderRadius: 4, background: "#2a2113",
+             border: "1px solid #5a4620", color: "#ffbe63", fontSize: 11 },
+  iprMark: { color: "#e8a06a", fontSize: 10 },
   sliderRoot: {
     position: "relative", display: "flex", alignItems: "center",
     userSelect: "none", touchAction: "none", height: 18, width: "100%",
