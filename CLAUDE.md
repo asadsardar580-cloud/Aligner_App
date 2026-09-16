@@ -16,7 +16,7 @@ Teeth must move biologically. Meshes must be mathematically watertight for 3D pr
 
 | | Live |
 |---|---|
-| API | **`api_core.py`** — `uvicorn api_core:app`, 31 routes. Launched by `start_backend.bat`. |
+| API | **`api_core.py`** — `uvicorn api_core:app`, 33 paths. Launched by `start_backend.bat`. |
 | Client | **`frontend/src/App.jsx`** — `npm run dev`, launched by `start_frontend.bat`. |
 | Geometry | **`core_geometry.py`** — pure NumPy/SciPy, headless, the engine. |
 | Docs | **`CLAUDE.md`** (this file) and **`README.md`**. No other document is authoritative. |
@@ -30,8 +30,8 @@ that used to shadow the real `tooth_segmentation/` modules.
 
 ```
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names without importing (84 files)
-python run_all_tests.py                 # CANONICAL runner — 34 entries
+python check_structure.py               # undefined names without importing (88 files)
+python run_all_tests.py                 # CANONICAL runner — 36 entries
 python -m pytest -q                     # runs alongside; both must pass
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 cd frontend && npm run lint && npm run build && npm run smoke
@@ -747,7 +747,223 @@ OBJECT space, and a cut crown carries its prescription as a committed 4x4 — us
 it raw places attachments correctly on an unmoved tooth and progressively wrongly
 on a moved one.
 
-## 18. KNOWN OPEN ISSUES
+## 18. RESOLVED: FAIL-SAFES, FAULT TOLERANCE, AND A DEVSECOPS STAGE
+
+**The happy paths in this brief were already built and green. What was almost
+entirely absent was the CONTINGENCY half of each** — and two audits found
+**four defects that reported themselves as fine**, which are worth more than
+any fail-safe added beside them.
+
+**1. `three.current` was REPLACED after `sun` and `catcher` were attached to it.**
+Two lines assigned them onto the object; a few lines later
+`three.current = { scene, camera, renderer, controls, raycaster }` discarded the
+whole thing. `aimShadows` opens with `if (!sun || !catcher) return;`, so **the
+entire shadow rig has never armed** — no throw, no warning, just no shadow. This
+is the same class as the record-vs-`Object3D` confusion in §18's old entry, and
+the same lesson: **the silent half of a bug is the half that survives a fix.**
+
+**2. `shadowsDirty` was written by `aimShadows` and nothing else**, while the
+comment beside the flag claimed a cut or a committed transform set it too. Every
+extraction and every tooth movement left the shadow of the **pre-cut arch** on
+the catcher. It is now set in `executeCut`, both kinematics commit handlers, and
+both attachment handlers. `autoUpdate=false` was correct; the re-arm was broken.
+
+**3. There was no React error boundary at all.** This app has white-screened
+**five** times from temporal-dead-zone errors, every one of which built cleanly.
+`ErrorBoundary.jsx` leads with the recovery — *the scan, the occlusal reference,
+every cut and every committed movement are held in the session on the backend* —
+because after five white screens that matters more than a stack trace.
+
+**4. `over_threshold` was computed from `contact_mm` (0.30) while sitting beside
+a field named `threshold_mm` (0.05) that was compared against nothing.** Any
+reader assumes the flag means 0.05. The flag's **value is unchanged** — two
+consumers gate on it — but the payload now carries `contact_threshold_mm` and
+`noise_floor_mm` under names that say which is which, and `threshold_mm` finally
+functions as the noise floor it claimed to be: **a 0.01mm closure is the mesh,
+not the movement**, and scanners resolve to 20–50 microns.
+
+Also: `core_geometry.py:438` was **the only silent `except: pass` on the live
+geometry path**, sitting directly under hole capping. It now warns and names the
+fan fallback.
+
+### Three measurements that decided a design, and would have been wrong to guess
+
+**The NaN gate exists because of how NaN compares.** `condition_mesh` drops a
+face when `area <= 1e-12`. Every comparison against NaN is False, so a NaN
+triangle has `area = nan`, is not `<= 1e-12`, and **survives the one filter
+whose job is to remove it** — then dies in `cap_boundary_loop` as `LinAlgError:
+SVD did not converge`, which reaches a clinician as an opaque 500 about a file
+that opens everywhere else. `sanitize_scan` is **delete-only**, because rule 3.1
+is the constraint on the repair: a repair that quietly re-centred a damaged arch
+would fix the crash and break inter-arch registration, which is worse. A test
+asserts surviving vertices are **bit-identical** to the upload, and a clean scan
+returns *the same objects*.
+
+**`trimesh.repair.sanitize()` does not exist** — not in trimesh 5.1.0 and not in
+any release. The nearest real API is `Trimesh.remove_infinite_values()`. The gate
+is NumPy so it is provably delete-only and works with the optional wheel absent;
+a test cross-checks the two produce identical surviving geometry.
+
+**The root-cone clamp uses the scan's GLOBAL apical extent, not a local one.**
+The obvious choice is the depth in a cylinder around the tooth, and it is wrong.
+Sampling 12 ridge points on `case_lower.stl`:
+
+| bound | median depth | clamps a 13mm canine |
+|---|---|---|
+| local, within 6mm | 12.24 mm | **7 of 12** |
+| global | 14.58 mm | **0 of 12** |
+
+The local bound measures the vestibular depth, which is normal anatomy. The
+global bound fires only on a cropped or shallow scan. **A warning that fires on
+healthy anatomy is the same as no warning** — the same lesson as
+`ToothCandidate.confidence` being unconditionally `needs_review`.
+
+**Hoisting the KD-trees is what makes a per-stage interproximal sweep possible.**
+94,848-vertex base, 2,000-vertex crown, 31 stages: **8.856 s → 0.514 s, 17.2×**
+(285.7 → 16.6 ms/stage). Same lesson as the antagonist index in §11. It runs once
+per commit on `/kinematics`, never during a scrub — a KD-tree query inside a
+60 FPS loop is exactly what the refs-and-rAF path exists to avoid.
+
+### Four things that were right to refuse, and one that was wrong to assume
+
+**Welding the arch to fix a BVH build would be a cure worse than the disease.**
+`mergeVertices` renumbers vertices, and an arch vertex id is the contract with
+the backend session — `BrushIndex`, the wand selection and the cumulative
+extraction mask are all keyed on it, and the server's `verts` array is never
+rebuilt (§6). Repairing a raycast by silently re-pointing every selection at
+different anatomy is far worse than a 13 ms cast. `allowWeld` defaults to
+**false**; crowns, whose ids are local and replaced wholesale from each payload,
+opt in. The arch's realistic failure — NaN coordinates — is caught at upload
+instead, where it can be repaired without renumbering.
+
+**`|det − 1| < 1e-6` does NOT catch a transposition, and the brief names it for
+that job.** `det(Mᵀ) = det(M)` for every matrix there is, so transposing a rigid
+4×4 leaves the determinant at exactly 1.0 and a bar of any tightness passes it.
+What a transposition actually does is move the translation out of the last column
+into the **bottom row**, which is the perspective-divide explosion rule 4 warns
+about. Both checks now run: observed `|det−1|` **3.33e-16**, bottom row
+**0.00e+0**, agreement unchanged at **1.78e-15**.
+
+**An inverted-winding input does not make `manifold3d` raise.** It unions an
+inverted solid and returns a different volume, silently — measured 0.125 mm³
+where 1.875 was correct. The repair cascade cannot catch that and does not claim
+to. What it does catch: an open shell repairs at rung 1 to the correct volume and
+is recorded as `CSG_REPAIR_CASCADE_APPLIED`; triangle soup is **refused 422
+naming every rung tried**. There is deliberately no displacement-carving rung —
+a tray thermoformed from a solid the software had to carve into shape is worse
+than a tray that was never made.
+
+**The weld rung uses 1e-5 to FIND duplicates, not to replace them.** Snapping
+survivors to the lattice is a different operation; a test asserts every surviving
+coordinate is an original, from a deliberately off-lattice input.
+
+### The telemetry denylist needed two sets, and the first version proved it
+
+Reusing `audit.py`'s single denylist **dropped 6 of 8 attributes including every
+count**, because `faces` is an array of triangles in an audit entry and a scalar
+187,625 in a span — the single most useful thing to record about `/cut`.
+Identifiers are dropped whatever their type (*a name is an ordinary scalar
+string, and no shape check will ever flag it*); geometry keys matter only for
+non-scalars, and **every non-scalar is reduced to its type and length whatever
+the key is called**, which is what catches `attrs={"debug": verts.tolist()}`.
+Measured: 94,848 vertices under three innocent key names produce a **315-byte
+span**.
+
+**`record_span()` exists because the first wiring lied.** `/cut` logged
+`duration_ms: 0.0` beside `seconds: 0.352`, because a context manager opened
+where the counts are known wraps nothing. **A field named duration that reads
+zero for a multi-second operation is worse than no field.** Now 452.1 ms on a
+real cut.
+
+**`SimpleSpanProcessor`, not `Batch`.** A span buffered in memory is a span that
+is NOT on disk when the process dies, and the ones worth having are written just
+before something went wrong. Batching also made every telemetry test read an
+empty file, which is how it was found. Both backends emit an identical schema so
+a support engineer never has to work out which produced a line.
+
+**FILE EXPORTER ONLY, and that is the design rather than a default.** There is no
+OTLP exporter, no collector endpoint, and no environment variable that can turn
+one on. An observability SDK is a data-egress path wearing a helpful hat, and the
+ordinary way it gets configured is `OTEL_EXPORTER_OTLP_ENDPOINT`, set by somebody
+not thinking about PHI. A semgrep rule fails the build on any network exporter,
+and a test parses `telemetry.py`'s **AST — not its prose** — to prove none is
+referenced. (The first version grepped the file and failed on the docstring that
+*explains* why they must not appear. A test that cannot tell an explanation from
+an implementation will either be deleted or will force the explanation out, and
+the explanation is the more valuable of the two.)
+
+### Two semgrep rules could not fire, and a clean scan hid it
+
+**Every rule was verified against a deliberately bad probe file before being
+trusted**, which caught both:
+
+* `pattern-not-inside: def test_$F(...)` is not valid semgrep — there is no
+  partial-identifier metavariable. It failed to parse, which **disabled the whole
+  rule** while the scan still reported success.
+* `pattern: dangerouslySetInnerHTML={...}` never matches; semgrep parses a bare
+  JSX attribute as an expression. It has to be anchored to an element.
+
+**A clean scan from a rule that cannot match is indistinguishable from a clean
+scan from a rule that can.** Repo scan: **9 rules, 209 targets, 0 findings, 0
+parse errors.** It is a CI job and deliberately **not** a pre-commit hook: a hook
+that costs seconds per commit is bypassed with `--no-verify` within a week, and a
+check that is routinely bypassed is worse than one that is absent, because it is
+believed in.
+
+### Other behaviour that changed
+
+**`space_analysis` measured T0 crowns** (`t["cv"]`, the crown exactly as cut)
+while the clinician was looking at the planned setup — so every contact it
+reported described the malocclusion they started with. It now poses each crown,
+and the payload **states which pose it measured**, because a contact table is
+read as a statement about the plan.
+
+**C_res projection is clamped to `[7, 15]` mm and reported every time.** This is
+NOT `validation.ROOT_LENGTH_MIN/MAX` (4–30mm) and the two must not be conflated:
+that band refuses a typo, this one clamps a plausible-but-out-of-envelope value.
+A silent 2mm pivot shift is only visible months later, as a tooth that tipped
+where it should have translated. A non-finite root length is **refused** rather
+than clamped, because `min`/`max` pass NaN straight through.
+
+**Low segmentation confidence opens the landmark picker instead of driving the
+cut.** `AUTO_CUT_MIN_CONFIDENCE` (0.70) is separate from the PASS bar (0.99) on
+purpose: PASS is strict because any disagreeing factor deserves an eye, and would
+be useless as a blocking gate. The cut is **not refused** — the landmarks are
+cleared, the two-click picker is armed with the tooth selected, and the clinician
+places them. What is refused is the machine's guess doing it for them.
+
+**The re-upload banner is persistent, and that is the entire point.** The backend
+has returned a per-arch `missing[]` with reasons since the scan cache landed and
+nothing consumed it; the session-restore path put its message in the status bar,
+which the next `setStatus` overwrites — often within the second. An E2E spec
+waits through several health-poll ticks and asserts the banner is still there.
+
+**`.gitignore` now excludes `storage/` and the Fernet keys.** An arch mesh
+identifies a person the way a fingerprint does, and a key committed beside its
+own ciphertext is not encryption. Verified nothing of the sort ever reached
+history.
+
+**§2.5 needed no work.** The `<details>` fallback triggers above **+50 KB gzip**
+and Radix measured **+11.0 KB**. Recorded, not built.
+
+Measured, before → after:
+
+| | before | after |
+|---|---|---|
+| `run_all_tests.py` | 34/34 | **36/36** |
+| `pytest` | 225 | **237** |
+| `check_structure.py` | 84 files | **88 files** |
+| browser E2E | 11 passed / 1 skipped | **19 specs**, 12 pass / 7 need the backend |
+| semgrep | none | **9 rules, 209 targets, 0 findings** |
+| `npm run lint` | 0 | **0** |
+| bundle gzip | 250.7 KB | **264.19 KB** (+13.5 KB, `BufferGeometryUtils` + fail-safe UI) |
+| `verify-kinematics` | 1.78e-15 | **1.78e-15**, plus `|det−1|` 3.33e-16 |
+| API paths | 31 | **33** (`/audit`, `/telemetry`) |
+
+Covered by `test_failsafes.py` (18), `test_telemetry.py` (12) and
+`frontend/e2e/failsafes.spec.js` (7).
+
+## 19. KNOWN OPEN ISSUES
 * **RESOLVED 2026-09-15 — the suite is 24/24.** `test_api_core.py` was rewritten against the
   current endpoints and `test_face_order.py` took the one-line `stl_io.parse_stl_bytes` fix. Both
   had been red on a **stale API surface**, never on geometry, which is why nothing downstream ever
@@ -758,9 +974,25 @@ on a moved one.
   the API boundary) and **every session endpoint 404s rather than 500s on an expired session**.
   `/segment` is deliberately excluded: a 64MB checkpoint and ~236s is a runtime property of the
   model, not of the module.
-  **Read 24/24 with the caveat below** — 3 of those entries assert nothing.
+  **RESOLVED 2026-09-16: the suite is 36/36 and every entry carries enforcing assertions.**
+* `/teeth` **is** called on load now — see §14. A refresh restores crowns, poses, the occlusal
+  frame and the labels; only the session id lives in `localStorage`, and when it no longer
+  resolves the persistent re-upload banner says so (§18).
+* **OPEN — the CSG repair cascade has never fired on real geometry.** It is exercised on an open
+  shell and on triangle soup, and both behave as designed, but no real scan has yet produced a
+  boolean that `manifold3d` refuses. The rungs are the right ones in principle; which rung a real
+  failure lands on is unmeasured.
+* **OPEN — the C_res clamp has never fired outside a test.** The slider is bounded 7–16mm in the
+  UI and `rootDefaultForFDI` returns 9–13, so reaching it needs an unsegmented case with the
+  slider at 16. The arithmetic and the warning are pinned; a clinical trigger is not.
+* **OPEN — `sanitize_scan` has never seen a genuinely damaged scan.** `case_lower.stl` is clean,
+  so the gate is proved on a synthetic fixture and cross-checked against trimesh. That the repair
+  is delete-only is asserted; that it is *sufficient* for whatever a real scanner emits is not.
+* **OPEN — the OTel bridge runs only because semgrep pulled the SDK in.** `opentelemetry` is
+  deliberately absent from `requirements.txt`, so on a clean install the builtin writer is what
+  runs. Both paths are tested and emit an identical schema, but a production install exercises
+  the builtin one.
 * `u_bl` is pinned buccal from the arch frame, so `u_md`'s sign varies by quadrant (unavoidable — the arch is mirror-symmetric). The frame reports `u_md_points_distal`; the sliders do not yet use it.
-* `/teeth` exists but the client does not yet call it on load, so a browser refresh still loses the crowns from the scene (the server keeps them).
 * **A pinched cast rim loses a small spur.** `_open_pinch_vertices` deletes the smaller fan at a neck, and `/cut` drops the smaller lobe of a self-touching socket rim. Both are a handful of triangles and both are recorded, but neither is reconstructed.
 * **`trim_to_arch` is not stable on a very coarse mesh.** Measured: at ~18 samples across the band the trim nearly severs the arch and `np.bincount(labels).argmax()` picks a different largest component under rotation — an 80% volume swing. Unreachable at scan density (187k faces across the same band) and worth remembering before anyone decimates a scan upstream.
 * **The staged export still needs one interactive wand cut to be judged end to end.** It passes

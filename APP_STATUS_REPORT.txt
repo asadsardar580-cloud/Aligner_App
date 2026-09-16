@@ -47,13 +47,66 @@ Audit trail               none                                  closed vocabular
                                                                 bounded
 CBCT                      none                                  interface only - every entry point
                                                                 raises
-run_all_tests.py          24/24                                 30/30
-API routes                14                                    23
+run_all_tests.py          24/24                                 36/36
+API routes                14                                    33 paths
+
+FAIL-SAFE SPRINT (2026-09-16). The happy paths above were already green; what
+this pass added is the CONTINGENCY half of each, plus a DevSecOps stage that did
+not exist. Four defects were found that reported themselves as fine:
+
+Shadow rig                three.current was REPLACED after sun  sun/catcher live in the literal;
+                          and catcher were attached, so         aimShadows arms
+                          aimShadows returned early, ALWAYS
+Shadow staleness          shadowsDirty set only by aimShadows;  set at every commit point (cut,
+                          every cut left the PRE-CUT silhouette both kinematics handlers, both
+                                                                attachment handlers)
+White screens             no React error boundary at all        ErrorBoundary.jsx, recovery-first
+over_threshold            derived from contact_mm (0.30) while  contact_threshold_mm and
+                          sitting beside threshold_mm (0.05),   noise_floor_mm both named; the
+                          which was compared against NOTHING    floor now actually suppresses
+                                                                sub-scanner closure
+Silent except: pass       core_geometry.py:438, the only one    warns and names the fallback
+                          on the live geometry path
+space_analysis            measured T0 crowns while the          poses each crown; the payload
+                          clinician looked at the setup         states which pose it measured
+NaN/Inf scan              survived the degenerate filter        sanitize_scan, DELETE-ONLY, no
+                          (every comparison against NaN is      surviving vertex moves (rule 3.1)
+                          False), died later as "SVD did not
+                          converge"
+C_res projection          unbounded                             clamped [7,15]mm and reported
+                                                                loudly, never silently
+CSG failure               unguarded boolean                     fix_normals+fill_holes -> weld
+                                                                1e-5 -> REFUSE by name
+Missing manifold3d        ImportError traceback, 500            503 naming the pip command
+BVH build failure         silent early return, 13ms/cast        mergeVertices retry (crowns only;
+                          forever                               welding renumbers, and arch ids
+                                                                are the session contract)
+Raycaster                 collected and SORTED every hit        firstHitOnly; all 5 sites take [0]
+Hover on no-emissive      silent no-op, and the restore         color.addScalar(0.12), restoring
+                          invented emissiveIntensity            the SAVED hex
+WebGL context loss        unhandled; canvas stays black         preventDefault + re-arm shadows
+Root cones                could hang below the cast in space    clamped to the scan's apical
+                          that was never imaged                 extent (global, measured)
+Interproximal             measured once on the final pose       swept every stage, trees hoisted
+                                                                (8.86s -> 0.51s, 17.2x)
+Lost session              one status-bar line, overwritten      persistent re-upload banner
+                          by the next setStatus
+Low AI confidence         label drove the cut regardless        < 0.70 arms the landmark picker
+SAST                      none                                  .semgrep.yml, 9 rules, CI job
+Telemetry                 none                                  file-only spans, no exporter can
+                                                                be configured
+Audit trail               written, called by nothing            recorded at upload, cut,
+                                                                prescription and both exports
+pytest                    131                                   237
+check_structure.py        61 files                              88 files
+Browser E2E               7/7                                   19 specs (12 pass, 7 need the
+                                                                backend and skip)
 
 
 Superseded below: §4.9's "LIVE BUG" is fixed; §4.10's requirements.txt row is fixed; §7's
-test counts are now 30 suite entries / 7 browser E2E; §0's dead files have moved to
-_archive/; §1's "declared, never imported" row no longer applies to three-mesh-bvh.
+test counts are now 36 suite entries / 19 browser E2E specs; §0's dead files have moved
+to _archive/; §1's "declared, never imported" row no longer applies to three-mesh-bvh.
+Every route count below predates the fail-safe sprint: it is 33 paths now.
 
 
 0. HOW TO READ THIS - AUTHORITATIVE FILES
@@ -863,7 +916,10 @@ i, so THREE.STLLoader's non-indexed geometry lines up - was always valid.
 --------------------------------------------------------------
 test_interproximal.py, test_auto_color.py, test_incisal_edge.py are characterization scripts:
 they print measurements and exit 0, so the runner reports PASS regardless of what they measured.
-This matters more now that the suite reads 24/24 - treat it as **21 enforcing tests plus 3
+FIXED 2026-09-16: all three were hardened and every suite entry now carries enforcing
+assertions. The paragraph below is kept because the LESSON outlives the defect - a script
+that prints and exits 0 reports PASS whatever it measured - but it no longer describes
+this repo. SUPERSEDED: This matters more now that the suite reads 24/24 - treat it as **21 enforcing tests plus 3
 reports**, and do not read their PASS as evidence of anything.
 
 

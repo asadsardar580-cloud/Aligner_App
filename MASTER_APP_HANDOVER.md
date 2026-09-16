@@ -32,12 +32,46 @@ changed the following, and **CLAUDE.md §13-§16 are the authoritative record**:
 | Attachments | none | 4 parametric shapes, fused via manifold3d |
 | Audit trail | none | closed vocabulary, PHI denylist, bounded |
 | CBCT | none | interface only — every entry point raises |
-| `run_all_tests.py` | 24/24 | **30/30** |
-| API routes | 14 | **23** |
+| `run_all_tests.py` | 24/24 | **36/36** |
+| API routes | 14 | **33 paths** |
+
+### Fail-safe sprint (2026-09-16)
+
+The happy paths above were already green. This pass added the CONTINGENCY half of
+each, plus a DevSecOps stage that did not exist. **Four defects were found that
+reported themselves as fine** — the dangerous kind:
+
+| | Then | Now |
+|---|---|---|
+| Shadow rig | `three.current` was **replaced** after `sun`/`catcher` were attached, so `aimShadows` returned early every time and the rig never armed | both live in the literal |
+| Shadow staleness | `shadowsDirty` set only by `aimShadows`; every cut left the **pre-cut** silhouette | set at every commit point |
+| White screens | no React error boundary at all | `ErrorBoundary.jsx`, recovery message first |
+| `over_threshold` | computed from `contact_mm` (0.30) beside a field named `threshold_mm` (0.05) that was compared against **nothing** | both constants named; the floor now suppresses sub-scanner closure |
+| Silent `except: pass` | `core_geometry.py:438`, the only one on the live geometry path | warns and names the fallback |
+| `space_analysis` | measured **T0** crowns while the clinician looked at the setup | poses each crown; the payload states which pose |
+| NaN/Inf scan | survived the degenerate filter (every comparison against NaN is False), died later as "SVD did not converge" | `sanitize_scan`, **delete-only** — no surviving vertex moves |
+| C_res projection | unbounded | clamped `[7,15]`mm and reported **loudly** |
+| CSG failure | unguarded boolean | `fix_normals`+`fill_holes` → weld 1e-5 → **refuse by name** |
+| Missing `manifold3d` | ImportError traceback, 500 | 503 naming the pip command |
+| BVH build failure | silent early return, 13 ms/cast forever | `mergeVertices` retry — **crowns only**, since welding renumbers and arch ids are the session contract |
+| Raycaster | collected and **sorted** every hit | `firstHitOnly`; all five sites take `[0]` |
+| Hover without emissive | silent no-op, and the restore invented `emissiveIntensity` | `color.addScalar(0.12)`, restoring the **saved** hex |
+| WebGL context loss | unhandled; the canvas stays black forever | `preventDefault` + shadow re-arm |
+| Root cones | could hang below the cast in space never imaged | clamped to the scan's apical extent |
+| Interproximal | measured once, on the final pose | swept every stage; trees hoisted, **8.86 s → 0.51 s (17.2×)** |
+| Lost session | one status-bar line, overwritten by the next `setStatus` | persistent re-upload banner |
+| Low AI confidence | the label drove the cut regardless | `< 0.70` arms the landmark picker |
+| SAST | none | `.semgrep.yml`, 9 rules, CI job, **every rule verified to fire** |
+| Telemetry | none | file-only spans; no exporter can be configured |
+| Audit trail | written, called by nothing | recorded at upload, cut, prescription, both exports |
+| `pytest` | 131 | **237** |
+| `check_structure.py` | 61 files | **88 files** |
+| Browser E2E | 7/7 | **19 specs** (12 pass; 7 need the backend and skip) |
 
 **Superseded below:** §4.9's "LIVE BUG" is fixed; §4.10's `requirements.txt` row is fixed; §7's
-test counts are now **30 suite entries / 7 browser E2E**; §0's dead files have moved to
+test counts are now **36 suite entries / 19 browser E2E specs**; §0's dead files have moved to
 `_archive/`; §1's "declared, never imported" row no longer applies to `three-mesh-bvh`.
+**Every route and line count in the body predates this sprint.**
 
 ## 0. HOW TO READ THIS — AUTHORITATIVE FILES
 
@@ -538,13 +572,21 @@ geometry engine in to check a struct. Its substance — server face index *i* mu
 ### ⚠ 3 entries still contain ZERO assertions and can never fail
 `test_interproximal.py`, `test_auto_color.py`, `test_incisal_edge.py` are characterization scripts:
 they print measurements and exit 0, so the runner reports PASS regardless of what they measured.
-**This matters more now that the suite reads 24/24** — treat it as **21 enforcing tests plus 3
-reports**, and do not read their PASS as evidence of anything.
+**RESOLVED 2026-09-16 — every suite entry now carries enforcing assertions.** The paragraph below
+is kept because the lesson is worth more than the defect: a script that prints and exits 0 reports
+PASS whatever it measured. It no longer describes this repo.
 
-### 3 entries contain ZERO assertions and can never fail
-`test_interproximal.py`, `test_auto_color.py`, `test_incisal_edge.py` are characterization/reporting
-scripts. They print measurements and exit 0. They report **PASS** in the runner regardless.
-Treat the suite as **21 real tests**, not 24.
+~~This matters more now that the suite reads 24/24 — treat it as 21 enforcing tests plus 3
+reports, and do not read their PASS as evidence of anything.~~
+
+### ~~3 entries contain ZERO assertions and can never fail~~ — FIXED
+~~`test_interproximal.py`, `test_auto_color.py`, `test_incisal_edge.py` are characterization
+scripts. They print measurements and exit 0, so they report PASS regardless.~~
+
+All three were hardened on 2026-09-16 and now assert: 20 interproximal configurations
+non-negative with the separation ordering holding, the colour buffer `(22500, 3)` float32 in
+`[0,1]` (a 0-255 palette slipping in clips silently to white in WebGL), and 91% of identified
+incisal points inside the occlusal 15% band. **Every entry in the suite can now fail.**
 
 ### Highest-value tests
 | File | Lines | Guards |
