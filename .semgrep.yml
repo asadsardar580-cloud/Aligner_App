@@ -1,0 +1,247 @@
+# Semgrep configuration for Project Aligner.
+#
+# WHAT THIS IS FOR, AND WHAT IT IS NOT FOR.
+#
+# This is a clinical workstation application that holds biometric data — a
+# dental arch mesh identifies a person the way a fingerprint does — and runs
+# entirely on the clinician's own machine. So the rules that matter here are
+# about (a) patient data leaving the workstation, (b) secrets and keys, and
+# (c) the ordinary injection and deserialisation classes that turn a local file
+# into code execution. Broad "code smell" rulesets are deliberately not enabled:
+# a gate that reports fifty style opinions is a gate people learn to skip, and
+# CLAUDE.md section 13 already recorded what happened when the linter was
+# reporting seven unactionable errors about generated bundle code.
+#
+# RUN IT AS A CI JOB, NOT A PRE-COMMIT HOOK. That was a deliberate decision: a
+# hook that adds seconds to every commit gets bypassed with --no-verify within a
+# week, and a check that is routinely bypassed is worse than one that is not
+# there, because it is believed in.
+#
+#     semgrep --config .semgrep.yml --error
+#
+rules:
+  # ------------------------------------------------------------------
+  # PHI / telemetry. The invariant from CLAUDE.md: everything runs 100%
+  # locally and nothing patient-derived is sent to a third party.
+  # ------------------------------------------------------------------
+  - id: aligner-no-outbound-http
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Outbound HTTP from backend code. This application is zero-telemetry by
+      design: scans, labels, prescriptions and case files never leave the
+      clinician's workstation. If this call is genuinely needed, it must be
+      reviewed against that invariant and annotated with nosemgrep and a reason.
+    patterns:
+      - pattern-either:
+          - pattern: requests.$M(...)
+          - pattern: httpx.$M(...)
+          - pattern: urllib.request.urlopen(...)
+          - pattern: urllib.request.Request(...)
+          - pattern: http.client.$C(...)
+    paths:
+      exclude:
+        - ToothGroupNetwork/
+        - _archive/
+        - Aligner_App_AI_Export/
+        - .venv/
+        # Tests may stand up a local server and call it. `pattern-not-inside`
+        # with `def test_$F` is NOT the way to express that: semgrep has no
+        # partial-identifier metavariable and rejects the pattern outright
+        # ("Invalid pattern for Python: Stdlib.Parsing.Parse_error"), which
+        # silently disables the whole rule while the scan still reports success.
+        - "test_*.py"
+        - "**/tests/"
+
+  - id: aligner-no-otel-network-exporter
+    languages: [python]
+    severity: ERROR
+    message: >-
+      OpenTelemetry network exporter. Spans are FILE-ONLY here by decision — a
+      collector endpoint is a patient-data egress path that can be enabled by an
+      environment variable nobody reviewed. Use the file exporter in
+      telemetry.py.
+    pattern-either:
+      - pattern: OTLPSpanExporter(...)
+      - pattern: opentelemetry.exporter.otlp.$X.$Y.OTLPSpanExporter(...)
+      - pattern: JaegerExporter(...)
+      - pattern: ZipkinExporter(...)
+    paths:
+      exclude:
+        - .venv/
+
+  - id: aligner-no-patient-identifiers-in-logs
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A patient identifier may be reaching a log or an audit entry. audit.py
+      enforces a runtime denylist for exactly this; anything writing these
+      fields elsewhere bypasses it. Log the opaque case id instead.
+    patterns:
+      - pattern-either:
+          - pattern: print(..., $X, ...)
+          - pattern: logging.$LEVEL(..., $X, ...)
+          - pattern: $LOG.$LEVEL(..., $X, ...)
+      - metavariable-regex:
+          metavariable: $X
+          regex: (?i).*(patient_name|date_of_birth|\bdob\b|\bmrn\b|ssn|national_id).*
+    paths:
+      exclude:
+        - ToothGroupNetwork/
+        - _archive/
+        - .venv/
+
+  # ------------------------------------------------------------------
+  # Secrets. The Fernet key that opens the scan cache and the case files
+  # lives beside the data by design (the threat model is a file copied
+  # somewhere it should not be, not an attacker on this workstation).
+  # A key in SOURCE is a different thing entirely.
+  # ------------------------------------------------------------------
+  - id: aligner-no-hardcoded-key
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A key or secret appears to be hard-coded. Case files and the scan cache
+      are Fernet-encrypted with a key generated at first use and stored outside
+      version control; a literal here would ship one key for every install.
+    patterns:
+      - pattern-either:
+          - pattern: $K = "..."
+          - pattern: $K = b"..."
+      - metavariable-regex:
+          metavariable: $K
+          regex: (?i)^(.*_)?(secret|api_key|apikey|token|password|passwd|private_key|fernet_key)$
+    paths:
+      exclude:
+        - ToothGroupNetwork/
+        - _archive/
+        - .venv/
+        - test_
+
+  # ------------------------------------------------------------------
+  # Deserialisation and execution. A case file is user-supplied input.
+  # ------------------------------------------------------------------
+  - id: aligner-no-pickle-of-untrusted-input
+    languages: [python]
+    severity: ERROR
+    message: >-
+      pickle.load/loads executes arbitrary code in the pickle. Case files and
+      the scan cache are Fernet-encrypted and HMAC-authenticated precisely so a
+      tampered file is REFUSED rather than half-loaded; pickle would make a
+      tampered file a code-execution path instead. Use JSON.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: cPickle.load(...)
+    paths:
+      exclude:
+        - ToothGroupNetwork/     # vendored; its checkpoints are torch's problem
+        - .venv/
+
+  - id: aligner-no-eval-exec
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    message: eval/exec on a clinical workstation. There is no legitimate use here.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+    paths:
+      exclude:
+        - ToothGroupNetwork/
+        - _archive/
+        - .venv/
+        - node_modules/
+
+  - id: aligner-no-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      subprocess with shell=True. run_all_tests.py and the launchers pass
+      argument lists deliberately; a shell here turns a filename into a command.
+    patterns:
+      - pattern: subprocess.$F(..., shell=True, ...)
+    paths:
+      exclude:
+        - ToothGroupNetwork/
+        - .venv/
+
+  # ------------------------------------------------------------------
+  # Frontend.
+  # ------------------------------------------------------------------
+  - id: aligner-no-dangerously-set-inner-html
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      dangerouslySetInnerHTML. Every string this UI renders is either its own or
+      derived from a scan; none of it needs to be HTML, and the error boundary
+      renders error text into a <pre> for exactly this reason.
+    # `pattern: dangerouslySetInnerHTML={...}` does NOT match — semgrep parses a
+    # bare JSX attribute as an expression and finds nothing, which reports a
+    # clean scan for a rule that cannot fire. It has to be anchored to an
+    # element. Verified against a probe file before this was believed.
+    pattern-either:
+      - pattern: <$EL dangerouslySetInnerHTML={...} />
+      - pattern: <$EL dangerouslySetInnerHTML={...}>...</$EL>
+    paths:
+      exclude:
+        - node_modules/
+        - dist/
+        - ssr_out/
+
+  - id: aligner-no-patient-data-in-browser-storage
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Only opaque session ids may go into localStorage. Geometry, labels and
+      prescriptions stay in memory and on the backend — localStorage is
+      plaintext on disk and survives the case.
+    patterns:
+      - pattern-either:
+          - pattern: localStorage.setItem($K, $V)
+          - pattern: sessionStorage.setItem($K, $V)
+      - metavariable-regex:
+          metavariable: $V
+          regex: (?i).*(vert|geometr|mesh|label|prescription|clinical|patient|scan).*
+    paths:
+      exclude:
+        - node_modules/
+        - dist/
+        - ssr_out/
+
+# ----------------------------------------------------------------------
+# DELIBERATE EXCLUSIONS, each with its reason. These are not "things we
+# could not be bothered to fix" — they are places where a generic rule
+# would be wrong about this codebase.
+#
+#   ToothGroupNetwork/   Vendored third-party model code. CLAUDE.md section 13:
+#                        vendored code is not edited to silence warnings, and
+#                        two SyntaxWarnings there are left alone for the same
+#                        reason. Patching it would fork a dependency.
+#
+#   _archive/            Documented dead code (_archive/README.md). Linting it
+#                        would raise the report count without raising standards.
+#
+#   Aligner_App_AI_Export/  A generated handover archive holding a second copy
+#                        of every source file. It already broke pytest
+#                        collection once with "import file mismatch".
+#
+#   frontend/dist/, ssr_out/, node_modules/
+#                        Build output and dependencies. Linting generated code
+#                        does not raise standards, it lowers signal — seven of
+#                        fourteen eslint problems were once unactionable errors
+#                        about bundled code, drowning the seven that mattered.
+#
+# NO EXCLUSION IS MADE FOR THE 3D MATRIX MATH. The brief anticipated needing
+# one; nothing in core_geometry.py or toothGizmo.js trips any rule above, so
+# adding a pre-emptive ignore would only hide a future finding.
+# ----------------------------------------------------------------------
+paths:
+  exclude:
+    - ToothGroupNetwork/
+    - _archive/
+    - Aligner_App_AI_Export/
+    - .venv/
+    - node_modules/
+    - frontend/dist/
+    - frontend/ssr_out/
+    - "**/__pycache__/"

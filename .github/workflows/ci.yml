@@ -97,3 +97,36 @@ jobs:
         # claim rather than asserting it. If this drifts, the viewport and the
         # exported STL disagree and nothing else would notice.
         run: node verify-kinematics.mjs
+
+  sast:
+    name: Security — semgrep
+    runs-on: ubuntu-latest
+    # A SEPARATE JOB, NOT A PRE-COMMIT HOOK, and that was a deliberate choice.
+    # A hook that adds seconds to every commit gets bypassed with --no-verify
+    # within a week, and a check that is routinely bypassed is worse than one
+    # that is absent, because it is believed in. Here it cannot be skipped and
+    # it costs a developer nothing.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install semgrep
+        run: pip install semgrep
+
+      - name: SAST — PHI egress, secrets, deserialisation
+        # --error makes a finding fail the build. The ruleset is deliberately
+        # narrow (9 rules, all about patient data leaving the workstation,
+        # hard-coded keys, or a local file becoming code execution) rather than
+        # a broad "code smell" pack: a gate that reports fifty style opinions is
+        # a gate people learn to skip.
+        #
+        # Every rule was verified to FIRE against a deliberately bad probe file
+        # before being trusted — a clean scan from a rule that cannot match is
+        # indistinguishable from a clean scan from a rule that can, and one of
+        # these rules did exactly that until it was anchored (see the comment on
+        # aligner-no-dangerously-set-inner-html).
+        run: semgrep --config .semgrep.yml --error --metrics=off .

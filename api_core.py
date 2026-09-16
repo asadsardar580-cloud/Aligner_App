@@ -31,6 +31,35 @@ import scan_cache_manager
 import clinical_safety
 import export_clinical_report
 import attachments as attachments_mod
+import audit
+import telemetry
+
+
+# One trail per SESSION, because a session is what a clinician is working in and
+# a Case may not exist yet — the first cut happens long before anything is saved.
+# The trail travels into the Case when one is built.
+_TRAILS: dict = {}
+
+
+def _trail(sid: str) -> audit.AuditTrail:
+    t = _TRAILS.get(sid)
+    if t is None:
+        t = _TRAILS[sid] = audit.AuditTrail()
+    return t
+
+
+def _record(sid: str, action: str, **fields):
+    """Append to the session's audit trail. NEVER raises.
+
+    audit.record refuses a forbidden key by raising, which is right for the
+    module and wrong here: a request must not fail because someone added a
+    field to a log line. The refusal is recorded as a dropped entry instead, so
+    the denylist still holds and the failure is still visible.
+    """
+    try:
+        _trail(sid).record(action, **fields)
+    except Exception as e:                           # noqa: BLE001 — by design
+        print(f"[audit] entry refused ({type(e).__name__}: {e})")
 
 
 def _structured(result):
@@ -110,6 +139,25 @@ def _warm_tgn():
     _SEGMENTATION_STATE["warming"] = True
     print("[Clinical AI] Initializing AI Bridge in the background; API is live now.")
     threading.Thread(target=_load, name="tgn-warmup", daemon=True).start()
+
+
+@app.get("/api/session/{sid}/audit")
+def get_audit(sid: str):
+    """The session's audit trail. Local, bounded, and free of identifiers."""
+    t = _TRAILS.get(sid)
+    if t is None:
+        return {"entries": [], "summary": audit.AuditTrail().summary()}
+    return {"entries": t.to_list(), "summary": t.summary()}
+
+
+@app.get("/api/telemetry")
+def get_telemetry(limit: int = 50):
+    """Span status and the most recent spans. For support, not for a clinician.
+
+    There is no endpoint to CONFIGURE the exporter, deliberately — see
+    telemetry.py. This one only reads.
+    """
+    return {"status": telemetry.status(), "recent": telemetry.read_spans(limit)}
 
 
 @app.get("/api/ai/status")
@@ -219,6 +267,7 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
     except ValueError as e:
         raise HTTPException(400, str(e))
     raw = await file.read()               
+    _t_up = time.perf_counter()
     verts, faces = stl_io.parse_stl_bytes(raw)
     # Content-addressable cache, keyed by the hash of the RAW upload so it
     # identifies what the clinician sent rather than what conditioning made of
@@ -255,6 +304,21 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
     # Knowing that here is what lets /export blame the scan instead of the cut.
     scan_health = cg.manifold_report(faces)
     STORE.put(sid, "scan_health", scan_health)
+
+    # NO FILENAME. The upload's own name routinely carries a patient's, which is
+    # exactly why session_store stores none and why audit.py's denylist refuses
+    # the key outright.
+    _record(sid, audit.SCAN_LOADED, arch=arch,
+            detail=f"{len(verts):,} vertices, {len(faces):,} faces",
+            values={"vertices": int(len(verts)), "faces": int(len(faces)),
+                    "welded": int(report.get("welded_vertices", 0)),
+                    "open_edges": int(scan_health.get("open_edges", 0)),
+                    "sanitize_repaired": bool(sanity["repaired"])})
+    telemetry.record_span(
+        "session.create", (time.perf_counter() - _t_up) * 1000,
+        arch=arch, vertices=int(len(verts)), faces=int(len(faces)),
+        bytes_in=len(raw), sanitize_repaired=bool(sanity["repaired"]),
+        nonfinite_vertices=int(sanity["nonfinite_vertices"]))
     
     edges = cg.directed_edges(faces)
     conc = cg.boundary_field(verts, faces, edges=edges)
@@ -350,6 +414,20 @@ async def segment(sid: str):
 
         STORE.put(sid, "labels", labels)
         STORE.put(sid, "segmentation_tiers", hybrid["teeth"])
+        _n_teeth = int(len(set(int(x) for x in labels)) - (1 if 0 in set(
+            int(x) for x in labels) else 0))
+        _record(sid, audit.SEGMENTED, arch=arch,
+                detail=f"{_n_teeth} region(s) labelled",
+                values={"teeth": _n_teeth,
+                        "repaired": int(sum(1 for t in hybrid["teeth"]
+                                            if t.get("tier") != "model"))})
+        telemetry.record_span(
+            "segment",
+            (time.time() - _SEGMENTATION_STATE["started_at"]) * 1000,
+            arch=arch, vertices=int(len(v)), arch_faces=int(len(f)),
+            teeth=_n_teeth,
+            repaired=int(sum(1 for t in hybrid["teeth"]
+                             if t.get("tier") != "model")))
         return {
             "labels": [int(x) for x in labels], "jaw": arch, "report": check,
             # Intrinsic geometric plausibility. NOT measured accuracy - no IoU is
@@ -412,6 +490,7 @@ def put_selection(sid: str, req: SelectionRequest):
 
 @app.post("/api/session/{sid}/cut")
 def cut(sid: str, req: CutRequest):
+    _t_cut = time.perf_counter()
     try:
         try:
             v, f = STORE.require(sid, "verts"), STORE.require(sid, "faces")
@@ -642,6 +721,19 @@ def cut(sid: str, req: CutRequest):
         tid = uuid.uuid4().hex[:8]
         if "cres_clamp" in cres_report:
             cres_report["cres_clamp"]["tooth_id"] = tid
+        _record(sid, audit.TOOTH_CUT, arch=STORE.arch(sid), tooth_id=tid,
+                detail=f"crown extracted on a {req.root_length_mm:.1f}mm root",
+                values={"selected_vertices": len(req.vertex_ids),
+                        "root_length_mm": float(req.root_length_mm),
+                        "cres_clamped": bool("cres_clamp" in cres_report)})
+        # record_span, not span(): the work is already done by the time the
+        # counts are known, so a context manager here would wrap nothing and
+        # report duration_ms 0.0 for a multi-second cut.
+        telemetry.record_span(
+            "cut", (time.perf_counter() - _t_cut) * 1000,
+            arch=STORE.arch(sid), selected_vertices=len(req.vertex_ids),
+            arch_faces=int(len(f)), root_length_mm=float(req.root_length_mm),
+            cres_clamped=bool("cres_clamp" in cres_report))
         STORE.put(sid, f"tooth:{tid}", {"cv": cv, "cf": cf, "bv": bv, "bf": bf,
                                         "frame": frame, "c_res": c_res,
                                         "root_length_mm": float(req.root_length_mm),
@@ -731,6 +823,7 @@ def cut(sid: str, req: CutRequest):
 
 @app.post("/api/session/{sid}/tooth/{tid}/kinematics")
 def kinematics(sid: str, tid: str, req: KinematicsRequest):
+    _t_kin = time.perf_counter()
     try:
         t = STORE.require(sid, f"tooth:{tid}")
     except SessionExpired as e:
@@ -784,6 +877,23 @@ def kinematics(sid: str, tid: str, req: KinematicsRequest):
     STORE.put(sid, f"tooth:{tid}", t)
 
     occlusal = _occlusal_check(req.opposing_session_id, cg.apply_matrix(t["cv"], M))
+
+    _record(sid, audit.PRESCRIPTION_COMMITTED, arch=STORE.arch(sid), tooth_id=tid,
+            fdi=t.get("fdi"),
+            detail=f"{staging.get('stages_required')} stages, "
+                   f"{staging.get('driver')}-driven",
+            # Small, numeric, unit-bearing — the six clinical values in the
+            # units the UI shows. Never the matrix.
+            values={"tip_deg": req.tip_deg, "torque_deg": req.torque_deg,
+                    "rotation_deg": req.rotation_deg, "d_md": req.d_md,
+                    "d_bl": req.d_bl, "d_oa": req.d_oa,
+                    "stages": int(staging.get("stages_required") or 0)})
+    telemetry.record_span(
+        "kinematics", (time.perf_counter() - _t_kin) * 1000,
+        arch=STORE.arch(sid), stages=int(staging.get("stages_required") or 0),
+        crown_vertices=int(len(t["cv"])),
+        ipr_stages_yellow=len((stage_clearance or {}).get("stages_yellow", [])),
+        occlusion_checked=occlusal is not None)
 
     return {"matrix": M.ravel().tolist(), "staging": staging, "clearance": pen,
             # One row per stage. `stages_yellow` is what the timeline chips.
@@ -1838,8 +1948,19 @@ def export_setup(sid: str, req: ExportRequest):
     for the rest is the honest progress message the client shows, not a second
     thread.
     """
+    _t_exp = time.perf_counter()
     try:
-        bundle = build_export_bundle(sid, req)
+        # The span wraps the BUILD, not the stream. StreamingResponse returns
+        # immediately and the body is consumed afterwards, so timing the return
+        # would record a few microseconds for a 7.5s operation.
+        with telemetry.span("export", arch=STORE.arch(sid)) as _sp:
+            bundle = build_export_bundle(sid, req)
+            _sp.set(files=len(bundle["files"]),
+                    seconds=round(time.perf_counter() - _t_exp, 3))
+        _record(sid, audit.EXPORTED, arch=STORE.arch(sid),
+                detail=f"printable cast, {len(bundle['files'])} file(s)",
+                values={"files": len(bundle["files"]),
+                        "seconds": round(time.perf_counter() - _t_exp, 2)})
         return StreamingResponse(
             bundle["buf"], media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{bundle["filename"]}"',
@@ -2187,6 +2308,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
     Measured on the real scan: base (178k tris) union crown (14k tris) = 0.162s,
     so a 31-stage 14-crown case is roughly 70s of boolean work.
     """
+    _t_stage = time.perf_counter()
     try:
         v, f = STORE.require(sid, "verts"), STORE.require(sid, "faces")
         arch = STORE.arch(sid)
@@ -2499,6 +2621,22 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
                 fh.write(blob)
         with open(os.path.join(out_dir, "manifest.json"), "w") as fh:
             json.dump(manifest, fh, indent=2)
+
+    _record(sid, audit.EXPORTED, arch=arch,
+            detail=f"{total} staged manufacturing models",
+            values={"stages": int(total), "teeth": len(teeth),
+                    "union_seconds": round(t_union, 2),
+                    "interproximal_seconds": round(t_ipr, 2),
+                    "collision_seconds": round(t_collide, 2),
+                    "stages_yellow": len([s for s in stage_meta
+                                          if s["interproximal_state"] == "YELLOW"])})
+    telemetry.record_span(
+        "staging", (time.perf_counter() - _t_stage) * 1000,
+        arch=arch, stages=int(total), teeth=len(teeth),
+        union_seconds=round(t_union, 3),
+        interproximal_seconds=round(t_ipr, 3),
+        collision_seconds=round(t_collide, 3),
+        repaired_stages=len([s for s in stage_meta if s.get("fallback_reason")]))
 
     return {"buf": buf, "filename": f"{arch}_stages.zip", "manifest": manifest,
             "stages": total, "out_dir": out_dir, "union_seconds": t_union}

@@ -29,6 +29,7 @@ TESTS = [
     ("antagonist collision", "test_antagonist_collision.py"),
     ("clinical safety",      "test_clinical_safety.py"),
     ("fail-safes",           "test_failsafes.py"),
+    ("telemetry + PHI",      "test_telemetry.py"),
     ("face order",           "test_face_order.py"),
     ("auto colour",          "test_auto_color.py"),
     ("bleed fix",            "test_bleed_fix.py"),
