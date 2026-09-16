@@ -14,6 +14,7 @@ Triangles only.
 from __future__ import annotations
 
 import heapq
+import math
 import warnings
 import numpy as np
 from scipy.spatial import Delaunay
@@ -950,8 +951,67 @@ def resolve_long_axis(
     return axis, info
 
 
+# The PHYSIOLOGICAL band for the distance C_res is projected apical of the
+# crown. Wheeler's own root lengths span 9-13mm across the dentition (incisor
+# 10, canine 13, premolar and molar 9), so 7-15 is that range with roughly 2mm
+# of headroom either side for a short-rooted or a long-rooted patient.
+#
+# This is NOT validation.ROOT_LENGTH_MIN/MAX (4-30mm), and the two must not be
+# conflated. That band REFUSES a typo — 0mm or 100mm is not a prescription. This
+# one CLAMPS a plausible-but-out-of-envelope value, because C_res is extrapolated
+# along the long axis by exactly this distance and a 20mm projection puts the
+# pivot through the inferior alveolar canal. Refusing there would block a cut
+# over a slider position; clamping silently would move the axis a tooth rotates
+# about without saying so. So it clamps AND says so, every time.
+CRES_PROJECTION_MIN_MM = 7.0
+CRES_PROJECTION_MAX_MM = 15.0
+
+
+def clamp_cres_projection(root_length_mm: float, tooth_id=None, fdi=None):
+    """Clamp into the physiological band and describe what happened.
+
+    Returns (clamped_mm, note_or_None). The note is a structured dict carrying
+    the requested value, the clamped value and the bound that fired — never a
+    bare string, because a refusal or an adjustment that cannot be inspected
+    cannot be argued with.
+    """
+    requested = float(root_length_mm)
+    if not math.isfinite(requested):
+        # Every comparison against NaN is False, so the clamp below would pass a
+        # NaN straight through and C_res would come out NaN — which then passes
+        # the alveolus gate for exactly the same reason (CLAUDE.md §14).
+        raise ValueError(f"root_length_mm must be finite, got {requested!r}")
+
+    lo, hi = CRES_PROJECTION_MIN_MM, CRES_PROJECTION_MAX_MM
+    clamped = min(max(requested, lo), hi)
+    if clamped == requested:
+        return clamped, None
+
+    note = {
+        "event": "cres_projection_clamped",
+        "tooth_id": tooth_id, "fdi": fdi,
+        "requested_mm": round(requested, 4),
+        "clamped_mm": round(clamped, 4),
+        "shift_mm": round(abs(requested - clamped), 4),
+        "bound": "min" if clamped == lo else "max",
+        "band_mm": [lo, hi],
+        "provenance": "software heuristic, envelope around Wheeler root lengths",
+        "detail": (
+            f"C_res projection clamped from {requested:.2f}mm to {clamped:.2f}mm "
+            f"for tooth {tooth_id or fdi or '?'}. The pivot therefore sits "
+            f"{abs(requested - clamped):.2f}mm from where the requested root "
+            f"length would have put it, which changes the arc of every rotation "
+            f"on this tooth. Set a root length inside {lo:.0f}-{hi:.0f}mm to "
+            f"control the pivot directly."),
+    }
+    warnings.warn(note["detail"], RuntimeWarning, stacklevel=3)
+    return clamped, note
+
+
 def center_of_resistance(frame: dict, root_length_mm: float = 10.0,
-                         cres_fraction: float | None = None) -> np.ndarray:
+                         cres_fraction: float | None = None,
+                         report: dict | None = None,
+                         tooth_id=None, fdi=None) -> np.ndarray:
     """C_res on the SOCKET AXIS, root_length_mm apical of the crown centroid.
 
     Scanner STLs contain no root, so this is a parametric stand-in for
@@ -991,7 +1051,16 @@ def center_of_resistance(frame: dict, root_length_mm: float = 10.0,
     verification, not a free ride on an axis fix.
 
     Falls back to the crown centroid for frames carrying no rim_centroid.
+
+    THE PROJECTION IS CLAMPED to [7, 15] mm and the clamp is reported, never
+    silent — pass a `report` dict and it gains a "cres_clamp" key. A 2mm pivot
+    shift nobody was told about is the kind of error that is only visible
+    months later as a tooth that tipped when it should have translated.
     """
+    root_length_mm, _clamp_note = clamp_cres_projection(root_length_mm, tooth_id, fdi)
+    if report is not None and _clamp_note is not None:
+        report["cres_clamp"] = _clamp_note
+
     u_oa = np.asarray(frame["u_oa"], float)
     rim_centroid = frame.get("rim_centroid") if hasattr(frame, "get") else None
     if rim_centroid is None:
@@ -2166,6 +2235,98 @@ def remove_small_components(faces: np.ndarray, min_fraction: float = 0.02):
         else:
             removed += 1
     return keep, removed
+
+
+def sanitize_scan(verts: np.ndarray, faces: np.ndarray):
+    """Make a scan SAFE to compute on, without moving a single surviving vertex.
+
+    WHY THIS HAS TO EXIST, MEASURED. `condition_mesh`'s degenerate filter is
+    `area <= 1e-12`, and every comparison against NaN is False — so a triangle
+    with a NaN corner has `area = nan`, is not `<= 1e-12`, and SURVIVES the one
+    filter whose job is to remove it. The mesh then reaches `boundary_loops` and
+    `cap_boundary_loop`, where it dies as `LinAlgError: SVD did not converge`.
+    That reaches the clinician as an opaque 500 about a file that opened fine in
+    every other program they own.
+
+    Intraoral scanners and the converters around them do emit these: a dropped
+    frame, a division by a zero-length normal, a truncated float in an ASCII
+    STL. It is not exotic and it is not the clinician's fault.
+
+    RULE 3.1 IS THE CONSTRAINT ON THE REPAIR, not an aside. This function may
+    only DELETE — non-finite vertices and the faces that reference them, and
+    faces whose indices are out of range or repeat a corner. It must never
+    translate, rescale, re-centre or rotate anything, because inter-arch bite
+    registration depends on both scans sitting in one raw scanner space. A
+    repair that quietly re-centred a damaged arch would fix the crash and break
+    the occlusion, which is the worse outcome by far.
+
+    THE BRIEF ASKED FOR `trimesh.repair.sanitize()`. There is no such function —
+    not in trimesh 5.1.0, which is what is installed, and not in any release.
+    The nearest real equivalent is `Trimesh.remove_infinite_values()`, and this
+    is implemented in NumPy instead for two reasons: it must be provably
+    delete-only to satisfy rule 3.1, and a scan must still open if an optional
+    wheel is missing. `test_failsafes.py` cross-checks it against trimesh's own
+    result on the same input and asserts they agree, so the choice is measured
+    rather than asserted — and skips if trimesh is absent.
+
+    Returns (verts, faces, report). On a clean scan the arrays are returned
+    UNCHANGED — the same objects — and `report["repaired"]` is False.
+    """
+    v = np.asarray(verts, dtype=float)
+    f = np.asarray(faces, dtype=np.int64)
+    report = {"input_vertices": int(len(v)), "input_faces": int(len(f)),
+              "nonfinite_vertices": 0, "faces_dropped_nonfinite": 0,
+              "faces_dropped_out_of_range": 0, "faces_dropped_repeated_corner": 0,
+              "repaired": False, "method": None}
+
+    finite = np.isfinite(v).all(axis=1)
+    n_bad = int((~finite).sum())
+    in_range = (f >= 0) & (f < len(v))
+    bad_range = ~in_range.all(axis=1)
+    repeated = ((f[:, 0] == f[:, 1]) | (f[:, 1] == f[:, 2]) | (f[:, 0] == f[:, 2]))         if len(f) else np.zeros(0, dtype=bool)
+
+    report["nonfinite_vertices"] = n_bad
+    report["faces_dropped_out_of_range"] = int(bad_range.sum())
+    report["faces_dropped_repeated_corner"] = int((repeated & ~bad_range).sum())
+
+    if n_bad == 0 and not bad_range.any() and not repeated.any():
+        report["method"] = "none needed"
+        return verts, faces, report
+
+    # Drop faces first, using only in-range rows to index `finite`.
+    keep = ~bad_range & ~repeated
+    if n_bad:
+        touches_bad = np.zeros(len(f), dtype=bool)
+        safe = np.where(keep)[0]
+        touches_bad[safe] = ~finite[f[safe]].all(axis=1)
+        report["faces_dropped_nonfinite"] = int(touches_bad.sum())
+        keep &= ~touches_bad
+    f2 = f[keep]
+
+    # Then drop orphaned vertices and remap. Positions are COPIED, never
+    # recomputed: `v[used]` is a gather, so every surviving coordinate is the
+    # bit pattern that arrived. A test asserts that against the raw upload.
+    used = np.unique(f2) if len(f2) else np.zeros(0, dtype=np.int64)
+    remap = -np.ones(len(v), dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    v2 = v[used]
+    f2 = remap[f2]
+
+    report["repaired"] = True
+    report["method"] = "numpy delete-only"
+    report["output_vertices"] = int(len(v2))
+    report["output_faces"] = int(len(f2))
+    report["vertices_dropped"] = int(len(v) - len(v2))
+    report["warning"] = (
+        f"The uploaded scan contained {n_bad} vertices with NaN or infinite "
+        f"coordinates and {int(len(f) - len(f2))} unusable faces. They have been "
+        f"REMOVED, not corrected — no surviving vertex was moved, so the scan "
+        f"stays in its original scanner coordinates and inter-arch registration "
+        f"is unaffected. Inspect the area around the damage before cutting.")
+
+    if not np.isfinite(v2).all():
+        raise ValueError("sanitize_scan left non-finite vertices; refusing the scan")
+    return v2, f2, report
 
 
 def condition_mesh(verts: np.ndarray, faces: np.ndarray,

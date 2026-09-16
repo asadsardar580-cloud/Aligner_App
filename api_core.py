@@ -225,7 +225,19 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
     # it. Encrypted at rest; no filename stored. This is what lets a restart
     # restore a case without a manual re-upload.
     _scan_hash = scan_cache_manager.scan_hash(raw)
+    # FINITENESS GATE, BEFORE ANYTHING ELSE TOUCHES THE BUFFER. condition_mesh's
+    # degenerate filter is `area <= 1e-12`, which is False for NaN, so a NaN
+    # triangle survives the only filter meant to remove it and the scan dies
+    # deeper in as "LinAlgError: SVD did not converge" — an opaque 500 about a
+    # file that opens fine everywhere else. Delete-only: no vertex is moved, so
+    # rule 3.1 and inter-arch registration are untouched.
+    verts, faces, sanity = cg.sanitize_scan(verts, faces)
+    if sanity["repaired"] and not len(faces):
+        raise HTTPException(422, "The uploaded scan has no usable triangles: every "
+                                 "face referenced a vertex with NaN or infinite "
+                                 "coordinates. Re-export the scan from the scanner.")
     verts, faces, report = cg.condition_mesh(verts, faces)
+    report["sanitize"] = sanity
     STORE.put(sid, "verts", verts)
     STORE.put(sid, "faces", faces)
     STORE.put(sid, "scan_hash", _scan_hash)
@@ -555,7 +567,14 @@ def cut(sid: str, req: CutRequest):
         frame = cg.derive_frame_from_region(
             np.asarray(req.mesial_pt, float), np.asarray(req.distal_pt, float),
             cv, rim_pts, arch_frame=af)
-        c_res = cg.center_of_resistance(frame, root_length_mm=req.root_length_mm)
+        # The clamp report rides back to the client. A pivot shifted 2mm without
+        # anyone being told is only visible months later, as a tooth that tipped
+        # where it should have translated.
+        cres_report: dict = {}
+        # The tooth id does not exist yet (it is minted below), so it is stamped
+        # onto the note afterwards rather than guessed here.
+        c_res = cg.center_of_resistance(frame, root_length_mm=req.root_length_mm,
+                                        report=cres_report)
 
         # Backstop, deliberately sharing NO code with the frame derivation.
         # Everything above is one chain of reasoning; if it is wrong anywhere,
@@ -621,6 +640,8 @@ def cut(sid: str, req: CutRequest):
                 for i in tri])
 
         tid = uuid.uuid4().hex[:8]
+        if "cres_clamp" in cres_report:
+            cres_report["cres_clamp"]["tooth_id"] = tid
         STORE.put(sid, f"tooth:{tid}", {"cv": cv, "cf": cf, "bv": bv, "bf": bf,
                                         "frame": frame, "c_res": c_res,
                                         "root_length_mm": float(req.root_length_mm),
@@ -649,6 +670,9 @@ def cut(sid: str, req: CutRequest):
         STORE.put(sid, f"tooth:{tid}", _rec)
 
         return {"tooth_id": tid, "watertight": True,
+                # Present ONLY when the projection was clamped. An absent key
+                # means the requested root length was used as given.
+                "cres_clamp": cres_report.get("cres_clamp"),
                 # What the cut measured but did not refuse over. Warnings here
                 # are real findings — a selection in pieces, a crown that is
                 # mostly gingiva, two labelled teeth in one flood — and the UI
@@ -883,7 +907,11 @@ def restore_sessions(req: SessionRestoreRequest):
 
         sid = STORE.create(arch.arch)
         verts, faces = stl_io.parse_stl_bytes(raw)
+        # Same gate on the restore path. The cache stores the RAW upload bytes,
+        # so a scan that was damaged on arrival is still damaged on rehydration.
+        verts, faces, sanity = cg.sanitize_scan(verts, faces)
         verts, faces, report = cg.condition_mesh(verts, faces)
+        report["sanitize"] = sanity
         STORE.put(sid, "verts", verts)
         STORE.put(sid, "faces", faces)
         STORE.put(sid, "scan_hash", h)
@@ -1807,7 +1835,11 @@ PLUG_INSET_FRACTION = 0.75
 
 
 def _to_manifold(verts: np.ndarray, faces: np.ndarray):
-    import manifold3d as m3
+    # Routed through the guard because this is the FIRST thing any CSG path
+    # touches — the two `import manifold3d` lines further down only ever run on
+    # objects this function already produced, so they cannot be reached with the
+    # wheel missing.
+    m3 = _require_manifold3d()
     return m3.Manifold(m3.Mesh(vert_properties=np.asarray(verts, np.float32),
                                tri_verts=np.asarray(faces, np.uint32)))
 
@@ -1852,6 +1884,124 @@ def _rim_plug(rim_xyz: np.ndarray, u_oa: np.ndarray, depth_mm: float):
     # the boolean real volume to work with at both ends.
     u = np.asarray(u_oa, float)
     return v2 + (u / np.linalg.norm(u)) * PLUG_LIFT_MM, f2
+
+
+MANIFOLD3D_MISSING = (
+    "manifold3d is not installed, so fused stage models cannot be built. "
+    "Install it with `pip install manifold3d` (it is listed in requirements.txt). "
+    "Everything else — cutting, kinematics, staging and the printable cast "
+    "export — works without it.")
+
+
+def _require_manifold3d():
+    """Import manifold3d or raise a 503 that says what to do about it.
+
+    An ImportError escaping a request handler is a 500 with a traceback about a
+    module name, which tells a clinician nothing and a support engineer only
+    slightly more. This is the one dependency in the stack that is optional in
+    practice — the wheel does not build everywhere — so its absence gets a
+    sentence rather than a stack.
+    """
+    try:
+        import manifold3d as m3
+        return m3
+    except ImportError as e:
+        raise HTTPException(503, f"{MANIFOLD3D_MISSING} ({e})")
+
+
+# The order matters and each rung is here because it fixes a different thing.
+CSG_REPAIR_CASCADE = ("fix_normals+fill_holes", "weld_1e-5")
+
+
+def _repair_for_csg(v: np.ndarray, f: np.ndarray, stage: str):
+    """One rung of the CSG repair cascade. Returns (verts, faces).
+
+    RUNG 1 — `fix_normals` then `fill_holes`. manifold3d requires a closed,
+    consistently-wound input; a crown whose winding was scrambled by a boolean
+    upstream, or that carries a one-triangle hole, is refused by the library
+    with a message about manifoldness that names neither cause.
+
+    RUNG 2 — weld at 1e-5 mm. A boolean between tangent surfaces emits
+    topologically distinct vertices at identical positions (see the long note in
+    the stage loop); when those positions differ by a few ULP instead of exactly
+    zero, nothing downstream can weld them and the solid never closes. 1e-5 mm
+    is 10 nanometres — four orders below the 0.1mm the appliance is built to —
+    so what it moves is numerically invisible and clinically nothing.
+
+    THIS IS THE END OF THE CASCADE. There is deliberately no displacement-
+    carving rung: a stage model that still will not close after this is refused
+    by name. A tray thermoformed from a solid the software had to force closed
+    is worse than a tray that was never made.
+    """
+    v = np.asarray(v, float)
+    f = np.asarray(f, np.int64)
+
+    if stage == "fix_normals+fill_holes":
+        import trimesh
+        import trimesh.repair
+        m = trimesh.Trimesh(vertices=v, faces=f, process=False, validate=False)
+        trimesh.repair.fix_normals(m)
+        trimesh.repair.fill_holes(m)
+        return np.asarray(m.vertices, float), np.asarray(m.faces, np.int64)
+
+    if stage == "weld_1e-5":
+        v2, f2 = _repair_for_csg(v, f, "fix_normals+fill_holes")
+        keys = np.round(v2 / 1e-5).astype(np.int64)
+        _, first, inverse = np.unique(keys, axis=0, return_index=True,
+                                      return_inverse=True)
+        # Keep the ORIGINAL coordinate of the first occurrence rather than the
+        # rounded key: the grid is how duplicates are found, not what replaces
+        # them, so no surviving vertex is snapped to a lattice.
+        welded = v2[first]
+        f3 = np.asarray(inverse).ravel()[f2]
+        degenerate = ((f3[:, 0] == f3[:, 1]) | (f3[:, 1] == f3[:, 2])
+                      | (f3[:, 0] == f3[:, 2]))
+        return welded, f3[~degenerate]
+
+    raise ValueError(f"unknown CSG repair stage {stage!r}")
+
+
+def _batch_union_with_cascade(m3, part_arrays, label: str):
+    """Union a list of (verts, faces) with a repair cascade. Returns (solid, info).
+
+    `info` carries `fallback_reason` when any repair was needed, so the manifest
+    records that a stage was not built from the meshes as they arrived. A silent
+    repair is the thing to avoid here: the lab prints what comes out.
+    """
+    attempts = []
+    for stage in (None,) + CSG_REPAIR_CASCADE:
+        try:
+            if stage is None:
+                parts = [_to_manifold(v, f) for v, f in part_arrays]
+            else:
+                parts = [_to_manifold(*_repair_for_csg(v, f, stage))
+                         for v, f in part_arrays]
+            solid = m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+            mesh = solid.to_mesh()
+            if len(np.asarray(mesh.tri_verts)) == 0:
+                raise ValueError("the boolean produced an empty solid")
+            info = {"csg_repair_stage": stage or "none",
+                    "csg_attempts": attempts + [{"stage": stage or "none",
+                                                 "result": "ok"}]}
+            if stage is not None:
+                info["fallback_reason"] = "CSG_REPAIR_CASCADE_APPLIED"
+                info["fallback_detail"] = (
+                    f"{label}: the boolean failed on the meshes as built and "
+                    f"succeeded after '{stage}'. The geometry that was printed is "
+                    f"not bit-identical to the geometry that was cut.")
+            return solid, info
+        except HTTPException:
+            raise
+        except Exception as e:                       # noqa: BLE001 — cascade
+            attempts.append({"stage": stage or "none",
+                             "result": f"{type(e).__name__}: {e}"})
+
+    tried = "; ".join(f"{a['stage']} -> {a['result']}" for a in attempts)
+    raise HTTPException(422,
+        f"{label}: the boolean union could not be completed. Tried {tried}. "
+        f"The stage is REFUSED rather than forced closed — a tray thermoformed "
+        f"from a solid the software had to carve into shape is worse than a "
+        f"tray that was never made.")
 
 
 def _solid_bodies(solid):
@@ -2046,7 +2196,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
     except ValueError as e:
         raise HTTPException(422, f"The cast base could not be built. {e}")
 
-    import manifold3d as m3
+    m3 = _require_manifold3d()
     base_solid = _to_manifold(bv, bf)
     # Screens every crown AND builds its manufacturing solid, once. manifold3d
     # transforms lazily, so a stage then costs one batch boolean rather than
@@ -2081,7 +2231,30 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
                     interference.append({"tooth_id": t["tid"], "fdi": t["fdi"],
                                          **hit})
         t0 = time.perf_counter()
-        solid = m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+        try:
+            solid = m3.Manifold.batch_boolean(parts, m3.OpType.Add)
+            mesh = solid.to_mesh()
+            if len(np.asarray(mesh.tri_verts)) == 0:
+                raise ValueError("the boolean produced an empty solid")
+            csg_info = {"csg_repair_stage": "none"}
+        except HTTPException:
+            raise
+        except Exception as direct_err:              # noqa: BLE001 — cascade
+            # REPAIR AND RETRY, THEN REFUSE. The parts are re-read as arrays so
+            # each rung can be applied to them; manifold3d transforms lazily, so
+            # this costs nothing on the overwhelmingly common path where the
+            # direct boolean succeeds and this block never runs.
+            part_arrays = []
+            for pm in parts:
+                pmesh = pm.to_mesh()
+                part_arrays.append((np.asarray(pmesh.vert_properties, float)[:, :3],
+                                    np.asarray(pmesh.tri_verts, np.int64)))
+            solid, csg_info = _batch_union_with_cascade(
+                m3, part_arrays, f"Stage {k}")
+            csg_info.setdefault("csg_attempts", []).insert(
+                0, {"stage": "none",
+                    "result": f"{type(direct_err).__name__}: {direct_err}"})
+            mesh = solid.to_mesh()
         # Same crumb purge as every other boolean here — see _solid_bodies.
         solid, n_bodies, crumbs = _solid_bodies(solid)
         mesh = solid.to_mesh()
@@ -2150,6 +2323,12 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
             "volume_mm3": round(float(solid.volume()), 3),
             "components": int(n_comp),
             "inverted_crumbs_discarded": int(crumbs),
+            # "none" on the ordinary path. Anything else means the boolean
+            # failed on the meshes as built and this stage was printed from
+            # repaired geometry — which the lab is entitled to know.
+            "csg_repair_stage": csg_info.get("csg_repair_stage", "none"),
+            "fallback_reason": csg_info.get("fallback_reason"),
+            "fallback_detail": csg_info.get("fallback_detail"),
             "occlusal_interference": interference,
             "occlusal_warning": ANTAGONIST_WARNING if interference else None,
             "closed": True,

@@ -92,13 +92,57 @@ function read(pivotMatrix) {
   };
 }
 
+/**
+ * |det(M) - 1| for a 4x4 given as a flat ROW-MAJOR array, exactly as the
+ * backend serialises it. A rigid transform has determinant +1.
+ */
+function detErrRowMajor(m) {
+  const A = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
+  const det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1])
+            - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0])
+            + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+  return Math.abs(det - 1);
+}
+
+/**
+ * Largest deviation of the bottom row from [0,0,0,1], row-major.
+ *
+ * THIS — NOT THE DETERMINANT — IS WHAT CATCHES A TRANSPOSITION, and the
+ * distinction is worth stating because the brief names the determinant for the
+ * job. det(M') = det(M) for every matrix there is, so transposing a rigid 4x4
+ * leaves the determinant at exactly 1.0 and a |det-1| bar of any tightness
+ * passes it. What a transposition DOES do is move the translation out of the
+ * last column and into the bottom row, which is precisely the perspective-divide
+ * explosion CLAUDE.md rule 4 warns about. So both checks run: the determinant
+ * catches shear and scale creeping into the rotation block, and this catches
+ * the convention drift.
+ */
+function bottomRowErrRowMajor(m) {
+  return Math.max(Math.abs(m[12]), Math.abs(m[13]), Math.abs(m[14]),
+                  Math.abs(m[15] - 1));
+}
+
+// 1e-6, as the brief specifies. It sits deliberately between the 1e-3 used for
+// the round-tripped clinical values and the 1e-12 the stage matrices are held
+// to: a determinant is a product of three 3-term sums, so it accumulates more
+// error than either, and this is a sanity bar on matrices crossing a process
+// boundary rather than a precision claim about them.
+const DET_BAR = 1e-6;
+
 let worstM = 0, worstAng = 0, worstMm = 0, worstScale = 0;
+let worstApiDet = 0, worstApiBottom = 0;
 for (const { k, M } of CASES) {
   const delta = deltaFromClinical(k);
   const e = delta.elements;                       // three is COLUMN-major
   const rowMajor = [e[0], e[4], e[8], e[12], e[1], e[5], e[9], e[13],
                     e[2], e[6], e[10], e[14], e[3], e[7], e[11], e[15]];
   worstM = Math.max(worstM, ...rowMajor.map((v, i) => Math.abs(v - M[i])));
+
+  // Every matrix that crosses the API, checked on BOTH sides of the boundary:
+  // the backend's golden value and the browser's own reconstruction of it.
+  worstApiDet = Math.max(worstApiDet, detErrRowMajor(M), detErrRowMajor(rowMajor));
+  worstApiBottom = Math.max(worstApiBottom,
+                            bottomRowErrRowMajor(M), bottomRowErrRowMajor(rowMajor));
 
   const r = read(delta.clone().multiply(rest));   // setClinical, then read back
   worstAng = Math.max(worstAng, Math.abs(r.tip_deg - k.tip_deg),
@@ -112,6 +156,10 @@ for (const { k, M } of CASES) {
 console.log(`setClinical vs cg.kinematic_matrix : max |diff| ${worstM.toExponential(2)}`);
 console.log(`setClinical -> read round trip     : ${worstAng.toFixed(4)} deg, ${worstMm.toFixed(4)} mm`);
 console.log(`scale drift (must stay 1.0)        : ${worstScale.toExponential(2)}`);
+console.log(`API matrices |det-1|               : ${worstApiDet.toExponential(2)} `
+          + `(bar ${DET_BAR.toExponential(0)})`);
+console.log(`API matrices bottom row [0,0,0,1]  : ${worstApiBottom.toExponential(2)} `
+          + `— the actual transposition guard`);
 
 // ===========================================================================
 // STAGING
@@ -198,7 +246,8 @@ const stagingOk = stage0Err < 1e-12 && stageNErr < 1e-12
 const AGREEMENT_BAR = 1e-12;
 
 const ok = worstM < AGREEMENT_BAR && worstAng <= 0.005 && worstMm <= 0.0005
-        && worstScale < 1e-9 && stagingOk;
+        && worstScale < 1e-9 && stagingOk
+        && worstApiDet < DET_BAR && worstApiBottom < DET_BAR;
 console.log(`  bar ${AGREEMENT_BAR.toExponential(0)}, observed ${worstM.toExponential(2)} `
           + `(~${Math.round(worstM / Number.EPSILON)} ULP of 1.0 - the float64 noise floor)`);
 console.log(ok ? "PASS  two-way binding and staging are exact and agree with the backend"
