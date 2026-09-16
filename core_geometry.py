@@ -14,6 +14,7 @@ Triangles only.
 from __future__ import annotations
 
 import heapq
+import warnings
 import numpy as np
 from scipy.spatial import Delaunay
 
@@ -435,8 +436,19 @@ def cap_boundary_loop(
                 keep.append([loop_idx[simplex[0]], loop_idx[simplex[1]], loop_idx[simplex[2]]])
         if len(keep) >= max(3, len(loop_idx) // 4):
             return np.array(keep, dtype=int)
-    except Exception:
-        pass
+    except Exception as e:
+        # SAY SO. This was a silent `pass`, and it is the only silent swallow on
+        # the live geometry path - directly under hole capping, which both
+        # condition_mesh and cap_and_close depend on. Silent, a genuine
+        # numerical failure in Delaunay is indistinguishable from the benign
+        # "produced too few interior triangles" case three lines above, and both
+        # end up in the same fan fallback with no way to tell which happened.
+        # The fallback is correct and stays; only the silence was wrong.
+        warnings.warn(
+            f"cap_boundary_loop: Delaunay failed on a {len(loop_idx)}-vertex loop "
+            f"({type(e).__name__}: {e}). Falling back to a centroid fan, which is "
+            f"topologically safe but coarser.",
+            RuntimeWarning, stacklevel=2)
     return np.empty((0, 3), dtype=int)  # caller applies the fan fallback
 
 
@@ -5657,6 +5669,7 @@ def measure_interproximal_penetration(
     far_from_socket = socket_tree.query(base)[0] > socket_exclusion_mm
     if not np.any(far_from_socket):
         return dict(max_closure_mm=0.0, min_clearance_mm=None, over_threshold=False,
+                    noise_floor_mm=threshold_mm, contact_threshold_mm=contact_mm,
                     threshold_mm=threshold_mm, contact_mm=contact_mm, per_side={})
     tree = cKDTree(base[far_from_socket])
     out = {}
@@ -5667,13 +5680,28 @@ def measure_interproximal_penetration(
         g0 = float(tree.query(t0[sel])[0].min())
         g1 = float(tree.query(t1[sel])[0].min())
         closure = max(0.0, g0 - g1)
+        # `threshold_mm` is the NOISE FLOOR, and until now it was carried in the
+        # payload and compared against nothing at all. Scanners resolve to
+        # 20-50 microns, so a 0.001mm "closure" is the mesh, not the movement,
+        # and reporting it as a real closure invites someone to act on it.
+        if closure < threshold_mm:
+            closure = 0.0
         worst = max(worst, closure)
         out[name] = dict(clearance_before_mm=round(g0, 4), clearance_after_mm=round(g1, 4),
                          closed_by_mm=round(closure, 4), in_contact=bool(g1 <= contact_mm))
 
     tightest = min((d["clearance_after_mm"] for d in out.values() if "clearance_after_mm" in d), default=None)
     return dict(max_closure_mm=round(worst, 4), min_clearance_mm=tightest,
+                # NAMED HONESTLY. This flag is computed from contact_mm (0.30),
+                # NOT from threshold_mm (0.05) - a reader seeing `threshold_mm`
+                # beside `over_threshold` reasonably assumes the flag means
+                # 0.05mm, and it never has. Both constants are now in the
+                # payload under names that say which is which. The VALUE of
+                # over_threshold is unchanged: export_planned_setup and the
+                # client status line both gate on it at 0.30mm.
                 over_threshold=bool(tightest is not None and tightest <= contact_mm),
+                contact_threshold_mm=contact_mm,
+                noise_floor_mm=threshold_mm,
                 threshold_mm=threshold_mm, contact_mm=contact_mm, per_side=out)
 
 def export_planned_setup(

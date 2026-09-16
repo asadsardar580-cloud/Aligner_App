@@ -143,9 +143,26 @@ def test_the_file_on_disk_is_not_readable_plaintext():
         c = _populated_case()
         path = case_store.save(c)
         raw = open(path, "rb").read()
-        for leak in (b"crowding", b"mid-course", b"confirmed", b"33"):
+
+        # DISTINCTIVE strings only. A short needle like b"33" is worse than
+        # useless here: Fernet output is base64, so any 2-character sequence
+        # appears by chance roughly once per 4096 characters, and an 844-byte
+        # token hits one about 20% of the time. That made this assertion flaky -
+        # it failed on the FDI number while b"ab" collided just as readily, and
+        # the result depended on the randomly generated key. A leak test whose
+        # verdict changes with the key tests nothing.
+        for leak in (b"crowding", b"mid-course", b"confirmed",
+                     b"tip_deg", b"root_length_mm", b"prescription"):
             assert leak not in raw, f"{leak!r} is sitting in the file in clear text"
-        print("PASS  ciphertext leaks none of the label, FDI or review state")
+
+        # And the positive half, which the negative half cannot prove: the
+        # content must still be RECOVERABLE with the key. Without this, a
+        # function that wrote 844 random bytes would pass every check above.
+        back = case_store.load(c.case_id)
+        assert back.label == c.label
+        assert back.arches["lower"].teeth["t1"].fdi == 33
+        print(f"PASS  ciphertext ({len(raw)}B) leaks no distinctive plaintext, and the "
+              f"content is recoverable with the key")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

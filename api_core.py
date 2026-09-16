@@ -25,6 +25,12 @@ import domain
 import case_store
 import space_analysis
 import segmentation_review
+import segmentation_fallback
+import benchmark_segmentation
+import scan_cache_manager
+import clinical_safety
+import export_clinical_report
+import attachments as attachments_mod
 
 
 def _structured(result):
@@ -214,9 +220,22 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
         raise HTTPException(400, str(e))
     raw = await file.read()               
     verts, faces = stl_io.parse_stl_bytes(raw)
+    # Content-addressable cache, keyed by the hash of the RAW upload so it
+    # identifies what the clinician sent rather than what conditioning made of
+    # it. Encrypted at rest; no filename stored. This is what lets a restart
+    # restore a case without a manual re-upload.
+    _scan_hash = scan_cache_manager.scan_hash(raw)
     verts, faces, report = cg.condition_mesh(verts, faces)
     STORE.put(sid, "verts", verts)
     STORE.put(sid, "faces", faces)
+    STORE.put(sid, "scan_hash", _scan_hash)
+    try:
+        scan_cache_manager.put(raw, arch, len(verts), len(faces))
+    except OSError as e:
+        # A cache failure must not block a clinician mid-case. The session works
+        # exactly as before; only restart-recovery is lost, and saying so beats
+        # failing an upload over a disk problem.
+        print(f"[scan cache] could not cache {_scan_hash[:12]}: {e}")
 
     # Record the scan's own topology BEFORE any cut. condition_mesh welds,
     # drops degenerates and debris and fills small holes, but it does not
@@ -234,7 +253,9 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
     
     return {"session_id": sid, "vertex_count": int(len(verts)), "face_count": int(len(faces)),
             "bbox": [verts.min(0).tolist(), verts.max(0).tolist()],
-            "conditioning": report, "scan_health": scan_health}
+            "conditioning": report, "scan_health": scan_health,
+            "scan_hash": _scan_hash,
+            "scan_cached": scan_cache_manager.has(_scan_hash)}
 
 @app.get("/api/session/{sid}/mesh")
 def get_mesh(sid: str):
@@ -299,8 +320,36 @@ async def segment(sid: str):
         if len(labels) != len(v):
             raise HTTPException(500, "Label array does not match mesh.")
 
+        # HYBRID FALLBACK. Tier 1 is the model; any tooth whose region is
+        # geometrically impossible - split across two places, or implausibly
+        # sized - is re-grown by the classical geodesic flood, which follows the
+        # curvature barrier at the cervical margin and therefore returns ONE
+        # connected region by construction. The FDI is kept from the model,
+        # which the flood cannot supply, and the tooth is marked
+        # REVIEW_REQUIRED because a repair is not a confirmation.
+        af = STORE.get(sid, "arch_frame")
+        occ = np.asarray(af["u_occ"], float) if af else None
+        centre = v.mean(axis=0) if af is not None else None
+        hybrid = segmentation_fallback.run(
+            labels, v, f, arch,
+            graph=STORE.get(sid, "graph"), concavity=STORE.get(sid, "concavity"),
+            arch_centre=centre, occlusal_axis=occ)
+        labels = hybrid["labels"]
+
         STORE.put(sid, "labels", labels)
-        return {"labels": [int(x) for x in labels], "jaw": arch, "report": check}
+        STORE.put(sid, "segmentation_tiers", hybrid["teeth"])
+        return {
+            "labels": [int(x) for x in labels], "jaw": arch, "report": check,
+            # Intrinsic geometric plausibility. NOT measured accuracy - no IoU is
+            # computable without annotated ground truth, and the payload says so
+            # in `is_measured_accuracy` and `meaning`.
+            "segmentation_confidence_breakdown": _jsonable(
+                benchmark_segmentation.confidence_breakdown(
+                    labels, v, f, arch, centre, occ)),
+            "fallback": _jsonable({k: hybrid[k] for k in
+                                   ("teeth", "repaired_count", "needs_review",
+                                    "tiers", "threshold", "limitation")}),
+        }
     finally:
         _SEGMENTATION_STATE.update({
             "in_progress": False,
@@ -619,7 +668,7 @@ def cut(sid: str, req: CutRequest):
                 # low opacity in a non-tissue colour so it can never be mistaken
                 # for captured data.
                 "root_cone": _root_cone(v[socket_rim_global], frame,
-                                        float(req.root_length_mm)),
+                                        float(req.root_length_mm), arch_verts=v),
                 "removed_faces": removed_faces.astype(np.int64).tolist(),
                 "extracted_face_count": int(extracted.sum()),
                 # A negative index -(k+1) in socket_cap.faces means appended
@@ -756,7 +805,8 @@ def _case_from_sessions(sessions: dict, case_id=None, label="") -> domain.Case:
             arch=STORE.arch(sid), session_id=sid,
             has_occlusal_frame=STORE.get(sid, "arch_frame") is not None,
             has_segmentation=STORE.get(sid, "labels") is not None,
-            scan_vertex_count=int(len(v)), scan_face_count=int(len(f)))
+            scan_vertex_count=int(len(v)), scan_face_count=int(len(f)),
+            scan_hash=STORE.get(sid, "scan_hash"))
         for key in STORE.keys(sid):
             if not key.startswith("tooth:"):
                 continue
@@ -792,6 +842,146 @@ def save_case(req: CaseSaveRequest):
             "tooth_count": len(c.all_teeth()), "stage_count": c.stage_count(),
             "scan_persisted": False,
             "note": "Treatment state only. Reload the arch scans to continue."}
+
+
+class SessionRestoreRequest(BaseModel):
+    """Rebuild live sessions for a saved case, from the scan cache."""
+    case_id: str
+
+
+@app.post("/api/session/restore")
+def restore_sessions(req: SessionRestoreRequest):
+    """Re-create in-memory sessions for a saved case WITHOUT a re-upload.
+
+    The treatment plan records each arch's scan_hash. That hash finds the exact
+    bytes in the local cache, so the mesh a plan is re-applied to is provably
+    the mesh it was planned on - a random id could be re-pointed at a different
+    scan and the plan would silently apply to the wrong anatomy.
+
+    What is NOT restored here is the derived layer: crowns, sockets and root
+    cones are rebuilt by replaying the cuts, exactly as they were the first
+    time. Nothing is recomputed differently.
+    """
+    try:
+        case = case_store.load(req.case_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No saved case {req.case_id!r}.")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+    restored, missing = {}, []
+    for name, arch in case.arches.items():
+        h = arch.scan_hash
+        if not h:
+            missing.append({"arch": name, "reason": "the plan records no scan hash"})
+            continue
+        try:
+            raw = scan_cache_manager.get(h)
+        except scan_cache_manager.ScanNotCached as e:
+            missing.append({"arch": name, "scan_hash": h, "reason": str(e)})
+            continue
+
+        sid = STORE.create(arch.arch)
+        verts, faces = stl_io.parse_stl_bytes(raw)
+        verts, faces, report = cg.condition_mesh(verts, faces)
+        STORE.put(sid, "verts", verts)
+        STORE.put(sid, "faces", faces)
+        STORE.put(sid, "scan_hash", h)
+        STORE.put(sid, "scan_health", cg.manifold_report(faces))
+        edges = cg.directed_edges(faces)
+        conc = cg.boundary_field(verts, faces, edges=edges)
+        STORE.put(sid, "edges", edges)
+        STORE.put(sid, "concavity", conc)
+        STORE.put(sid, "graph", cg.build_barrier_graph(verts, faces, conc, edges=edges))
+
+        arch.session_id = sid
+        restored[name] = {"session_id": sid, "scan_hash": h,
+                          "vertex_count": int(len(verts)),
+                          "face_count": int(len(faces)),
+                          "tooth_count": len(arch.teeth)}
+
+    if not restored:
+        raise HTTPException(409, {
+            "error": "No arch could be restored — none of this case's scans are in "
+                     "the local cache. Re-upload the original files; their hashes "
+                     "must match what the plan records.",
+            "missing": missing})
+
+    case_store.save(case)   # session ids refreshed
+    return {"case_id": case.case_id, "restored": restored, "missing": missing,
+            "stage_count": case.stage_count(),
+            "note": "Sessions are live again. Occlusal frame, segmentation labels and "
+                    "committed poses are in the plan; replay the cuts to rebuild crowns."}
+
+
+@app.get("/api/scans")
+def list_cached_scans():
+    return {"scans": scan_cache_manager.list_scans(), "stats": scan_cache_manager.stats()}
+
+
+@app.delete("/api/scans/{scan_hash}")
+def forget_scan(scan_hash: str):
+    """Delete one cached scan. The clinician's control over their own data."""
+    return {"deleted": scan_cache_manager.forget(scan_hash)}
+
+
+@app.get("/api/case/{case_id}/safety")
+def case_safety(case_id: str):
+    """Biomechanical guardrails for a saved case: GREEN / YELLOW / RED per tooth.
+
+    GREEN means "within the range clear aligner cases are normally planned in".
+    It is NOT a statement that the movement is biologically safe - root
+    resorption risk is driven by force, duration, root morphology and patient
+    biology, none of which this software can see.
+    """
+    try:
+        case = case_store.load(case_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No saved case {case_id!r}.")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return _jsonable(clinical_safety.assess_case(
+        [{"tooth_id": t.tooth_id, "fdi": t.fdi,
+          "prescription": {k: getattr(t.prescription, k) for k in
+                           ("tip_deg", "torque_deg", "rotation_deg",
+                            "d_md", "d_bl", "d_oa")}}
+         for t in case.all_teeth()], case.stage_count()))
+
+
+@app.post("/api/case/{case_id}/report")
+def clinical_report(case_id: str):
+    """The clinician-facing treatment plan: JSON plus a printable HTML summary.
+
+    Leads with what is uncertain - teeth not yet reviewed, movements outside the
+    envelope, checks that did not run - rather than burying it. Carries no
+    patient identifier.
+    """
+    try:
+        case = case_store.load(case_id)
+    except FileNotFoundError:
+        raise HTTPException(404, f"No saved case {case_id!r}.")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+    space = None
+    for arch in case.arches.values():
+        if arch.session_id and STORE.get(arch.session_id, "verts") is not None:
+            try:
+                space = space_analysis_report(arch.session_id)
+                break
+            except HTTPException:
+                pass   # no occlusal frame yet; the report simply omits IPR
+
+    report = export_clinical_report.build(case, space_analysis=space)
+    out_dir = os.path.join(CURRENT_DIR, "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.join(out_dir, f"plan_{case.case_id}")
+    return {
+        "report": _jsonable(report),
+        "json_path": export_clinical_report.write_json(report, base + ".json"),
+        "html_path": export_clinical_report.write_html(report, base + ".html"),
+        "disclaimer": export_clinical_report.DISCLAIMER,
+    }
 
 
 @app.get("/api/case")
@@ -889,6 +1079,114 @@ def segmentation_review_report(sid: str):
         arch_centre=(v.mean(axis=0) if af is not None else None),
         occlusal_axis=occ)
     return _jsonable(out)
+
+
+class AttachmentRequest(BaseModel):
+    """What the viewport sends when a clinician clicks a crown surface."""
+    tooth_id: str
+    type: str
+    position_xyz: list[float]
+    normal_xyz: list[float]
+    dimensions_hwd: dict | None = None      # {height, width, depth} in mm
+    rotation_deg: float = 0.0
+
+
+@app.get("/api/attachments/shapes")
+def attachment_shapes():
+    """The catalogue, with each shape's mechanical purpose and the size band."""
+    return {"shapes": attachments_mod.SHAPES,
+            "limits_mm": {"min": attachments_mod.MIN_DIM_MM,
+                          "max": attachments_mod.MAX_DIM_MM},
+            "note": "Orientation is the mechanical point. An attachment is built in "
+                    "the TOOTH'S anatomical frame, so 'vertical' means along that "
+                    "tooth's long axis, not along world Z."}
+
+
+@app.post("/api/session/{sid}/tooth/{tid}/attachment")
+def place_attachment(sid: str, tid: str, req: AttachmentRequest):
+    """Fuse a composite attachment onto a crown, before staging.
+
+    The attachment moves WITH the crown, so it must be part of the solid the
+    stage models are built from. Bonding it to an already-moved crown would put
+    it where the tooth ends up rather than where the clinician placed it.
+    """
+    try:
+        STORE.require(sid, "verts")
+        tooth = STORE.get(sid, f"tooth:{tid}")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+    if tooth is None:
+        raise HTTPException(404, f"No extracted tooth {tid!r} in this session.")
+
+    hwd = req.dimensions_hwd or {}
+    size = {}
+    if hwd:
+        # The viewport speaks height/width/depth; the geometry speaks the tooth's
+        # own axes. Mapping them here rather than in the client keeps one
+        # vocabulary at the boundary.
+        size = {"oa": float(hwd.get("height", 3.0)),
+                "md": float(hwd.get("width", 2.0)),
+                "bl": float(hwd.get("depth", 1.0))}
+
+    try:
+        att = attachments_mod.build_attachment(
+            req.type, tooth["frame"], req.position_xyz, size_mm=size or None)
+        fused = attachments_mod.fuse_to_crown(tooth["cv"], tooth["cf"], att)
+    except ValueError as e:
+        # Unknown shape, implausible dimensions, or not touching the crown. Each
+        # names its own cause; none is a 500.
+        raise HTTPException(422, str(e))
+
+    existing = list(tooth.get("attachments") or [])
+    record = {
+        "attachment_id": uuid.uuid4().hex[:8],
+        "shape": req.type,
+        "dimensions_mm": att["dimensions_mm"],
+        "purpose": att["purpose"],
+        "position_xyz": [float(x) for x in req.position_xyz],
+        "normal_xyz": [float(x) for x in req.normal_xyz],
+        "rotation_deg": float(req.rotation_deg),
+        "fused_volume_mm3": fused["volume_mm3"],
+    }
+    existing.append(record)
+    tooth["attachments"] = existing
+    # The fused solid replaces the crown for manufacturing. The ORIGINAL crown
+    # is kept so an attachment can be removed without re-cutting the tooth.
+    tooth.setdefault("crown_without_attachments", {"cv": tooth["cv"], "cf": tooth["cf"]})
+    tooth["cv"], tooth["cf"] = fused["verts"], fused["faces"]
+    STORE.put(sid, f"tooth:{tid}", tooth)
+
+    return {"attachment": record, "attachments": existing,
+            "crown": {"positions": np.asarray(fused["verts"], np.float32).ravel().tolist(),
+                      "indices": np.asarray(fused["faces"], np.uint32).ravel().tolist()},
+            "bodies": fused["bodies"], "volume_mm3": fused["volume_mm3"]}
+
+
+@app.delete("/api/session/{sid}/tooth/{tid}/attachment")
+def clear_attachments(sid: str, tid: str):
+    """Restore the crown as it was cut. Removing one attachment from a fused
+    solid is not a boolean subtraction of the same block - the union has already
+    merged the surfaces - so the honest operation is to go back to the original
+    and re-place whichever attachments are still wanted."""
+    try:
+        STORE.require(sid, "verts")
+        tooth = STORE.get(sid, f"tooth:{tid}")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+    if tooth is None:
+        raise HTTPException(404, f"No extracted tooth {tid!r}.")
+
+    orig = tooth.get("crown_without_attachments")
+    if not orig:
+        return {"cleared": 0, "note": "This crown has no attachments."}
+    tooth["cv"], tooth["cf"] = orig["cv"], orig["cf"]
+    n = len(tooth.get("attachments") or [])
+    tooth["attachments"] = []
+    tooth.pop("crown_without_attachments", None)
+    STORE.put(sid, f"tooth:{tid}", tooth)
+    return {"cleared": n,
+            "crown": {"positions": np.asarray(orig["cv"], np.float32).ravel().tolist(),
+                      "indices": np.asarray(orig["cf"], np.uint32).ravel().tolist()}}
 
 
 @app.get("/api/session/{sid}/space-analysis")
@@ -1026,7 +1324,8 @@ def list_teeth(sid: str, geometry: bool = False):
                 "reconcile": _jsonable(t.get("reconcile")),
                 "crown": {"positions": np.asarray(cv, np.float32).ravel().tolist(),
                           "indices":   np.asarray(cf, np.uint32).ravel().tolist()},
-                "root_cone": _root_cone(rim_xyz, t["frame"], float(t["root_length_mm"])),
+                "root_cone": _root_cone(rim_xyz, t["frame"], float(t["root_length_mm"]),
+                                        arch_verts=STORE.require(sid, "verts")),
                 # Same dual-index convention /cut uses: a non-negative entry is
                 # an arch vertex id, -(k+1) is appended cup vertex k.
                 "socket_cap": {
@@ -1046,7 +1345,8 @@ def list_teeth(sid: str, geometry: bool = False):
             "face_count": int(len(faces))}
 
 
-def _root_cone(rim_xyz: np.ndarray, frame: dict, root_length_mm: float) -> dict:
+def _root_cone(rim_xyz: np.ndarray, frame: dict, root_length_mm: float,
+               arch_verts: np.ndarray | None = None) -> dict:
     """The cervical rim swept to an apex root_length_mm apical along u_oa.
 
     World coordinates, so the client can parent it beside the crown and drive
@@ -1058,19 +1358,57 @@ def _root_cone(rim_xyz: np.ndarray, frame: dict, root_length_mm: float) -> dict:
     own construction (rim_centroid + u_oa*(h - root_length)), so the drawn root
     and the pivot the tooth actually rotates about are derived the same way
     rather than two independent guesses about where the apex is.
+
+    THE DRAWN APEX IS CLAMPED TO THE SCAN'S OWN APICAL EXTENT, and the clamp is
+    reported. A Wheeler root length is an average for a tooth TYPE; the patient's
+    alveolar housing is not consulted because this software has no CBCT. On a
+    short-rooted case or a shallow scan the 13mm canine cone therefore projects
+    out through the back of the model into empty space, and a violet cone hanging
+    below the cast looks like a finding rather than an artefact.
+
+    The bound used is the deepest point the SCAN has data for, measured along
+    the tooth's own long axis from the rim centroid. It is not an alveolar
+    crest — nothing here can measure one — and `clamped` plus `requested_mm`
+    say exactly that, so the drawing never implies anatomy that was not imaged.
+
+    C_res IS NOT AFFECTED. The pivot is the biomechanical quantity and it is
+    derived in core_geometry from the requested root length; clamping a drawing
+    must never quietly move the axis a tooth rotates about.
     """
     rim = np.asarray(rim_xyz, float)
     u_oa = np.asarray(frame["u_oa"], float)
     u_oa = u_oa / np.linalg.norm(u_oa)
     centroid = np.asarray(frame.get("rim_centroid", rim.mean(axis=0)), float)
-    apex = centroid - u_oa * float(root_length_mm)
+
+    requested = float(root_length_mm)
+    drawn, clamped, available = requested, False, None
+    if arch_verts is not None and len(arch_verts):
+        # Signed projection onto u_oa relative to the rim centroid: occlusal is
+        # positive, apical negative. The scan's most negative value is as deep
+        # as the model goes.
+        t = (np.asarray(arch_verts, float) - centroid) @ u_oa
+        available = float(-t.min())
+        if np.isfinite(available) and 0.0 < available < requested:
+            drawn, clamped = available, True
+
+    apex = centroid - u_oa * drawn
 
     n = len(rim)
     verts = np.vstack([rim, apex])
     faces = [[i, (i + 1) % n, n] for i in range(n)]
-    return {"vertices": verts.tolist(), "faces": faces,
-            "apex": apex.tolist(), "length_mm": float(root_length_mm),
-            "label": "virtual root (estimated)"}
+    out = {"vertices": verts.tolist(), "faces": faces,
+           "apex": apex.tolist(), "length_mm": float(drawn),
+           "requested_mm": requested, "clamped": bool(clamped),
+           "label": "virtual root (estimated)"}
+    if available is not None:
+        out["scan_apical_extent_mm"] = round(available, 3)
+    if clamped:
+        out["clamp_note"] = (
+            f"[Virtual Root] Projection constrained to alveolar boundary — "
+            f"{requested:.1f}mm requested, {drawn:.1f}mm drawn (the scan has no "
+            f"data deeper than that). C_res is unchanged and still uses "
+            f"{requested:.1f}mm.")
+    return out
 
 
 ANTAGONIST_WARNING = "Warning: Trajectory creates occlusal interference with antagonist."

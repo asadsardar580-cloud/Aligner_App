@@ -19,6 +19,14 @@ frontend/ssr_out2/
 exports/
 segmented/
 
+# The encrypted scan cache and the Fernet key that opens it. BOTH, and for the
+# same reason: a dental arch mesh identifies a person the way a fingerprint
+# does, and a key committed next to its own ciphertext is not encryption. The
+# cache is content-addressable and fully regenerable by re-uploading the scan.
+storage/
+*.scan_key
+*.case_key
+
 # --- AI model checkpoints (64MB each, 12 of them) ---
 *.h5
 

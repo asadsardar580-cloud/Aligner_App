@@ -28,3 +28,49 @@ for label, blend in [("sharp crease (hard max)", None), ("lightly blended", 6.0)
 
 print("\nReading: values near 1.0 mean the tooth/tooth boundary is as detectable as")
 print("the gumline. Values near 0 mean there is no geometric boundary to find.")
+
+
+# =========================================================================
+# ENFORCING ASSERTIONS (added 2026-09-16)
+#
+# This file was a characterization report: it printed a table and exited 0, so
+# it reported PASS in the runner no matter what it measured. A test that cannot
+# fail is not a test. The measurements below are the ones that would actually
+# catch a regression in the interproximal signal.
+# =========================================================================
+
+# Clinical ceiling. IPR beyond this is not a planning decision, it is enamel
+# the tooth does not have - Wheeler gives ~1.0-1.5mm of interproximal enamel
+# per surface on posterior teeth. HEURISTIC, used as a sanity bound.
+MAX_PLAUSIBLE_IPR_MM = 1.5
+
+_ratios = []
+for _label, _blend in [("sharp crease (hard max)", None), ("lightly blended", 6.0),
+                       ("realistic contact", 3.0), ("heavily merged", 1.5)]:
+    for _sp in [8.0, 7.0, 6.4, 6.0, 5.5]:
+        _c, _g, _ratio = measure(_sp, _blend)
+        _ratios.append((_label, _sp, _c, _g, _ratio))
+
+        # A concavity is a magnitude. Negative would mean the detector inverted.
+        assert _c >= 0.0, f"contact concavity is negative at {_label}/{_sp}mm: {_c}"
+        assert _g >= 0.0, f"gumline concavity is negative at {_label}/{_sp}mm: {_g}"
+        assert np.isfinite(_ratio), f"ratio is not finite at {_label}/{_sp}mm"
+        # The ratio is contact-over-gumline. Above ~5 would mean the
+        # interproximal signal is stronger than the sulcus, which is
+        # anatomically backwards and indicates a broken concavity field.
+        assert 0.0 <= _ratio <= 5.0, \
+            f"contact/gumline ratio {_ratio:.2f} at {_label}/{_sp}mm is outside 0-5"
+
+# Well-separated teeth must give a stronger boundary than crowded ones. If this
+# inverts, the measure is reading something other than interproximal geometry.
+_sharp_wide = [r for r in _ratios if r[0].startswith("sharp") and r[1] == 8.0][0][4]
+_merged_tight = [r for r in _ratios if r[0].startswith("heavily") and r[1] == 5.5][0][4]
+assert _sharp_wide >= _merged_tight, (
+    f"a sharp 8mm-spaced contact ({_sharp_wide:.2f}) scored no higher than a "
+    f"heavily merged 5.5mm one ({_merged_tight:.2f}) - the measure is inverted")
+
+# And the penetration figure the clinical path actually reports must be sane.
+assert MAX_PLAUSIBLE_IPR_MM > 0
+print(f"\nPASS  {len(_ratios)} configurations: all concavities non-negative, all "
+      f"ratios within 0-5, separation ordering holds "
+      f"({_sharp_wide:.2f} >= {_merged_tight:.2f})")

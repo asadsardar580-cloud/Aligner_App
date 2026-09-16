@@ -73,3 +73,63 @@ for tol in [2,4,6,8,10,14,18,25,35]:
 print(f"\nRESULT: snapping gives a working window from tol={best}, "
       f"covering BOTH surfaces with no gingival bleed." if best else
       "\nRESULT: snapping did not open a clean window.")
+
+
+# =========================================================================
+# ENFORCING ASSERTIONS (added 2026-09-16)
+#
+# This file printed a tolerance sweep and exited 0 - PASS in the runner no
+# matter what it found. The spec asks that identified incisal points be
+# asserted to lie on the occlusal portion of the crown, which is the property
+# that actually matters: an "incisal edge" detected halfway down the crown
+# would seed every flood in the wrong place.
+# =========================================================================
+
+# The incisal edge is the occlusal extreme of the crown. 15% of crown height is
+# the band the spec names; the fixture's ridge is a sharp crest so it should sit
+# comfortably inside it. HEURISTIC.
+OCCLUSAL_BAND_FRACTION = 0.15
+
+_crown_v = np.unique(faces[on_crown])
+_z = verts[_crown_v][:, 2]
+_z_min, _z_max = float(_z.min()), float(_z.max())
+_crown_height = _z_max - _z_min
+assert _crown_height > 0.5, f"degenerate crown height {_crown_height:.2f}mm in the fixture"
+
+# The ridge vertices this file identifies as the incisal edge.
+_ridge_ids = np.nonzero(ridge)[0]
+assert len(_ridge_ids) > 0, "no incisal ridge vertices were identified at all"
+
+_ridge_z = verts[_ridge_ids][:, 2]
+_band_floor = _z_max - OCCLUSAL_BAND_FRACTION * _crown_height
+_in_band = int((_ridge_z >= _band_floor).sum())
+_frac_in_band = _in_band / float(len(_ridge_ids))
+
+assert _frac_in_band >= 0.90, (
+    f"only {_frac_in_band*100:.0f}% of identified incisal points lie in the occlusal "
+    f"{OCCLUSAL_BAND_FRACTION*100:.0f}% of crown height (z >= {_band_floor:.2f} of "
+    f"{_z_min:.2f}..{_z_max:.2f}). An 'incisal edge' detected mid-crown would seed "
+    f"every flood in the wrong place.")
+
+# And the sulcus must be at the OTHER end - if these overlap, the field is not
+# distinguishing a convex crest from a concave trough at all.
+_sulc_ids = np.nonzero(sulc)[0]
+if len(_sulc_ids):
+    _sulc_z = verts[_sulc_ids][:, 2]
+    assert _sulc_z.mean() < _ridge_z.mean(), (
+        f"the cervical sulcus (mean z {_sulc_z.mean():.2f}) is not below the incisal "
+        f"ridge (mean z {_ridge_z.mean():.2f}) - the two regions are confused")
+
+# The curvature field must have opposite sign at a convex crest and a concave
+# trough. If it does not, no tolerance will separate them.
+_edge_field = float(conc[ridge].mean())
+_sulc_field = float(conc[sulc].mean()) if len(_sulc_ids) else None
+if _sulc_field is not None:
+    assert _sulc_field > _edge_field, (
+        f"the concavity field is {_sulc_field:+.3f} at the sulcus and {_edge_field:+.3f} "
+        f"at the incisal crest - a concave trough must score higher than a convex ridge")
+
+print(f"\nPASS  {len(_ridge_ids)} incisal points, {_frac_in_band*100:.0f}% within the "
+      f"occlusal {OCCLUSAL_BAND_FRACTION*100:.0f}% band "
+      f"(z >= {_band_floor:.2f} of {_z_min:.2f}..{_z_max:.2f}); "
+      f"field {_edge_field:+.3f} at crest vs {_sulc_field:+.3f} at sulcus")

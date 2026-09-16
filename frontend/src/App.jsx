@@ -4,12 +4,14 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { frameArch, attachResize, pickAcrossArches } from "./frameArch";
 import { BrushIndex, installBrush, CELL_FACTOR } from "./brush";
-import { installBVH, refreshBoundsTree, dropBoundsTree } from "./bvh";
+import { installBVH, refreshBoundsTree, dropBoundsTree, configureRaycaster } from "./bvh";
 import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
          toothAxes, deltaFromClinical, clinicalAtStage, stagingFor } from "./toothGizmo";
 import StagingTimeline from "./StagingTimeline";
 import { useStagePlayback } from "./useStagePlayback";
 import ValidationPanel, { PASS, REVIEW, UNKNOWN } from "./ValidationPanel";
+import AttachmentPanel from "./AttachmentPanel";
+import { installAttachmentTool, SHAPES as ATTACHMENT_SHAPES } from "./AttachmentPlacementTool";
 import { PanelGroup, Panel } from "./Panel";
 
 /** Which Wheeler class an FDI number belongs to, for the label next to the slider. */
@@ -377,6 +379,33 @@ export default function App() {
   // messages.
   const [health, setHealth] = useState({ state: "checking", detail: "" });
 
+  // Attachment placement. Kept out of `tool` because it is a MODE over the
+  // selected crown rather than another selection brush - the wand and brush
+  // paint the arch, this one bonds to a tooth that has already been cut.
+  const [attachMode, setAttachMode] = useState(false);
+  const [attachSettings, setAttachSettings] = useState({
+    shape: "vertical_rectangular",
+    dimensions: { ...{ md: ATTACHMENT_SHAPES.vertical_rectangular.md,
+                       oa: ATTACHMENT_SHAPES.vertical_rectangular.oa,
+                       bl: ATTACHMENT_SHAPES.vertical_rectangular.bl } },
+    rotation_deg: 0,
+  });
+  const [placedAttachments, setPlacedAttachments] = useState([]);
+  const attachToolRef = useRef(null);
+  // Mirrored for the imperative pointer handlers, which are installed once and
+  // must read the CURRENT settings without being re-installed on every slider
+  // move. Written in an EFFECT, not during render: React may discard a render,
+  // and `activeTooth` is declared further down this component, so reading it
+  // here during render would be a temporal-dead-zone crash - the fourth time
+  // that trap has appeared in this file.
+  const attachRef = useRef({ mode: false, settings: null, tooth: null });
+  // The placement callback, reached through a ref for two reasons: the scene
+  // effect must run ONCE (depending on a callback would tear down and rebuild
+  // three.js on every change), and placeAttachment is declared further down
+  // this component, so naming it in a deps array would be a temporal-dead-zone
+  // crash - the fifth occurrence of that trap here.
+  const placeAttachmentRef = useRef(null);
+
   const [archFrame, setArchFrame] = useState(null);
   const [tool, setTool] = useState("wand"); 
   const [tolerance, setTolerance] = useState(1.2);
@@ -392,6 +421,12 @@ export default function App() {
   // 10mm in a shipped manifest.
   const [rootLength, setRootLength] = useState(10.0);
   const [activeTooth, setActiveTooth] = useState(null);
+
+  useEffect(() => {
+    attachRef.current = { mode: attachMode, settings: attachSettings, tooth: activeTooth };
+    attachToolRef.current?.refresh();
+    if (!attachMode) attachToolRef.current?.hide();
+  }, [attachMode, attachSettings, activeTooth]);
 
   const [gizmoMode, setGizmoMode] = useState("rotate");
   // Stage scrubbing. `stage` is React state because the chrome shows it, but
@@ -418,7 +453,30 @@ export default function App() {
     scene.background = new THREE.Color(0x0d0f12);
 
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
+
+    // WebGLRenderer THROWS if the browser cannot give it a context — a blocked
+    // GPU, a software-rendering blacklist, or simply too many live contexts
+    // because the tab has been reloaded repeatedly. Unguarded, that throw
+    // escapes the effect and the clinician gets the blank page the error
+    // boundary exists to prevent, with no statement of the cause.
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+    } catch (err) {
+      try {
+        // Antialiasing needs a multisampled buffer. Dropping it is often the
+        // difference between a context and none on constrained hardware, so it
+        // is worth one retry before giving up on the viewport entirely.
+        renderer = new THREE.WebGLRenderer({ antialias: false });
+        console.warn(`[WebGL] antialiasing unavailable (${err.message}); `
+                     + `continuing without it.`);
+      } catch (err2) {
+        setStatus(`3D viewport unavailable: this browser could not create a WebGL `
+                  + `context (${err2.message}). The backend is unaffected — an `
+                  + `existing case can still be exported.`);
+        return () => {};
+      }
+    }
     renderer.setPixelRatio(window.devicePixelRatio);
     // Physically-based materials need tone mapping to stay off the clipping
     // ceiling; without it the clearcoat highlight blows out to flat white and
@@ -479,8 +537,6 @@ export default function App() {
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.shadowMap.autoUpdate = false;
-    three.current.sun = sun;
-    three.current.catcher = catcher;
 
     // Image-based lighting. A physical material with no environment has nothing
     // to reflect, so the clearcoat has no highlight to modulate and the whole
@@ -493,8 +549,32 @@ export default function App() {
 
 
     installBVH();   // patch three's raycast before anything is picked
-    three.current = { scene, camera, renderer, controls, raycaster: new THREE.Raycaster() };
+    // sun AND catcher GO IN THE LITERAL. They used to be assigned onto
+    // three.current a few lines above — and then this statement REPLACED the
+    // whole object, so both were gone by the time anything read them.
+    // `aimShadows` opens with `if (!sun || !catcher) return;`, so the entire
+    // shadow rig silently never armed: no throw, no warning, just no shadow.
+    // That is the same class of failure as the record-vs-Object3D mistake below
+    // — the silent half of a bug is the half that survives a fix.
+    three.current = { scene, camera, renderer, controls, sun, catcher,
+                      // firstHitOnly is not a micro-optimisation: without it
+                      // three-mesh-bvh collects and sorts EVERY intersection
+                      // along the ray, and all five call sites take [0]. This
+                      // is the one raycaster the brush, the gizmo, the frame
+                      // picker and the attachment tool all share.
+                      raycaster: configureRaycaster(new THREE.Raycaster()) };
     const detach = attachResize(mount, camera, renderer);
+
+    // Click-to-place attachments. Installed once; it reads live settings through
+    // attachRef so a slider move does not re-install pointer handlers. It raycasts
+    // ONLY against cut crowns - an attachment bonds to a tooth, not to the cast.
+    attachToolRef.current = installAttachmentTool({
+      dom: renderer.domElement, camera, raycaster: three.current.raycaster, scene,
+      getTargets: () => (attachRef.current.mode
+        ? Object.values(teeth.current).map((r) => r.mesh).filter(Boolean) : []),
+      getSettings: () => attachRef.current.settings,
+      onPlace: (p) => { if (attachRef.current.mode) placeAttachmentRef.current?.(p); },
+    });
 
     // Initialize the Deltaface-style 3D Gizmo
     gizmoRef.current = new ToothGizmo(
@@ -513,6 +593,8 @@ export default function App() {
           rec.delta.copy(gizmoRef.current.deltaMatrix());
           rec.clinical = clinicalValues;
         }
+        // A tooth moved, so its shadow is wrong until the map is re-rendered.
+        three.current.shadowsDirty = true;
         if (sid && st.activeTooth) {
           await fetch(`${API}/api/session/${sid}/tooth/${st.activeTooth}/kinematics`, {
             method: "POST",
@@ -541,23 +623,91 @@ export default function App() {
       }
     );
 
+    // --- WebGL context loss ------------------------------------------------
+    // A context is lost on a GPU driver reset, a laptop switching graphics
+    // cards, or the browser reclaiming one from a backgrounded tab. Every GPU
+    // resource — geometries, textures, the shadow map, the bounds trees' host
+    // buffers — is invalidated, and rendering afterwards throws once per frame.
+    //
+    // The DEFAULT browser behaviour is the problem: without preventDefault the
+    // context is never restored and the canvas stays black forever. So this
+    // takes the event, stops the render loop, and says plainly that the CASE IS
+    // INTACT — the scan, the cuts and the prescriptions live in the session on
+    // the backend, and none of them are GPU state.
+    const canvas = renderer.domElement;
+    const onContextLost = (e) => {
+      e.preventDefault();                 // opt in to restoration
+      three.current.contextLost = true;
+      console.warn("[WebGL] context lost — suspending the render loop until restore.");
+      setStatus("3D context lost (GPU driver reset or the tab was reclaimed). "
+                + "Your case is safe on the backend. Waiting for the browser to "
+                + "restore the context; reload if it does not return.");
+    };
+    const onContextRestored = () => {
+      three.current.contextLost = false;
+      // Every cached shadow map died with the context, and autoUpdate is off,
+      // so without this the scene comes back lit but with no shadows at all.
+      three.current.shadowsDirty = true;
+      console.warn("[WebGL] context restored — resuming.");
+      setStatus("3D context restored.");
+    };
+    canvas.addEventListener("webglcontextlost", onContextLost, false);
+    canvas.addEventListener("webglcontextrestored", onContextRestored, false);
+
+    // Shadow allocation is the one thing here that can fail on an otherwise
+    // working context: the 1024x1024 depth target is a real buffer and a
+    // constrained GPU can refuse it. It is allocated on the FIRST RENDER, not
+    // when shadowMap.enabled is set, so this is the only place that can catch
+    // it. Shadows are presentation — losing them costs a depth cue, not the
+    // viewport — so the failure disables them once and says so, rather than
+    // throwing sixty times a second into a console nobody has open.
+    let renderFailures = 0;
+
     let raf;
     (function animate() {
       raf = requestAnimationFrame(animate);
+      if (three.current.contextLost) return;
       controls.update();
       // One shadow-map update per change, not per frame. shadowsDirty is set by
-      // a cut, a committed transform or the occlusal plane being established —
-      // everything that actually moves geometry. An orbit moves the camera and
-      // nothing else, so it costs nothing.
+      // a cut, a committed transform (dragged or typed), an attachment being
+      // bonded or cleared, and the occlusal plane being established — every
+      // path that changes geometry. This comment used to claim all of that
+      // while aimShadows was the ONLY writer, so every cut and every movement
+      // left the pre-cut arch's shadow on the catcher. An orbit moves the
+      // camera and nothing else, so it still costs nothing.
       if (three.current.shadowsDirty) {
         renderer.shadowMap.needsUpdate = true;
         three.current.shadowsDirty = false;
       }
-      renderer.render(scene, camera);
+      try {
+        renderer.render(scene, camera);
+        renderFailures = 0;
+      } catch (err) {
+        renderFailures += 1;
+        if (renderer.shadowMap.enabled) {
+          renderer.shadowMap.enabled = false;
+          sun.castShadow = false;
+          catcher.receiveShadow = false;
+          three.current.shadowsUnavailable = true;
+          console.warn(`[WebGL] render failed (${err.message}); disabling shadows `
+            + `and retrying. Geometry, cutting, staging and export are unaffected.`);
+        } else if (renderFailures === 1 || renderFailures === 30) {
+          // Not the shadow map, then. Report it twice — once immediately and
+          // once after half a second of failures — and keep the loop alive, so
+          // the sidebar and the export button still work while the viewport
+          // does not.
+          console.error("[WebGL] render failed with shadows already off:", err);
+          setStatus(`3D rendering failed: ${err.message}. The case is intact on the `
+            + `backend and export still works; reload to rebuild the viewport.`);
+        }
+      }
     })();
 
     return () => {
       cancelAnimationFrame(raf);
+      canvas.removeEventListener("webglcontextlost", onContextLost);
+      canvas.removeEventListener("webglcontextrestored", onContextRestored);
+      attachToolRef.current?.dispose();
       detach();
       cleanupBrush();
       gizmoRef.current?.detach();
@@ -686,6 +836,88 @@ export default function App() {
     // the dependency removed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessions, active, archFrame, staging, activeTooth, kinematics]);
+
+  /** Send a clicked placement to the backend and fuse it onto the crown. */
+  const placeAttachment = useCallback(async (payload) => {
+    const st = attachRef.current;
+    const sid = stateRef.current?.sessions?.[stateRef.current.activeArch]?.session_id;
+    const tid = payload.tooth_id || st.tooth;
+    if (!sid || !tid) { setStatus("Select a cut tooth before placing an attachment."); return; }
+    try {
+      const res = await fetch(`${API}/api/session/${sid}/tooth/${tid}/attachment`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, tooth_id: tid }),
+      });
+      const body = await res.text();
+      if (!res.ok) {
+        // 422 carries the reason - implausible size, or not touching the crown.
+        let msg = body;
+        try { msg = JSON.parse(body).detail || body; } catch { /* plain text */ }
+        setStatus(`Attachment refused: ${msg}`);
+        return;
+      }
+      const data = JSON.parse(body);
+      setPlacedAttachments(data.attachments || []);
+
+      // Replace the crown geometry with the FUSED solid, so what the clinician
+      // sees is the solid that will be staged and printed.
+      const rec = teeth.current[tid];
+      if (rec?.mesh && data.crown) {
+        const g = rec.mesh.geometry;
+        g.setAttribute("position",
+          new THREE.BufferAttribute(new Float32Array(data.crown.positions), 3));
+        g.setIndex(new THREE.BufferAttribute(new Uint32Array(data.crown.indices), 1));
+        g.computeVertexNormals();
+        const n = g.attributes.position.count;
+        const c = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) CROWN_COL.toArray(c, i * 3);
+        g.setAttribute("color", new THREE.BufferAttribute(c, 3));
+        // allowWeld: a crown's vertex ids are local. It is rebuilt wholesale
+        // from each server payload and nothing keys a selection on it, unlike
+        // the arch, where welding would re-point the wand at other anatomy.
+        refreshBoundsTree(g, { allowWeld: true });
+        // The crown is a different solid now - it has a bump on it. Same
+        // reason as a cut: autoUpdate is off, so without this the catcher
+        // keeps the silhouette of the un-bonded crown.
+        three.current.shadowsDirty = true;
+      }
+      setStatus(`${data.attachment.shape.replace(/_/g, " ")} bonded — `
+                + `fused to ${data.bodies} body, ${data.volume_mm3}mm3.`);
+    } catch (err) {
+      setStatus(`Attachment failed: ${err.message}`);
+    }
+  }, []);
+
+  // Published in an effect BELOW its own declaration. Putting it in the deps
+  // array of the effect further up crashed the app with "Cannot access
+  // 'placeAttachment' before initialization" - deps arrays are evaluated during
+  // render, while a const declared later is still in its temporal dead zone.
+  // npm run smoke caught it; npm run build did not, and reported success.
+  useEffect(() => { placeAttachmentRef.current = placeAttachment; }, [placeAttachment]);
+
+  const clearAttachments = useCallback(async () => {
+    const sid = stateRef.current?.sessions?.[stateRef.current.activeArch]?.session_id;
+    const tid = attachRef.current.tooth;
+    if (!sid || !tid) return;
+    const res = await fetch(`${API}/api/session/${sid}/tooth/${tid}/attachment`,
+                            { method: "DELETE" });
+    if (!res.ok) return;
+    const data = await res.json();
+    setPlacedAttachments([]);
+    const rec = teeth.current[tid];
+    if (rec?.mesh && data.crown) {
+      const g = rec.mesh.geometry;
+      g.setAttribute("position",
+        new THREE.BufferAttribute(new Float32Array(data.crown.positions), 3));
+      g.setIndex(new THREE.BufferAttribute(new Uint32Array(data.crown.indices), 1));
+      g.computeVertexNormals();
+      refreshBoundsTree(g, { allowWeld: true });
+      // Removing the bumps changes the silhouette back. The shadow map has to
+      // be told; nothing else in the frame loop notices a geometry swap.
+      three.current.shadowsDirty = true;
+    }
+    setStatus(`Cleared ${data.cleared} attachment(s); crown restored as cut.`);
+  }, []);
 
   /**
    * Case stage count = MAX over committed teeth, plus who binds each one.
@@ -842,7 +1074,7 @@ export default function App() {
           g.setAttribute("position",
             new THREE.BufferAttribute(new Float32Array(t.crown.positions), 3));
           g.setIndex(new THREE.BufferAttribute(new Uint32Array(t.crown.indices), 1));
-          refreshBoundsTree(g);
+          refreshBoundsTree(g, { allowWeld: true });
           g.computeVertexNormals();
           const n = g.attributes.position.count;
           const c = new Float32Array(n * 3);
@@ -875,6 +1107,7 @@ export default function App() {
             fdi: t.fdi ?? null,
             rootLength: t.root_length_mm,
             rootDefault: t.fdi != null ? rootDefaultForFDI(t.fdi) : null,
+            rootClamp: t.root_cone?.clamped ? t.root_cone : null,
           };
 
           applyExtraction(archRec, t.removed_faces, t.socket_cap, three.current.scene);
@@ -1138,7 +1371,7 @@ export default function App() {
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(data.crown.positions), 3));
       geom.setIndex(new THREE.BufferAttribute(new Uint32Array(data.crown.indices), 1));
-      refreshBoundsTree(geom);
+      refreshBoundsTree(geom, { allowWeld: true });
       geom.computeVertexNormals();
 
       const nVerts = geom.attributes.position.count;
@@ -1166,11 +1399,20 @@ export default function App() {
         fdi: data.fdi ?? fdi,
         rootLength: rootUsed,
         rootDefault,
+        // Set only when the DRAWN cone was shortened to stay inside the scan.
+        // C_res still uses the full length; this is a note about a picture.
+        rootClamp: data.root_cone?.clamped ? data.root_cone : null,
       };
 
       // TRUE extraction: the tooth's faces leave the cast and the socket is
       // capped in gingiva. Previously this only recoloured the vertices dark,
       // which left the geometry in place and read as an impression.
+      // The cast just changed shape. Without this the shadow map keeps the
+      // silhouette of the PRE-CUT arch: autoUpdate is off (a shadow re-rendered
+      // every frame is the single most expensive thing here), so the map only
+      // refreshes when something sets this flag — and until now only
+      // aimShadows did, which runs once when the occlusal plane is established.
+      three.current.shadowsDirty = true;
       applyExtraction(arches.current[active], data.removed_faces, data.socket_cap,
                       three.current.scene);
       setSelection([]);
@@ -1265,6 +1507,9 @@ export default function App() {
     // downstream.
     rec.delta.copy(gizmoRef.current.deltaMatrix());
     rec.clinical = next;
+    // Typed movements move the tooth exactly as a drag does, so the shadow is
+    // equally stale. Same flag, same reason.
+    three.current.shadowsDirty = true;
     // A changed prescription changes the case length, and the timeline's own
     // stage count is what every stage pose is scaled against.
     const total = refreshStaging();
@@ -1521,16 +1766,43 @@ export default function App() {
   const setHover = useCallback((mesh) => {
     const prev = three.current.hovered;
     if (prev === mesh) return;
+
+    // UNDO EXACTLY WHAT WAS DONE, which means recording which of the two
+    // techniques was applied. The old code restored `emissiveIntensity`
+    // unconditionally — including on a material that has no `emissive` and was
+    // therefore never highlighted, where the write invents a property and
+    // "restores" it to a 1 nobody stored.
     if (prev?.material) {
-      prev.material.emissive?.setHex(prev.userData.prevEmissive ?? 0x000000);
-      prev.material.emissiveIntensity = prev.userData.prevEmissiveI ?? 1;
+      const how = prev.userData.hoverTechnique;
+      if (how === "emissive") {
+        prev.material.emissive.setHex(prev.userData.prevEmissive ?? 0x000000);
+        prev.material.emissiveIntensity = prev.userData.prevEmissiveI ?? 1;
+      } else if (how === "color") {
+        // Restore the SAVED hex, never `subScalar(0.12)`. addScalar clamps at
+        // 1.0, so on a light material the boost is not invertible and hovering
+        // repeatedly would walk the crown toward white a step at a time.
+        prev.material.color.setHex(prev.userData.prevColor ?? 0xffffff);
+      }
+      prev.userData.hoverTechnique = null;
     }
+
     if (mesh?.material?.emissive) {
       mesh.userData.prevEmissive = mesh.material.emissive.getHex();
       mesh.userData.prevEmissiveI = mesh.material.emissiveIntensity;
       mesh.material.emissive.setHex(0x1e6fff);       // neon blue, as asked
       mesh.material.emissiveIntensity = 0.55;
+      mesh.userData.hoverTechnique = "emissive";
+    } else if (mesh?.material?.color) {
+      // A material with no emissive channel — MeshBasicMaterial, or anything a
+      // future renderer path substitutes. Silently doing nothing here is the
+      // bad outcome: the clinician gets no feedback that the tooth under the
+      // cursor is the one that will be picked, and there is no way to tell
+      // that apart from a dead pointer handler.
+      mesh.userData.prevColor = mesh.material.color.getHex();
+      mesh.material.color.addScalar(0.12);
+      mesh.userData.hoverTechnique = "color";
     }
+
     three.current.hovered = mesh || null;
   }, []);
 
@@ -1747,7 +2019,24 @@ export default function App() {
         <ValidationPanel checks={caseChecks} />
 
         {Object.keys(teeth.current).length > 0 && (
-          <Panel id="export" step="5" title="Export">
+          <>
+          <Panel id="attachments" step="6" title="Attachments">
+            <AttachmentPanel
+              enabled={!!activeTooth}
+              active={attachMode}
+              onToggle={() => setAttachMode((m) => !m)}
+              settings={attachSettings}
+              onChange={setAttachSettings}
+              placed={placedAttachments}
+              onClear={clearAttachments}
+              targetLabel={activeTooth
+                ? (teeth.current[activeTooth]?.fdi
+                    ? `FDI ${teeth.current[activeTooth].fdi}`
+                    : activeTooth.slice(0, 8))
+                : null} />
+          </Panel>
+
+          <Panel id="export" step="7" title="Export">
             {Object.entries(teeth.current).map(([tid, rec]) => {
               const moved = rec.clinical && Object.values(rec.clinical).some((x) => x);
               return (
@@ -1759,6 +2048,14 @@ export default function App() {
                   {rec.fdi != null ? `FDI ${rec.fdi}` : tid}
                   {rec.rootLength != null ? `  ${rec.rootLength.toFixed(1)}mm root` : ""}
                   {moved ? "  (moved)" : "  (at T0)"}
+                  {rec.rootClamp ? (
+                    <div style={S.rootClamp} title={rec.rootClamp.clamp_note}>
+                      [Virtual Root] Projection constrained to alveolar boundary
+                      {" — "}
+                      {rec.rootClamp.requested_mm.toFixed(1)}mm requested,{" "}
+                      {rec.rootClamp.length_mm.toFixed(1)}mm drawn. Pivot unchanged.
+                    </div>
+                  ) : null}
                 </button>
               );
             })}
@@ -1772,6 +2069,7 @@ export default function App() {
               Export Stages (1&ndash;{staging.total || "?"}) &mdash; fused solids
             </button>
           </Panel>
+          </>
         )}
         </PanelGroup>
       </aside>
@@ -1800,6 +2098,12 @@ const S = {
   primary: { width: "100%", color: "#06181a", border: "none", borderRadius: 6, padding: "8px 12px", fontWeight: 600, cursor: "pointer" },
   chip: { width: "100%", marginTop: 5, background: "transparent", color: "#8b93a0", border: "1px solid #2c313a", borderRadius: 5, padding: "6px 8px", fontSize: 12, cursor: "pointer", transition: "0.2s" },
   dt: { color: "#8b93a0", marginBottom: 2, marginTop: 8 },
+  // Amber, not red: the plan is fine, the DRAWING was shortened. A red
+  // chip here would read as a clinical finding about the tooth.
+  rootClamp: { marginTop: 5, padding: "4px 6px", borderRadius: 4,
+               background: "#2a2113", border: "1px solid #5a4620",
+               color: "#ffa53c", fontSize: 10.5, lineHeight: 1.45,
+               whiteSpace: "normal" },
   stepBtn: {
     width: 28, flex: "0 0 28px", background: "linear-gradient(#2a2f37,#21252b)",
     border: "1px solid #2c313a", borderRadius: 5, color: "#e7ebee",

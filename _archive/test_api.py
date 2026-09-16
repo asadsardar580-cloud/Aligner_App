@@ -1,7 +1,10 @@
 import requests
 
-# Here is your exact 3D file path!
-file_path = r"C:\Users\Lenovo\OneDrive\Desktop\17012026-asad dk srdar-lowerjaw.stl"
+# SCRUBBED 2026-09-16: this line carried a real patient-identifying
+# filename (a date and a name). Replaced with a generic mock path.
+# The original remains in git history from the baseline commit - see
+# _archive/README.md for the options if that matters to you.
+file_path = r"C:\path\to\patient_mock_mandible.stl"
 
 print(f"Sending {file_path} to the AI Engine...")
 

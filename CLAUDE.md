@@ -16,7 +16,7 @@ Teeth must move biologically. Meshes must be mathematically watertight for 3D pr
 
 | | Live |
 |---|---|
-| API | **`api_core.py`** — `uvicorn api_core:app`, 21 routes. Launched by `start_backend.bat`. |
+| API | **`api_core.py`** — `uvicorn api_core:app`, 31 routes. Launched by `start_backend.bat`. |
 | Client | **`frontend/src/App.jsx`** — `npm run dev`, launched by `start_frontend.bat`. |
 | Geometry | **`core_geometry.py`** — pure NumPy/SciPy, headless, the engine. |
 | Docs | **`CLAUDE.md`** (this file) and **`README.md`**. No other document is authoritative. |
@@ -30,8 +30,8 @@ that used to shadow the real `tooth_segmentation/` modules.
 
 ```
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names without importing (67 files)
-python run_all_tests.py                 # CANONICAL runner — 27 entries
+python check_structure.py               # undefined names without importing (84 files)
+python run_all_tests.py                 # CANONICAL runner — 34 entries
 python -m pytest -q                     # runs alongside; both must pass
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 cd frontend && npm run lint && npm run build && npm run smoke
@@ -39,7 +39,8 @@ cd frontend && npm run lint && npm run build && npm run smoke
 
 `npm run smoke` is not optional: a `vite build` succeeds on code that throws during render, and a
 dependency array referencing a later `const` has already white-screened this app twice.
-**Three of the 27 suite entries assert nothing** — treat it as 24 enforcing tests plus 3 reports.
+**Every suite entry now carries assertions** — the three characterization scripts were
+hardened on 2026-09-16.
 `npx playwright test` (in `frontend/`) drives the production build; `node frontend/verify-kinematics.mjs`
 pins the browser against the backend at 1e-12 (observed 1.78e-15).
 
@@ -676,7 +677,77 @@ that name would reasonably be believed to come from a scanner. Registration must
 transform **the CBCT into scanner space, never the scan** — rule 3.1 — and a 2mm
 residual moves C_res by 2mm.
 
-## 17. KNOWN OPEN ISSUES
+## 17. RESOLVED: THE FIVE OPEN ITEMS
+
+**There is no ground truth in this repository, and the benchmark refuses to
+pretend otherwise.** `case_lower.stl_output.json` is ToothGroupNetwork's own
+PREDICTION. Scoring a model against its own output returns mIoU 1.0, FDI accuracy
+100% and Chamfer 0.0 — numbers that look like validation and mean nothing.
+`benchmark_segmentation.py` implements per-class IoU, FDI accuracy, Chamfer and
+Hausdorff correctly and completely, then **refuses to run** without an
+independently attributed annotation. It rejects an annotator field naming the
+model, a missing attribution, and a label count that does not match the mesh.
+
+**The `/segment` confidence breakdown is a plausibility proxy and says so in two
+fields.** `is_measured_accuracy: false` and a `meaning` string stating the key
+`miou_estimate` keeps the API's name but **must not be quoted as an mIoU**. This
+project already carried four mutually inconsistent accuracy claims inherited from
+prose; a fifth from a self-comparison would have been worse than none.
+
+**The hybrid fallback repairs SHAPE and keeps the model's NAME.** Tier 2 is the
+classical geodesic flood, which follows the curvature barrier and therefore
+returns ONE connected region by construction — the exact property tier 1 loses.
+It cannot name a tooth, so the FDI is kept from the model. Measured: a split
+label (65% largest island) is repaired by re-growing 5,671 vertices, and marked
+**REVIEW_REQUIRED, because a repair is not a confirmation**. The trigger is NOT an
+mIoU: no IoU is computable at runtime.
+
+**Scans are now cached on disk, which reverses a standing rule, and the cost is
+stated rather than absorbed.** A dental arch mesh is BIOMETRIC data — it
+identifies a person the way a fingerprint does. So scans are encrypted with the
+same Fernet key as case files, keyed by **SHA-256 of the raw upload**, and no
+filename is stored. Measured: zstd to **20% of raw size**; restart recovery
+restored 28,900 vertices with no re-upload. **A content hash cannot be
+re-pointed** — a random id could be aimed at a different scan and the plan would
+silently apply to wrong anatomy.
+
+**Three characterization scripts became tests.** They printed tables and exited
+0, so they reported PASS regardless of what they measured. Now: 20 interproximal
+configurations asserted non-negative with the separation ordering holding
+(1.47 >= 1.15); the colour buffer asserted `(22500, 3)` float32 in `[0,1]` —
+a 0-255 palette slipping in clips silently to white in WebGL; 91% of identified
+incisal points asserted inside the occlusal 15% band.
+
+**The antagonist sweep found first contact at stage 22/31** on a 3mm extrusion
+into a 2mm gap — exactly the predicted two-thirds — and penetration is monotonic.
+The fixture construction had a real bug first: **reflecting through a plane `g`
+above the tip puts the surface `2g` away**, so the gap was silently doubled and
+the interference test could never fire. **There is still no real maxillary scan**;
+the antagonist is a mirrored mandible, and a test asserts that so the gap cannot
+be forgotten.
+
+**GREEN never claims biological safety.** Rate limits are HEURISTIC (the tray
+will not track it); total extrusion/intrusion limits are LITERATURE-labelled and
+differ by a millimetre, so **a sign error would swap them** — `+2.5mm` extrusion
+is RED while `-2.5mm` intrusion is allowed, and a test pins exactly that. The
+clinical report leads with what is outstanding and carries the disclaimer
+verbatim; IPR rows carry `reduction_mm: null`, because the software measures a
+gap and does not prescribe enamel reduction.
+
+**`npm run smoke` caught a TDZ crash that `npm run build` reported as success.**
+Adding `placeAttachment` to a deps array above its own declaration threw
+`Cannot access 'placeAttachment' before initialization` while the bundle built
+cleanly at 946 KB. **That is the FIFTH occurrence of this trap in App.jsx.** The
+rule, now stated for the last time: **a deps array is evaluated during render, so
+anything it names must be declared above it** — route through a ref and publish
+it in an effect placed below the declaration.
+
+**An attachment's normal must be converted to world space.** `face.normal` is in
+OBJECT space, and a cut crown carries its prescription as a committed 4x4 — using
+it raw places attachments correctly on an unmoved tooth and progressively wrongly
+on a moved one.
+
+## 18. KNOWN OPEN ISSUES
 * **RESOLVED 2026-09-15 — the suite is 24/24.** `test_api_core.py` was rewritten against the
   current endpoints and `test_face_order.py` took the one-line `stl_io.parse_stl_bytes` fix. Both
   had been red on a **stale API surface**, never on geometry, which is why nothing downstream ever
@@ -720,7 +791,8 @@ residual moves C_res by 2mm.
   **`trimesh` and `open3d` are equally load-bearing** — `inference_pipelines/inference_pipeline_tgn.py:1`
   imports `gen_utils`, which imports `trimesh`, and both import `open3d`. All six are now listed.
   Verify a dependency by following the import chain, not by reading the app's own top-level imports.
-* **3 of the 24 suite entries assert nothing.** `test_interproximal.py`, `test_auto_color.py` and
+* ~~3 of the suite entries assert nothing~~ **RESOLVED 2026-09-16** — `test_interproximal`, `test_auto_color` and `test_incisal_edge` now carry enforcing
+  assertions. Every suite entry can now fail. `test_interproximal.py`, `test_auto_color.py` and
   `test_incisal_edge.py` are characterization scripts that print measurements and exit 0, so they
   report PASS unconditionally. The suite is 21 real tests, not 24.
 * **Segmentation cannot be cancelled.** It is 236s on a real scan and the only exits are waiting

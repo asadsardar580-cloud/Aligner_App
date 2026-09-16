@@ -147,6 +147,11 @@ class Tooth:
 class Arch:
     arch: str                              # 'upper' | 'lower'
     session_id: str | None = None          # the in-memory scan, if still live
+    # SHA-256 of the raw upload. This is what survives a restart: the session id
+    # dies with the process, the hash finds the same mesh in the scan cache. A
+    # content hash rather than a random id ON PURPOSE - it cannot be re-pointed
+    # at a different scan, so a plan can never silently apply to wrong anatomy.
+    scan_hash: str | None = None
     has_occlusal_frame: bool = False
     has_segmentation: bool = False
     scan_vertex_count: int = 0
@@ -255,7 +260,8 @@ class Case:
                 has_occlusal_frame=a.get("has_occlusal_frame", False),
                 has_segmentation=a.get("has_segmentation", False),
                 scan_vertex_count=a.get("scan_vertex_count", 0),
-                scan_face_count=a.get("scan_face_count", 0), teeth=teeth)
+                scan_face_count=a.get("scan_face_count", 0),
+                scan_hash=a.get("scan_hash"), teeth=teeth)
         return Case(case_id=d.get("case_id") or uuid.uuid4().hex[:12],
                     created=d.get("created", time.time()),
                     updated=d.get("updated", time.time()),
