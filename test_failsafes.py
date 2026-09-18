@@ -406,6 +406,228 @@ def test_missing_manifold3d_is_a_sentence_not_a_traceback():
     print("PASS  a missing manifold3d wheel is a 503 with an instruction")
 
 
+# =========================================================================
+# Print compensation on the FUSED stage model
+# -------------------------------------------------------------------------
+# The brief asked for a 0.15 mm dilation of each moved crown BEFORE the CSG
+# boolean. That is the one instruction in it that had to be changed rather than
+# implemented, and these tests pin the reason so nobody quietly puts it back.
+#
+# This export is a UNION producing the positive a lab draws a sheet over. A
+# crown dilated before that union oversizes the finished tray on every wall by
+# the full offset — 0.15 mm against a 0.25 mm per-stage translation limit, so
+# most of a stage of prescribed movement given away as slop. Applied to the
+# fused solid AFTER the union it is what it claims to be: an allowance for a
+# printer that runs undersized, on a model that is otherwise true to anatomy.
+#
+# Default 0.0, stated in the manifest either way.
+# =========================================================================
+
+def _staged(**kw):
+    """A two-crown arch with movement, exported at the given compensation."""
+    import api_core
+    from test_staging_export import moved_session
+    sid, _tids, _presc = moved_session()
+    return sid, api_core.build_stage_bundle(sid, api_core.StageExportRequest(**kw))
+
+
+def test_the_default_export_is_true_to_anatomy_and_SAYS_so():
+    """0.0 is not silence. A manifest that omits the field leaves a lab to
+    assume, and assuming is how an oversized tray reaches a patient."""
+    import api_core
+    from session_store import STORE
+    assert api_core.StageExportRequest().print_compensation_mm == 0.0, \
+        "the default must be OFF — a clearance nobody asked for is a silent defect"
+    sid, res = _staged()
+    try:
+        man = res["manifest"]
+        assert man["print_compensation_mm"] == 0.0
+        assert "true to anatomy" in man["print_compensation_note"]
+    finally:
+        STORE.drop(sid)
+    print("PASS  the default export is true to anatomy, and the manifest says so")
+
+
+def test_zero_compensation_changes_not_one_vertex():
+    """The offset path must be genuinely inert at 0.0, not merely small.
+
+    `offset_along_normals(v, f, 0.0)` is v + normals*0.0, which is v for every
+    finite normal — but it also runs a normal computation over the whole fused
+    solid, and a NaN normal times 0.0 is NaN, not 0.0. Asserting the written
+    STLs are byte-identical is the only claim that rules that out.
+    """
+    import zipfile
+    import api_core
+    from session_store import STORE
+    from test_staging_export import moved_session
+    sid, _tids, _presc = moved_session()
+    try:
+        a = api_core.build_stage_bundle(sid, api_core.StageExportRequest())
+        b = api_core.build_stage_bundle(
+            sid, api_core.StageExportRequest(print_compensation_mm=0.0))
+        za, zb = zipfile.ZipFile(a["buf"]), zipfile.ZipFile(b["buf"])
+        stls = sorted(n for n in za.namelist() if n.endswith(".stl"))
+        assert stls, "no stages were built, so this asserts nothing"
+        for name in stls:
+            assert za.read(name) == zb.read(name), f"{name} differs at 0.0 compensation"
+        assert [s["volume_mm3"] for s in a["manifest"]["stage_files"]] == \
+               [s["volume_mm3"] for s in b["manifest"]["stage_files"]]
+    finally:
+        STORE.drop(sid)
+    print(f"PASS  0.0 compensation leaves all {len(stls)} stage STLs byte-identical")
+
+
+def test_a_real_compensation_grows_the_model_and_keeps_it_printable():
+    """Grows it, reports it, and — the part that matters — does not break it.
+
+    A vertex-normal push is the operation that could plausibly cost this export
+    its invariant: push a concave fissure outward far enough and its walls
+    cross. So this does not merely check the volume went up, it re-asserts the
+    whole manufacturing gate on the compensated solid.
+    """
+    import zipfile
+    import api_core
+    import stl_io
+    from session_store import STORE
+    from test_staging_export import moved_session
+    comp = 0.15
+    sid, _tids, _presc = moved_session()
+    try:
+        base = api_core.build_stage_bundle(sid, api_core.StageExportRequest())
+        grown = api_core.build_stage_bundle(
+            sid, api_core.StageExportRequest(print_compensation_mm=comp))
+
+        man = grown["manifest"]
+        assert man["print_compensation_mm"] == comp
+        assert "not true to anatomy" in man["print_compensation_note"], \
+            "a compensated model must be labelled as one"
+        assert str(comp) in man["print_compensation_note"]
+
+        zf = zipfile.ZipFile(grown["buf"])
+        for before, after in zip(base["manifest"]["stage_files"], man["stage_files"]):
+            assert after["volume_mm3"] > before["volume_mm3"], \
+                f"stage {after['stage']} did not grow: " \
+                f"{before['volume_mm3']} -> {after['volume_mm3']}"
+            # INVARIANT 3, re-asserted on the offset geometry rather than
+            # assumed to survive it.
+            assert after["closed"] is True
+            assert after["components"] == 1
+            v, f = stl_io.parse_stl_bytes(zf.read(after["file"]))
+            rep = cg.manifold_report(f)
+            assert rep["open_edges"] == 0, \
+                f"stage {after['stage']} opened up under a {comp} mm offset"
+            assert cg.signed_volume(v, f) > 0
+
+        worst = max(100.0 * (a["volume_mm3"] - b["volume_mm3"]) / b["volume_mm3"]
+                    for b, a in zip(base["manifest"]["stage_files"], man["stage_files"]))
+        print(f"PASS  {comp} mm compensation grows every stage (worst +{worst:.1f}%), "
+              f"still closed and single-bodied")
+    finally:
+        STORE.drop(sid)
+
+
+def test_a_compensation_past_the_ceiling_is_REFUSED_not_clamped():
+    """Clamping would be the wrong mercy here.
+
+    An out-of-range clearance is invisible in the STL — the model still looks
+    like a model. A clamp would ship a number the requester did not ask for, on
+    a file that gets printed. So it is a 422 that names the limit and says what
+    the limit is measured against.
+    """
+    import api_core
+    from fastapi import HTTPException
+    from session_store import STORE
+    from test_staging_export import moved_session
+    sid, _tids, _presc = moved_session()
+    try:
+        for bad in (0.75, -0.1, float("nan"), float("inf")):
+            with pytest.raises(HTTPException) as ei:
+                api_core.build_stage_bundle(
+                    sid, api_core.StageExportRequest(print_compensation_mm=bad))
+            assert ei.value.status_code == 422
+            assert "print_compensation_mm" in ei.value.detail
+            assert str(api_core.MAX_PRINT_COMPENSATION_MM) in ei.value.detail
+            assert str(api_core.MAX_TRANSLATION_PER_STAGE_MM) in ei.value.detail, \
+                "the refusal must say what the ceiling is measured against"
+    finally:
+        STORE.drop(sid)
+    print("PASS  an out-of-range compensation is refused by name, never clamped")
+
+
+def test_the_ceiling_is_pinned_to_the_per_stage_limit_it_cites():
+    """The refusal tells a clinician that 0.5 mm is twice a stage of movement.
+    If someone retunes the staging limit and not the ceiling, that sentence
+    becomes a false statement inside a clinical error message."""
+    import api_core
+    # Asserted through staging_estimate's own behaviour rather than by reading
+    # its default off the function object: the behaviour is the contract.
+    est = cg.staging_estimate(0, 0, 0, api_core.MAX_TRANSLATION_PER_STAGE_MM, 0, 0)
+    assert est["stages_required"] == 1, \
+        "MAX_TRANSLATION_PER_STAGE_MM no longer matches staging_estimate's own limit"
+    nudged = cg.staging_estimate(0, 0, 0, api_core.MAX_TRANSLATION_PER_STAGE_MM * 1.01, 0, 0)
+    assert nudged["stages_required"] == 2, "…and it is the limit exactly, not merely under it"
+    assert api_core.MAX_PRINT_COMPENSATION_MM == 2 * api_core.MAX_TRANSLATION_PER_STAGE_MM
+    print("PASS  the compensation ceiling still means what its error message says")
+
+
+# --------------------------------------------------------------------------
+# The audit trail's denylist is enforced at RUNTIME, which means a bad call site
+# is only discovered when a clinician performs that action. This is a STATIC
+# check over every _record() in api_core, so it is discovered at test time.
+# --------------------------------------------------------------------------
+
+def test_no_audit_call_site_uses_a_forbidden_key():
+    """Found the hard way: `values={"faces": int(len(faces))}` at the upload
+    call site got EVERY scan upload refused by the denylist and silently
+    unaudited. The denylist was right - `faces` there means the triangle array.
+    The call site meant a scalar count and should have said `face_count`.
+
+    This is the same confusion telemetry.py splits IDENTIFIER_KEYS from
+    GEOMETRY_KEYS to avoid, and it has now been got wrong twice, so it gets a
+    test that reads the SOURCE rather than waiting for the action to be taken.
+    """
+    import ast
+
+    import audit
+
+    tree = ast.parse(open("api_core.py", encoding="utf-8").read())
+    sites, offences = 0, []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "_record"):
+            continue
+        sites += 1
+        for kw in node.keywords:
+            if kw.arg == "values" and isinstance(kw.value, ast.Dict):
+                keys = [k.value for k in kw.value.keys if isinstance(k, ast.Constant)]
+            elif kw.arg:
+                keys = [kw.arg]
+            else:
+                continue
+            offences += [(node.lineno, k) for k in keys if k in audit.FORBIDDEN_KEYS]
+
+    assert sites >= 5, f"only {sites} _record call sites found - did they move?"
+    assert not offences, (
+        "api_core calls _record with keys audit.py refuses, so those entries are "
+        f"dropped at runtime and the action goes unaudited: {offences}")
+    print(f"PASS  {sites} _record call sites, none uses a key the denylist refuses")
+
+
+def test_the_denylist_still_refuses_what_it_is_for():
+    """The counterpart: the check above must not pass because the denylist went
+    soft. A real geometry payload still has to be refused."""
+    import audit
+    trail = audit.AuditTrail()
+    with pytest.raises(ValueError, match="never the patient or the mesh"):
+        trail.record(audit.SCAN_LOADED, arch="lower",
+                     values={"faces": np.zeros((100, 3)).tolist()})
+    trail.record(audit.SCAN_LOADED, arch="lower",
+                 values={"face_count": 187625, "vertex_count": 94848})
+    assert len(trail.entries()) == 1
+    print("PASS  the denylist still refuses a mesh and accepts the counts")
+
+
+
 if __name__ == "__main__":
     test_over_threshold_is_the_CONTACT_flag_not_the_noise_floor()
     test_a_clearance_between_the_two_constants_proves_which_one_fires()
@@ -425,4 +647,11 @@ if __name__ == "__main__":
     test_an_unrepairable_solid_is_REFUSED_by_name_not_forced()
     test_the_weld_rung_does_not_snap_vertices_to_its_own_grid()
     test_missing_manifold3d_is_a_sentence_not_a_traceback()
+    test_no_audit_call_site_uses_a_forbidden_key()
+    test_the_denylist_still_refuses_what_it_is_for()
+    test_the_default_export_is_true_to_anatomy_and_SAYS_so()
+    test_zero_compensation_changes_not_one_vertex()
+    test_a_real_compensation_grows_the_model_and_keeps_it_printable()
+    test_a_compensation_past_the_ceiling_is_REFUSED_not_clamped()
+    test_the_ceiling_is_pinned_to_the_per_stage_limit_it_cites()
     print("\nALL FAIL-SAFE TESTS PASSED")

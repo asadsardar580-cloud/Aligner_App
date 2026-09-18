@@ -64,9 +64,45 @@ reported themselves as fine** — the dangerous kind:
 | SAST | none | `.semgrep.yml`, 9 rules, CI job, **every rule verified to fire** |
 | Telemetry | none | file-only spans; no exporter can be configured |
 | Audit trail | written, called by nothing | recorded at upload, cut, prescription, both exports |
-| `pytest` | 131 | **237** |
+| `pytest` | 131 | **244** |
 | `check_structure.py` | 61 files | **88 files** |
-| Browser E2E | 7/7 | **19 specs** (12 pass; 7 need the backend and skip) |
+| Browser E2E | 7/7 | **19 specs** (18 pass with the backend up; 1 needs a cut tooth) |
+
+### Viewport, shadow rig and startup (2026-09-19)
+
+| | Then | Now |
+|---|---|---|
+| Audit trail | refused **every** upload — the call site passed a scalar under the key `faces`, which the denylist reserves for the triangle ARRAY | `vertex_count`/`face_count`; a static AST test pins all 6 `_record` sites against the denylist |
+| Export snapshot | shipped runnable launchers with no checkpoints, so the app started and only the AI was missing — nothing to notice | launchers withheld from the archive, both refuse to run from it, `api_core` banners at import |
+| AI availability | nothing was running | model ready in **12.3 s**, `loaded: true`, 12 checkpoints present in the root |
+| Viewport framing | occlusal sign taken from where the scan sat vs the scanner origin | translation- and rotation-invariant rule; `camera.up` from the arch's own anterior |
+| Shadow catcher | a 400 mm plane against a 151.7 mm shadow frustum — **85.6%** of it sampled as SHADOWED, a full-screen wash | sized to the frustum |
+| Print compensation | none | `print_compensation_mm`, default 0.0, applied **after** the union |
+| Node CI pins | 1 (kinematics) | 3 (+ framing, + shadow rig) |
+
+### Viewport framing, the shadow rig, a manufacturing offset (2026-09-16)
+
+**CLAUDE.md §20 is the authoritative record.** Two of these are sign errors —
+the kind that look like a rendering preference until you translate the scan.
+
+| | Then | Now |
+|---|---|---|
+| Arch framing sign | `up.dot(camera.position - centre)`, and `camera.position` is `(0,0,0)` on a fresh page — so it asked where the scan sat relative to the **scanner origin**. Right on `case_lower.stl` by a 5.88 mm margin; **a 6 mm translation flips the cast upside-down**, against rule 3.1 | `occlusalOrientation()` — PCA axis, sign from skewness, corroborated by radial spread. Invariant to translation and rotation, asserted to 1e-12 |
+| Radial-spread polarity | planned as occlusal 3.16 mm / tissue 5.83 mm | **measured the other way round: occlusal σ 5.86 mm, tissue σ 3.14 mm.** The occlusal slab is a sparse scatter at widely varying radius; the near-constant-radius ring is the gingival margin. As planned it would have warned on every load |
+| Occlusal basis, once known | ignored by the camera | `frameArch({jaw, frame})` uses `u_occ` directly and skips the heuristic; re-aims **only when `dot < 0`**, so a correct guess never disturbs the clinician's orbit |
+| `camera.up` | the occlusal axis, rolled by an arbitrary seed | `−u_sag` lower / `+u_sag` upper once a frame exists — anterior teeth at the bottom for a mandible |
+| Shadow `near`/`far` | hardcoded `1` / `400` at construction, never touched again | derived from the sun-to-catcher span, 1.5 × radius of margin. 400 in fact held for one arch (156.4 mm) and two in occlusion (180.9 mm); it breaks at a **101.6 mm** combined radius, which two scans from different scanner origins reach **because rule 3.1 forbids re-centring** |
+| Sun direction | straight down `+u_occ` — flat, relief-free shading | `+u_occ + 0.35·u_sag + 0.25·u_tra`, 23.3° off-axis; intensity 1.1 → **1.2** |
+| `aimShadows` failure | a path that had **never once executed** before `2d372b4`, applied without a guard | `computeShadowRig` in a `try/catch`; anything non-finite leaves the sun dark and the catcher hidden. **No shadow, never no image** |
+| Print compensation | not expressible | `print_compensation_mm`, default **0.0**, applied **after** the union to the fused solid — before it, a 0.15 mm dilation oversizes every tray wall by 60% of a full stage of movement. Out of range is **refused, not clamped**; stated in the manifest on every export |
+| Running the wrong copy | `Aligner_App_AI_Export/` holds a full runnable tree with **no checkpoints by design**, so a backend started there looks like a broken AI install | detected at import: a console banner plus an actionable `/api/ai/status` error |
+| Node verification | 1 script (kinematics) | **3** — `verify-kinematics` 1.78e-15, `verify-framing` 25/25, `verify-shadowrig` 43/43 |
+| `pytest` | 237 | **242** |
+
+**Not verifiable here:** there is no browser in this environment, so neither the
+black viewport nor the inverted mandible can be reproduced or confirmed fixed.
+The arithmetic is asserted in Node and a failure is made to degrade safely;
+confirming the two reported symptoms needs one load in a real browser.
 
 **Superseded below:** §4.9's "LIVE BUG" is fixed; §4.10's `requirements.txt` row is fixed; §7's
 test counts are now **36 suite entries / 19 browser E2E specs**; §0's dead files have moved to

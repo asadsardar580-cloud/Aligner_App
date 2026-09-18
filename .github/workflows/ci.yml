@@ -90,6 +90,19 @@ jobs:
         # a real state users hit, and the one the connection badge exists for.
         run: npm run e2e
 
+      - name: Viewport framing pin
+        # The occlusal-axis rule must stay invariant to rigid motion. The rule
+        # it replaced asked where the scan sat relative to the scanner origin,
+        # so the SAME cast moved 60mm framed upside-down — rule 3.1 says a
+        # translation must change nothing, and this is what asserts it.
+        run: node verify-framing.mjs
+
+      - name: Shadow rig pin
+        # Every number handed to a light must be finite, correctly signed and
+        # inside its own frustum. It cannot tell you the viewport is lit — there
+        # is no browser in CI — but it excludes the arithmetic when it is not.
+        run: node verify-shadowrig.mjs
+
       - name: Cross-language kinematics pin
         # Asserts the browser's gizmo algebra still reproduces the backend's
         # golden matrices to 1e-12, that every staging frame stays rigid, and

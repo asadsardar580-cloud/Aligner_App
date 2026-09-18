@@ -1036,3 +1036,436 @@ Covered by `test_failsafes.py` (18), `test_telemetry.py` (12) and
 * **Attachments and CBCT are the next phase.** Staging exists now; the base is a real solid and
   `manifold3d` union means something, so bonded attachments are a boolean on a surface that can
   take one.
+
+---
+
+## 20. RESOLVED: VIEWPORT FRAMING, THE SHADOW RIG, AND A MANUFACTURING OFFSET
+
+Three things: which way up an arch is framed, a shadow rig that had never once
+executed, and a print allowance that belongs after the boolean rather than
+before it.
+
+### 20.1 The framing sign was decided by where the scan sat in scanner space
+
+`frameArch` derives the occlusal axis as the smallest-eigenvalue eigenvector of
+the vertex covariance — an arch is a flat-ish horseshoe, so the direction it is
+flattest in is the occlusal normal. That part was right. Resolving the
+eigenvector's arbitrary SIGN was not:
+
+```js
+if (up.dot(camera.position.clone().sub(bs.center)) < 0) up.negate();
+```
+
+On a fresh page `camera.position` is still `(0,0,0)`, so this reduces to
+`u · (−boundingCentre)`: it asks where the scan happens to sit relative to the
+scanner's origin, which is not a fact about the patient. Measured on
+`case_lower.stl` the bounding centre projects **5.88 mm** onto that axis, so the
+old rule got the right answer — by 5.88 mm of luck. **Translating the scan 6 mm
+flips the view upside-down**, and rule 3.1 says a translation must change
+nothing. That is the defect, independently of whether it manifests on a given
+file.
+
+**The occlusal end is recoverable from the shape, and two independent signals
+agree.** Projected onto the flattest PCA axis (spreads `[3.15, 16.03, 21.23]`
+mm, so the axis itself is unambiguous), on 62,544 sampled vertices:
+
+| | occlusal end | tissue end |
+|---|---|---|
+| skewness of the projection | **+0.697** | −0.697 |
+| radial spread, outer decile by count (σ) | **5.86 mm** | 3.14 mm |
+
+Skewness is primary: cusp tips are a sparse scatter reaching past the body of
+the cast, so the third moment leans occlusally. The radial spread corroborates,
+and **the direction of that second signal is the opposite of what it sounds
+like.** The occlusal slab is the handful of highest points — incisal edges far
+forward of the arch centroid, molar cusps much nearer it — so its radii VARY.
+The tissue slab is a near-continuous band running right around the periphery at
+an almost constant radius. The planning pass had this backwards on the
+intuition that "cusp tips form a thin ring"; they do not form a ring at all,
+the gingival margin does. Shipped as first written it would have logged a
+disagreement warning on every single load.
+
+The slabs are taken by equal COUNT, not by axial extent: the outer tenth of the
+extent puts 119 vertices in the occlusal slab against 2695 in the tissue slab,
+because one stray cusp tip stretches the extent that defines it.
+
+`occlusalOrientation(positions)` is exported as a pure function over a flat
+`[x,y,z,…]` array, so it is testable with no WebGL context, no
+`BufferGeometry` and no DOM.
+
+**Ground truth always wins.** `frameArch` now takes `{ jaw, frame }`. Given an
+established occlusal basis it uses `u_occ` directly and skips the heuristic
+entirely. `u_occ` points out of the mouth for BOTH jaws (`arch_frame.py:50`
+resolves its sign against the arch centroid), so which side the camera sits on
+is **not** a jaw question — the brief asks for an upper/lower branch on the
+camera position and it genuinely does not need one. The jaw decides only the
+roll: `camera.up` is `−u_sag` for a mandible and `+u_sag` for a maxilla, so the
+incisors sit at the bottom of the screen for a lower arch and at the top for an
+upper, which is how an opposing pair reads in the mouth.
+
+**THE SIDE WAS NEVER THE PROBLEM. THE ROLL WAS.** Confirmed from a browser on
+a real patient scan: the mandible still rendered as a maxilla after everything
+above shipped. The occlusal SIGN was correct all along — checked three
+independent ways (cluster count per slice, face-normal dispersion, skewness, all
+agreeing), and the backend's own `u_occ` agrees with them to 3.9°.
+
+What was wrong was `camera.up`. It was set to the occlusal axis while the camera
+sits **34.7° off that same axis**, so the screen's up direction was whatever
+survived projecting `u_occ` onto the view plane — about the scanner's −X on this
+scan. That is an arbitrary axis, and an arch rolled 180° in-plane reads exactly
+like the opposing jaw. The console line the app now prints is what pinned it:
+
+```
+[Arch Framing] mandibular: occlusal axis -0.053,-0.113,-0.992 ... camera 55.0,-14.5,-84.3 up -0.053,-0.113,-0.992
+```
+
+`camera.up` identical to the occlusal axis, camera 34.7° from it.
+
+**`archAnterior` fixes it, and the signal is anatomy rather than a heuristic:**
+a dental arch is widest between the molars and narrowest at the incisors —
+intermolar ~55 mm against intercanine ~35 mm — for every human arch, upper or
+lower, and it survives a partial scan. So of the two in-plane axes the SAGITTAL
+one is whichever shows the greater width contrast between its ends, and ANTERIOR
+is the narrow end. Measured on the real scan, outer quartiles, width taken along
+the other axis:
+
+| | one end | other end | ratio |
+|---|---|---|---|
+| axis A | **38.6 mm** | 71.5 mm | **1.85** ← sagittal |
+| axis B | 44.3 mm | 43.3 mm | 1.02 |
+
+Two independent checks confirm the sign: the point centroid sits 3.09 mm
+anterior of the mid-extent (a U opening posteriorly), and slicing across the
+arch gives two arms posteriorly against one blob anteriorly
+(`[2,2,2,2,2,2,2,2,2,2,1,1]`). Below a 1.15 ratio the rule REFUSES and the roll
+is left where it was, because returning a coin flip here reproduces the exact
+symptom being fixed.
+
+The resulting `camera.up` on the real scan is `-0.170,-0.979,0.117` — **90.0°
+from what it was**. The load-time view now agrees with the post-occlusal-plane
+view instead of contradicting it, and both put the anterior teeth at the bottom
+of the screen for a mandible.
+
+*(A note on how this was found, because it is the second time in this section.
+The planning pass called §2 "the mandibular framing fix" and reasoned entirely
+about the occlusal sign. The sign was already right. Neither the plan nor the
+first implementation asked the simpler question — what is `camera.up` actually
+set to? — and no headless test could have, because every one of them checks an
+axis and none of them checks the roll. It took one line of console output from a
+real browser.)*
+
+**Setting the occlusal plane re-aims the camera only when the guess was
+wrong.** `handleDefineOcclusalPlane` compares the stored load-time axis against
+`data.u_occ` and re-frames on `dot < 0` alone. Re-framing on a correct guess
+would yank the view back to default from wherever the clinician had just
+orbited to, three clicks into their workflow, for no visible reason.
+
+### 20.2 The shadow rig had never executed once
+
+Until `2d372b4`, `three.current` was reassigned after `sun` and `catcher` were
+attached to it, so `aimShadows` hit `if (!sun || !catcher) return;` on every
+call and returned silently. Fixing that did not fix a regression — **it turned
+a path on for the first time**, which is why "Set Occlusal Plane turns the
+scene black" appeared immediately afterwards. The response is therefore to
+harden a path nobody has watched run, not to hunt a regression in old code.
+
+`frontend/src/shadowRig.js` is new and holds all of the arithmetic and none of
+the three.js wiring: `computeShadowRig({box, u_occ, u_sag, u_tra})` takes plain
+arrays, imports nothing, and returns plain arrays. What changed inside it:
+
+* **`near`/`far` are computed.** They were hardcoded `1` / `400` at
+  construction and `aimShadows` only ever set `left/right/top/bottom`. Being
+  precise about when 400 is actually wrong, because the loose version of this
+  claim does not survive measurement: one arch puts the catcher at **156.4 mm**
+  of light depth and two arches in occlusion at **180.9 mm** — both
+  comfortably inside 400. The crossover is a combined bounding radius of
+  **101.6 mm**, which no single mouth reaches. What reaches it is rule 3.1:
+  this app never re-centres a scan, so two arches captured against different
+  scanner origins keep that separation in the combined box, and 180 mm apart
+  puts the catcher at **473.8 mm**. The planes were not wrong for a mouth; they
+  were unconnected to the scene.
+* **The sun is off-axis**, at `+u_occ + 0.35·u_sag + 0.25·u_tra` — 23.3° off
+  the occlusal axis. A light exactly along the view axis lights every visible
+  surface head-on and the cusps lose their modelling.
+* **Intensity 1.2**, up from 1.1.
+* The catcher stays on the `−u_occ` side, which is already correct for both
+  jaws once you know `u_occ` points out of the mouth.
+
+**THE BLACK VIEWPORT WAS THE CATCHER, AND THE GUARD BELOW DOES NOT CATCH IT.**
+Confirmed in a browser after the first pass shipped: the cast still went dark on
+"Set Occlusal Plane". The rig was computing a perfectly finite answer, so the
+degrade-to-no-shadow guard never fired — it was guarding against the wrong
+failure.
+
+The catcher was `PlaneGeometry(400, 400)`, fixed, while the shadow camera's
+orthographic box is `2 x 1.6 x radius` — **151.7 mm** on a real arch. So
+**85.6% of the catcher lay outside the shadow map**, where sampling the depth
+texture with clamped UVs returns SHADOWED. And 400 mm of plane at the catcher's
+distance covers 143 mm of visible frame, so the plane fills the viewport on its
+own: the misread is a full-screen 0.22-alpha black wash over everything behind
+the cast. Sized to the frustum (`rig.catcherSize`), every texel it samples is
+one the shadow map actually rendered.
+
+Three things this cost, worth recording because the mistake was in the
+reasoning and not in the arithmetic:
+
+* The planning pass asserted the black screen was "a path nobody has ever seen
+  run" and hardened the arithmetic. The arithmetic was fine. The defect was a
+  plain sizing mismatch that had been sitting in the constructor since the rig
+  was written, and would have been found by asking "what is 400 measured
+  against?" rather than by auditing the maths.
+* `receiveShadow` is set on exactly one object in the app, the catcher — which
+  was recorded below as evidence that self-shadow acne could not be the cause.
+  That was true and it pointed at the catcher, and the note stopped one step
+  short of saying so.
+* A guard is only as good as its model of the failure. This one turns a
+  non-finite rig into a missing shadow, which is right, and does nothing at all
+  about a finite rig that is wrong.
+
+**A failure degrades to no shadow, never to no image.** `aimShadows` wraps the
+apply in `try/catch`; if the rig is non-finite or throws, `sun.intensity` stays
+`0` and `catcher.visible` stays `false`, and the console says so. The scene
+keeps the camera-parented three-point rig and stays lit. A viewport with no
+shadow is a cosmetic loss; a black one is a dead tool.
+
+**§3.2 and §3.3 needed no work and were not touched — with one caveat that is
+recorded rather than silently satisfied.** The 3-point rig IS camera-parented,
+at `App.jsx:522-528` (`camera.add(key, fill, rim)`), which is the substantive
+requirement: the cast stays lit from every viewing angle however the raw
+scanner axes happen to be oriented. **The intensities are not the brief's
+numbers.** It asks for key 1.0 / fill 0.5 / rim 0.4; the rig ships 2.1 / 0.55 /
+0.9 against `scene.environmentIntensity` 0.45 and ambient 0.18. Those were
+tuned against the PMREM environment and the clearcoat, and changing them to
+match a number in a brief would darken a viewport this section exists to stop
+going dark. Left alone deliberately.
+
+`tissueMaterial` (`App.jsx:84-91`) already carries `roughness 0.35, metalness
+0.05, clearcoat 0.6, side: DoubleSide` exactly as §3.3 specifies. Nothing sets
+`receiveShadow` on the arch or the crowns, so self-shadow acne cannot be the
+cause of a black screen — worth recording, because it is the obvious suspect
+and it is ruled out.
+
+### 20.3 Two new Node checks, and what they can and cannot prove
+
+`frontend/verify-framing.mjs` (25 checks) and `frontend/verify-shadowrig.mjs`
+(43 checks) run under plain `node`, alongside `verify-kinematics.mjs`.
+
+The framing fixtures are synthetic arches built from anatomy — a broad gingival
+band under discrete crowns of unequal height at unequal distance from the arch
+centroid — and the rule is asked to recover an occlusal direction it was never
+told. **That part is only as good as the model.** The translation and rotation
+cases are not: they hold for any input at all, and they are the ones that would
+have caught the real defect. The old rule is reproduced in the file and shown
+answering differently for the same cast placed 60 mm either side of where it
+started.
+
+A deliberate adversary pins the documented tie-break: a thin spike over a
+ragged slab, where skewness says one end and radial spread says the other.
+Skewness wins and the disagreement is logged. The spike is kept short on
+purpose — the first draft reached +28 and made σ_z 7.4 against σ_xy 7.8, at
+which point Z stopped being the flattest axis, PCA picked something in-plane,
+and the fixture stopped testing the tie-break at all.
+
+**Neither file can tell you the viewport is lit.** There is no browser here.
+They assert that every number handed to a light is finite, correctly signed and
+inside its own frustum, so that if the screen is still black the arithmetic is
+excluded and the search moves to the three.js wiring.
+
+### 20.4 Print compensation goes AFTER the union, not before it
+
+The brief asks to dilate moved crowns by 0.15 mm before the CSG boolean. That
+is the right instinct in the wrong place. `build_stage_bundle` does
+`OpType.Add` — a UNION producing the POSITIVE a lab draws a sheet over, with
+the sockets filled flush. Dilating each crown before that union pushes every
+tooth surface outward, so the finished tray is oversized on **every wall** by
+the full offset. At 0.15 mm that is **60% of this app's own
+`max_translation_per_stage` of 0.25 mm**: the aligner would give away most of a
+stage of prescribed movement as slop. Measured on a fissured crown, +0.15 mm
+takes it from **131.9 to 153.5 mm³, +16.4%**.
+
+The 0.15 mm in `carve_socket` / `export_nested_pair` is untouched. That path is
+a nested insert, where a clearance between two parts genuinely belongs.
+
+So `StageExportRequest` gains **`print_compensation_mm: float = 0.0`**, applied
+after the union to the whole fused solid via `cg.offset_along_normals`:
+
+* **Default 0.0 — off unless a lab asks for it.** A test asserts 0.0 leaves
+  every stage STL byte-identical, which also rules out a NaN normal multiplied
+  by zero.
+* The index buffer is untouched, so `closed`, `components == 1` and the welded
+  edge counts still measure the model actually written. `volume_mm3` is
+  recomputed with `cg.signed_volume`, because `solid.volume()` is the
+  pre-offset Manifold and no longer describes the STL.
+* **Out of range is refused, never clamped.** Non-finite, negative, or above
+  `MAX_PRINT_COMPENSATION_MM` (0.5 mm — twice a full stage of movement) raises
+  a 422 naming both the ceiling and the `MAX_TRANSLATION_PER_STAGE_MM` it is
+  measured against. A silently clamped clearance is invisible in the exported
+  STL, which is the one place it would matter.
+* The manifest carries `print_compensation_mm` and `print_compensation_note` on
+  **every** export, 0.0 included, beside `socket_treatment`. A lab reading
+  "0.0" knows the model is true to anatomy; a lab reading nothing has to guess.
+
+**What is not shown.** The growth was measured at +3.5% worst case on the
+two-crown synthetic arch from `moved_session()`, not on a real segmented scan —
+the +16.4% above is the isolated fissured-crown probe and was not re-derived on
+a fused model. And no lab has consumed the new manifest fields; that they are
+the fields a lab actually wants is a design claim, not something a test settles.
+
+### 20.5 The export mirror is not a place to run the app from
+
+`Aligner_App_AI_Export/` is a snapshot for handing to a reader. It is a full
+tree copy, so it contains `api_core.py`, `start_backend.bat` and
+`start_frontend.bat` — and `build_ai_export.py` skips every `.h5/.pth/.ckpt/.pt`
+by design (`SKIP_EXT`: a model checkpoint is not source). The project root has
+12 checkpoints; the mirror has none and never will.
+
+A backend started in there therefore comes up with **all of the code and none of
+the model**, and reports:
+
+```
+FileNotFoundError: checkpoint not found:
+  ...\Aligner_App\Aligner_App_AI_Export\ToothGroupNetwork\ckpts\0707_cosannealing_val.h5
+```
+
+which reads as a corrupted install. It is not. It is the wrong working copy.
+
+**What makes this worth a guard rather than a note.** The mirror is refreshed
+from the tree, so its frontend is CURRENT — the app starts, the viewport works,
+every recent fix is present, and the only thing missing is the AI. There is
+nothing to notice. It cost a full diagnostic round here: the checkpoint was
+confirmed present and loadable (17.5 s) against a path that the running backend
+was never using, and the first explanation offered — a OneDrive placeholder —
+was wrong.
+
+`api_core.py` now detects `Aligner_App_AI_Export` on its own path at import,
+prints a banner to the backend console, and replaces the `error` field in
+`/api/ai/status` so the health chip says *"Wrong folder: this backend is running
+from Aligner_App_AI_Export..."* instead of a truncated file path. The chip
+truncates at 60 characters, so the actionable words come first.
+
+Refreshing the mirror is what makes it look runnable, and that is a real
+trade-off: a stale mirror misrepresents the code, a fresh one invites this
+mistake. It is kept fresh and guarded rather than left stale.
+
+### 20.6 The audit trail refused every upload, and the denylist was right
+
+Found by running the stack and reading the server log rather than by any test:
+
+```
+[audit] entry refused (ValueError: Refusing to audit ['faces'] - an audit entry
+records WHAT changed, never the patient or the mesh.)
+```
+
+The upload call site passed `values={"faces": int(len(faces))}` - a scalar
+COUNT - and `faces` is on `audit.FORBIDDEN_KEYS` because there it names the
+triangle ARRAY. So `audit.record` refused the whole entry, `_record` caught the
+refusal and printed it, the request carried on, and **every scan upload since
+the audit trail was wired in went unrecorded**. `scan_loaded` never once fired.
+
+**The denylist was correct and the call site was wrong**, which is the reverse
+of the instinct when a guard rejects your data. Renaming to `vertex_count` /
+`face_count` is the whole fix.
+
+**This is the SECOND time this exact confusion has been got wrong.**
+`telemetry.py` splits `IDENTIFIER_KEYS` from `GEOMETRY_KEYS` precisely because
+`faces` is an array in an audit entry and a scalar in a span (§18) — and then
+the audit call site fell into it anyway, three sections later, in the same
+commit series that wrote the explanation.
+
+So it now has a test that reads the SOURCE instead of waiting for a clinician to
+perform the action: `test_no_audit_call_site_uses_a_forbidden_key` walks
+`api_core.py`'s AST, finds all **6** `_record` call sites, and asserts no literal
+key in any of them appears in `audit.FORBIDDEN_KEYS`. A companion test asserts
+the denylist still refuses a real mesh, so the first cannot pass by the guard
+going soft.
+
+**The lesson worth keeping: a runtime denylist is only discovered when the
+guarded action is taken.** Everything else in this codebase that guards at
+runtime — the PHI filter, the alveolus gate, the CSG cascade — is exercised by a
+test that takes the action. This one was not, because `_record` deliberately
+never raises, so the failure had no way to reach a test. **A guard that cannot
+fail a build needs a static check standing behind it.**
+
+Verified against the live server after the fix:
+
+```
+AUDIT entries: 1
+  scan_loaded   arch=lower   94,848 vertices, 187,625 faces
+      values={'vertex_count': 94848, 'face_count': 187625, 'welded': 0,
+              'open_edges': 2101, 'sanitize_repaired': False}
+```
+
+`open_edges 2101` is the same number §9 measured on this scan, which is a useful
+cross-check that the entry describes the mesh that was actually loaded.
+
+### 20.7 The mirror no longer ships the buttons that start it
+
+§20.5 guards the export snapshot at import and prints a banner. That leaves the
+launchers sitting in the mirror looking exactly like the real ones, and
+`start_backend.bat`'s checkpoint step only WARNS:
+
+```
+[2/3] AI checkpoint...
+      NOT FOUND - the API still starts and manual cutting still works,
+      but "Segment Teeth" will report the model as unavailable.
+```
+
+which is easy to scroll past on the way to a working-looking app.
+
+Two changes, defence in depth:
+
+* **`build_ai_export.py` withholds both launchers** (`LAUNCHERS`, folded into
+  `SKIP_NAMES`) and writes `DO_NOT_RUN_FROM_HERE.txt` in their place, explaining
+  what the snapshot is for and where to run the app from. **The cleanest guard
+  is the one where the button does not exist.**
+* **Both launchers refuse outright** when their own `%CD%` contains
+  `Aligner_App_AI_Export`, naming the folder they are in and pointing at the
+  parent. This covers snapshots already extracted somewhere before this change.
+
+Measured: the rebuilt archive is **267 entries, 0.81 MB**, with
+`start_backend.bat` and `start_frontend.bat` absent and `DO_NOT_RUN_FROM_HERE.txt`
+present — asserted after the build, not assumed.
+
+### 20.8 The stack, run end to end
+
+Neither service was running when this session started, which is itself the
+commonest form of "the AI is unavailable" (§12 added the health badge for
+exactly this). Started and measured against the real scan:
+
+| | |
+|---|---|
+| backend first answer | immediate, `warming: true` |
+| AI model ready | **12.3 s** (19.1 s on a second cold start) |
+| `/api/ai/status` | `loaded: true`, `error: null`, `device: cpu` |
+| Vite dev server | ready in **1.19 s**, `http://localhost:5173` |
+| upload, 9.4 MB scan | **2.9 s**, 94,848 verts / 187,625 faces |
+| CORS on the dev origin | `access-control-allow-origin: http://localhost:5173` |
+| occlusal plane | 0.03 s |
+| wand | 0.09 s |
+
+**The 12 checkpoints are present in the project root and the model loads from
+it.** There was never anything wrong with AI availability in this working copy;
+what was wrong is that nothing had been started, and the one way to get it
+persistently wrong — starting from the snapshot — is now refused in three
+places.
+
+One thing that is NOT a defect, recorded so it is not chased: a wand click at an
+arbitrary point flooded **13,697 vertices** of a 94,848-vertex arch and the
+subsequent cut was refused 422 *"Crown did not close watertight."* That is the
+correct answer to a selection that is not one tooth. It is the guard working,
+not a bug in the wand.
+
+
+### 20.9 Still unverifiable here
+
+**There is no browser in this environment.** The black viewport cannot be
+reproduced or confirmed fixed headlessly, and neither can the upside-down
+mandible. The framing rule is proved translation- and rotation-invariant in
+Node and correct on the one real scan in the repo; that it fixes *your*
+inverted mandible needs one load in a browser. Both are flagged rather than
+reported as verified.
+
+**No frame-rate figures.** §5 asks for 60 FPS and there is no profiler here.
+The claim rests on the existing architecture — refs plus rAF, React kept out of
+the per-frame path — and the prior 12.5 µs/frame scrub measurement, not on
+anything measured this pass.

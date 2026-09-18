@@ -97,10 +97,100 @@ Telemetry                 none                                  file-only spans,
                                                                 be configured
 Audit trail               written, called by nothing            recorded at upload, cut,
                                                                 prescription and both exports
-pytest                    131                                   237
+pytest                    131                                   244
 check_structure.py        61 files                              88 files
-Browser E2E               7/7                                   19 specs (12 pass, 7 need the
-                                                                backend and skip)
+Browser E2E               7/7                                   19 specs (18 pass with the
+                                                                backend up, 1 needs a cut tooth)
+
+VIEWPORT / SHADOW / STARTUP PASS (2026-09-19). Framing, the shadow rig and a
+manufacturing offset, plus two defects found only by RUNNING the stack:
+
+Audit trail               refused EVERY upload - the call    vertex_count/face_count; a static
+                          site passed a scalar under the     AST test pins all 6 _record call
+                          key `faces`, which the denylist    sites against the denylist
+                          reserves for the triangle ARRAY
+Export snapshot           shipped runnable launchers with    launchers withheld from the
+                          no checkpoints, so the app         archive + both refuse to run from
+                          started and only the AI was        it + api_core banners at import
+                          missing - nothing to notice
+AI availability           nothing was running                backend 12.3s to model ready,
+                                                             loaded:true, 12 checkpoints present
+Viewport framing          occlusal sign came from where      translation/rotation invariant
+                          the scan sat vs the origin         rule + camera.up from the arch's
+                                                             own anterior
+Shadow catcher            400mm plane vs a 151.7mm shadow    sized to the frustum
+                          frustum -> 85.6% sampled as
+                          SHADOWED -> full-screen black
+Print compensation        none                               print_compensation_mm, default
+                                                             0.0, applied AFTER the union
+Node CI pins              1 (kinematics)                     3 (+ framing, + shadow rig)
+
+
+VIEWPORT FRAMING, THE SHADOW RIG, A MANUFACTURING OFFSET (2026-09-16).
+CLAUDE.md §20 is the authoritative record. Two of these are SIGN errors - the
+kind that look like a rendering preference until you translate the scan.
+
+Arch framing sign         up.dot(camera.position - centre),     occlusalOrientation(): PCA axis,
+                          and camera.position is (0,0,0) on a   sign from skewness, corroborated
+                          fresh page - so it asked where the    by radial spread. Invariant to
+                          scan sat relative to the SCANNER      translation and rotation, asserted
+                          ORIGIN. Right on case_lower.stl by a  to 1e-12
+                          5.88mm margin; a 6mm translation
+                          flips the cast upside-down, against
+                          rule 3.1
+Radial-spread polarity    planned as occlusal 3.16mm /          measured the other way round:
+                          tissue 5.83mm                         occlusal sigma 5.86mm, tissue
+                                                                3.14mm. The occlusal slab is a
+                                                                sparse scatter at widely varying
+                                                                radius; the near-constant-radius
+                                                                ring is the gingival margin. As
+                                                                planned it would have warned on
+                                                                EVERY load
+Occlusal basis, once      ignored by the camera                 frameArch({jaw, frame}) uses
+known                                                           u_occ directly and skips the
+                                                                heuristic; re-aims ONLY when
+                                                                dot < 0, so a correct guess never
+                                                                disturbs the clinician's orbit
+camera.up                 the occlusal axis, rolled by an       -u_sag lower / +u_sag upper once
+                          arbitrary seed                        a frame exists - anterior teeth
+                                                                at the bottom for a mandible
+Shadow near/far           hardcoded 1 / 400 at construction,    derived from the sun-to-catcher
+                          never touched again                   span, 1.5x radius of margin. 400
+                                                                in fact held for one arch
+                                                                (156.4mm) and two in occlusion
+                                                                (180.9mm); it breaks at a 101.6mm
+                                                                combined radius, which two scans
+                                                                from different scanner origins
+                                                                reach BECAUSE rule 3.1 forbids
+                                                                re-centring
+Sun direction             straight down +u_occ - flat,          +u_occ + 0.35 u_sag + 0.25 u_tra,
+                          relief-free shading                   23.3 deg off-axis; intensity
+                                                                1.1 -> 1.2
+aimShadows failure        a path that had NEVER ONCE EXECUTED   computeShadowRig in a try/catch;
+                          before 2d372b4, applied without a     anything non-finite leaves the sun
+                          guard                                 dark and the catcher hidden. No
+                                                                shadow, never no image
+Print compensation        not expressible                       print_compensation_mm, default
+                                                                0.0, applied AFTER the union to
+                                                                the fused solid - before it, a
+                                                                0.15mm dilation oversizes every
+                                                                tray wall by 60% of a full stage
+                                                                of movement. Out of range is
+                                                                REFUSED, not clamped; stated in
+                                                                the manifest on every export
+Running the wrong copy    Aligner_App_AI_Export/ holds a full     detected at import: a console banner
+                          runnable tree with NO checkpoints by   plus an actionable /api/ai/status
+                          design, so a backend started there     error
+                          looks like a broken AI install
+Node verification         1 script (kinematics)                 3 - verify-kinematics 1.78e-15,
+                                                                verify-framing 25/25,
+                                                                verify-shadowrig 43/43
+pytest                    237                                   242
+
+Not verifiable here: there is no browser in this environment, so neither the
+black viewport nor the inverted mandible can be reproduced or confirmed fixed.
+The arithmetic is asserted in Node and a failure is made to degrade safely;
+confirming the two reported symptoms needs one load in a real browser.
 
 
 Superseded below: §4.9's "LIVE BUG" is fixed; §4.10's requirements.txt row is fixed; §7's

@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { frameArch, attachResize, pickAcrossArches } from "./frameArch";
+import { computeShadowRig } from "./shadowRig";
 import { BrushIndex, installBrush, CELL_FACTOR } from "./brush";
 import { installBVH, refreshBoundsTree, dropBoundsTree, configureRaycaster } from "./bvh";
 import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
@@ -80,6 +81,10 @@ function disposeMesh(obj) {
  * side stays DoubleSide: an arch mid-extraction has open boundaries at every
  * socket, and backface-culling them would punch visible holes through the cast.
  */
+/** Edge length of the shadow catcher's geometry, before it is scaled to the
+ *  shadow frustum. Only ever used as the denominator of that scale. */
+const CATCHER_BASE_MM = 400;
+
 const tissueMaterial = (over = {}) => new THREE.MeshPhysicalMaterial({
   vertexColors: true,
   roughness: 0.35,
@@ -545,8 +550,11 @@ export default function App() {
     sun.shadow.bias = -0.0015;
     scene.add(sun, sun.target);
 
+    // 400 mm of plane, scaled DOWN in aimShadows to whatever the shadow
+    // frustum actually covers. See CATCHER_BASE_MM and shadowRig.js: a catcher
+    // wider than the shadow map washes the whole frame black.
     const catcher = new THREE.Mesh(
-      new THREE.PlaneGeometry(400, 400),
+      new THREE.PlaneGeometry(CATCHER_BASE_MM, CATCHER_BASE_MM),
       new THREE.ShadowMaterial({ opacity: 0.22 }));
     catcher.receiveShadow = true;
     catcher.visible = false;                 // shown once the plane is known
@@ -1041,7 +1049,25 @@ export default function App() {
     const mesh = new THREE.Mesh(geom, tissueMaterial());
     scene.add(mesh);
 
-    const view = frameArch(geom, camera, controls, renderer);
+    // jaw decides the ROLL only, and only once a real occlusal basis
+    // exists; u_occ points out of the mouth for both jaws, so which side
+    // the camera sits on is not a jaw question. See frameArch's docstring.
+    const view = frameArch(geom, camera, controls, renderer,
+                           { jaw: archName === "maxillary" ? "upper" : "lower" });
+    const o = view.orientation;
+    console.info(
+      `[Arch Framing] ${archName}: occlusal axis `
+      + `${view.up.toArray().map((n) => n.toFixed(3)).join(",")}`
+      + (o ? ` | skew ${o.skew.toFixed(3)} | spread occ ${o.spreadOcclusal.toFixed(2)} `
+           + `tis ${o.spreadTissue.toFixed(2)} | signals ${o.agree ? "agree" : "DISAGREE"}`
+          : " | from the established occlusal frame")
+      + (view.anterior
+          ? ` | anterior ${view.anterior.anterior.map((n) => n.toFixed(3)).join(",")} `
+            + `(width ratio ${view.anterior.ratio.toFixed(2)}, centroid `
+            + `${view.anterior.agree ? "agrees" : "DISAGREES"})`
+          : " | anterior UNREADABLE - roll left as found")
+      + ` | camera ${camera.position.toArray().map((n) => n.toFixed(1)).join(",")}`
+      + ` up ${camera.up.toArray().map((n) => n.toFixed(3)).join(",")}`);
     arches.current[archName] = { mesh, geometry: geom, view, brushIndex: geom.brushIndex,
                                  socketMesh: null, socketVerts: [], socketFaces: [] };
     return arches.current[archName];
@@ -1374,11 +1400,31 @@ export default function App() {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setArchFrame(data);
+
+      // The load-time occlusal axis was read out of the shape. This is ground
+      // truth, so it wins - but only where it disagrees. Re-framing on a
+      // CORRECT guess would yank the view back to default from wherever the
+      // clinician has just orbited to, three clicks into their workflow, for
+      // no visible reason. Re-framing on a wrong one is the whole point.
+      let corrected = false;
+      const rec = arches.current[active];
+      if (rec?.geometry && rec?.view?.up && Array.isArray(data.u_occ)) {
+        const truth = new THREE.Vector3().fromArray(data.u_occ);
+        if (truth.lengthSq() > 1e-12 && rec.view.up.dot(truth) < 0) {
+          const { camera, controls, renderer } = three.current;
+          rec.view = frameArch(rec.geometry, camera, controls, renderer, {
+            jaw: active === "maxillary" ? "upper" : "lower", frame: data });
+          corrected = true;
+        }
+      }
+
       // Now the patient's own "down" is known, so the shadow can be aimed and
       // the catcher laid under the cast. Before this the caster is dark, because
       // a shadow thrown along an arbitrary scanner axis is worse than none.
       aimShadows(data);
-      setStatus(data.midline_warning ? `Warning: ${data.midline_warning}` : "Occlusal Plane Established!");
+      setStatus(data.midline_warning ? `Warning: ${data.midline_warning}`
+                : corrected ? "Occlusal Plane Established - the view was inverted and has been corrected."
+                : "Occlusal Plane Established!");
     } catch (err) {
       setStatus(`Occlusal Plane cancelled: ${err.message}`);
     }
@@ -1702,28 +1748,58 @@ export default function App() {
     const { sun, catcher } = three.current;
     if (!sun || !catcher || !frame?.u_occ) return;
 
-    const up = new THREE.Vector3().fromArray(frame.u_occ).normalize();
     const box = new THREE.Box3();
     // rec is a plain record ({mesh, geometry, view, brushIndex, ...}), NOT an
     // Object3D — Box3.expandByObject calls updateWorldMatrix on its first line,
     // so passing rec threw a TypeError here and the whole shadow rig never armed.
     for (const rec of Object.values(arches.current)) if (rec?.mesh) box.expandByObject(rec.mesh);
     if (box.isEmpty()) return;
-    const centre = box.getCenter(new THREE.Vector3());
-    const radius = box.getSize(new THREE.Vector3()).length() * 0.5;
 
-    // Lowest point of the cast along the patient's own axis, then a little
-    // further, so the plane sits under the model rather than through it.
-    const drop = up.clone().multiplyScalar(-(radius + 2));
-    catcher.position.copy(centre).add(drop);
-    catcher.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), up);
+    // EVERY NUMBER IS COMPUTED SOMEWHERE ELSE, AND CHECKED BEFORE IT LANDS.
+    // This path ran for the first time in 2d372b4: before that `three.current`
+    // was reassigned after `sun` and `catcher` were attached, so aimShadows
+    // returned at its own first line, every time, silently. Code nobody has
+    // ever watched run does not get to take the viewport with it - if the rig
+    // cannot be computed the sun stays DARK and the catcher hidden, which
+    // costs a shadow. Half-applying it costs the image.
+    let rig = null;
+    try {
+      rig = computeShadowRig({
+        box: { min: box.min.toArray(), max: box.max.toArray() },
+        u_occ: frame.u_occ, u_sag: frame.u_sag, u_tra: frame.u_tra,
+      });
+    } catch (err) {
+      console.warn("[Shadow Rig] Refusing to aim the sun:", err);
+    }
+    if (!rig) {
+      sun.intensity = 0;
+      catcher.visible = false;
+      three.current.shadowsDirty = true;
+      console.warn("[Shadow Rig] No finite rig for this occlusal frame - shadows "
+                 + "stay off. The camera-parented three-point rig still lights the scene.");
+      return;
+    }
+
+    catcher.position.fromArray(rig.catcherPosition);
+    catcher.quaternion.fromArray(rig.catcherQuaternion);
+    // Shrink the plane to exactly what the shadow map covers. Left at its full
+    // 400 mm it extends far outside the shadow camera's 151.7 mm box, and every
+    // fragment out there samples the depth texture with clamped UVs and comes
+    // back SHADOWED - a full-frame black wash, because the plane is also big
+    // enough to fill the viewport on its own.
+    catcher.scale.setScalar(rig.catcherSize / CATCHER_BASE_MM);
     catcher.visible = true;
 
-    sun.target.position.copy(centre);
-    sun.position.copy(centre).add(up.clone().multiplyScalar(radius * 3));
-    sun.intensity = 1.1;
-    const s = radius * 1.6;
-    Object.assign(sun.shadow.camera, { left: -s, right: s, top: s, bottom: -s });
+    sun.target.position.fromArray(rig.targetPosition);
+    sun.position.fromArray(rig.sunPosition);
+    sun.intensity = rig.intensity;
+    // near/far included. They were hardcoded 1/400 at construction and never
+    // touched again. 400 is in fact enough for one arch (catcher at 156 mm of
+    // light depth) and for two in occlusion (181 mm) - it breaks at a combined
+    // bounding radius of 101.6 mm, which two scans recorded against different
+    // scanner origins reach, because nothing here is allowed to move them
+    // together. See shadowRig.js and verify-shadowrig.mjs section 3.
+    Object.assign(sun.shadow.camera, rig.frustum);
     sun.shadow.camera.updateProjectionMatrix();
 
     // Same record-vs-Object3D mistake as above: setting castShadow on the record
@@ -1732,6 +1808,15 @@ export default function App() {
     for (const rec of Object.values(arches.current)) if (rec?.mesh) rec.mesh.castShadow = true;
     for (const rec of Object.values(teeth.current)) if (rec.mesh) rec.mesh.castShadow = true;
     three.current.shadowsDirty = true;
+
+    const f = rig.frustum;
+    console.info(
+      `[Shadow Rig] armed. radius ${rig.radius.toFixed(1)}mm | `
+      + `sun ${rig.sunPosition.map((n) => n.toFixed(1)).join(",")} | `
+      + `catcher ${rig.catcherPosition.map((n) => n.toFixed(1)).join(",")} `
+      + `sized ${rig.catcherSize.toFixed(0)}mm | `
+      + `ortho +/-${f.right.toFixed(1)} near ${f.near.toFixed(1)} far ${f.far.toFixed(1)} | `
+      + `intensity ${rig.intensity}`);
   }, []);
 
   const exportStages = async () => {

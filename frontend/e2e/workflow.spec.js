@@ -85,7 +85,18 @@ test.describe("Application shell", () => {
         "aligner.case.sessions", JSON.stringify({ mandibular: "0".repeat(32) })));
       await page.reload();
 
-      await expect(page.getByText(/expired|Load an arch to begin/i)).toBeVisible({ timeout: 15000 });
+      // SCOPED TO THE FOOTER on purpose. A bare getByText(/expired/) now matches
+      // twice: the status line AND the re-upload banner, which also says the
+      // session expired. That is two correct behaviours colliding with one
+      // loose locator, not a regression — the banner was added after this test.
+      await expect(page.locator("footer"))
+        .toHaveText(/expired|Load an arch to begin/i, { timeout: 15000 });
+
+      // And assert the banner itself, which is the part a clinician acts on.
+      // The status line is transient; this is what tells them a FILE is needed.
+      await expect(page.getByTestId("rehydrate-banner")).toBeVisible();
+      await expect(page.getByTestId("rehydrate-banner")).toContainText(/mandibular/);
+
       const left = await page.evaluate(
         () => window.localStorage.getItem("aligner.case.sessions"));
       expect(left, "a dead session id was left behind to fail every later request").toBeNull();

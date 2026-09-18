@@ -55,7 +55,43 @@ SKIP_EXT = {
     ".pyc", ".pyo", ".zip", ".log",
 }
 
-SKIP_NAMES = {".scan_key", ".case_key", "Aligner_App_AI_Export.zip"}
+# THE LAUNCHERS ARE DELIBERATELY NOT SHIPPED.
+#
+# The mirror is a full tree copy with every checkpoint stripped, so a backend
+# started inside it comes up with all of the code and none of the model: the app
+# runs, the viewport works, every recent fix is present, and the only thing
+# missing is the AI. There is nothing to notice. Both launchers now refuse to
+# run from here and api_core.py prints a banner at import, but the cleanest
+# guard is the one where the button does not exist - you cannot double-click a
+# file that is not there. DO_NOT_RUN_FROM_HERE.txt takes their place.
+LAUNCHERS = {"start_backend.bat", "start_frontend.bat"}
+
+SKIP_NAMES = {".scan_key", ".case_key", "Aligner_App_AI_Export.zip"} | LAUNCHERS
+
+DO_NOT_RUN = """THIS IS A READING COPY. DO NOT RUN THE APP FROM HERE.
+
+Aligner_App_AI_Export/ is a snapshot of the project for handing to someone who
+does not have the repository. It is a full copy of the source, refreshed from
+the tree, so everything in it is CURRENT.
+
+What it does NOT contain is the AI model checkpoints. build_ai_export.py strips
+every .h5/.pth/.ckpt/.pt on purpose - a 64 MB model file per checkpoint, twelve
+of them, is not source code.
+
+That matters more than it sounds. A backend started in this folder would come up
+with all of the code and none of the model, so the app would start, the 3D
+viewport would work, every recent fix would be present, and "Segment Teeth"
+would report the AI as unavailable with nothing on screen to explain why. It
+reads as a corrupted install. It is not - it is the wrong working copy.
+
+start_backend.bat and start_frontend.bat are therefore omitted from this
+snapshot. To RUN the application, use the project root:
+
+    <project root>/start_backend.bat
+    <project root>/start_frontend.bat
+
+To READ the project, start with CLAUDE.md - it is the authoritative record.
+"""
 
 # Kept although the extension rule would otherwise be ambiguous.
 KEEP_ANYWAY = {"case_lower.stl_output.json"}
@@ -109,6 +145,10 @@ def build() -> dict:
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for full, rel in files:
             z.write(full, rel)
+        # Written into the ARCHIVE rather than kept in the tree: it is only
+        # true of the snapshot, and a file in the project root saying "do not
+        # run the app from here" would be false exactly where it sits.
+        z.writestr("DO_NOT_RUN_FROM_HERE.txt", DO_NOT_RUN)
     os.replace(tmp, OUT)
 
     by_top: dict[str, int] = {}
@@ -116,7 +156,9 @@ def build() -> dict:
         top = rel.split("/")[0] if "/" in rel else "(root)"
         by_top[top] = by_top.get(top, 0) + 1
 
-    return {"entries": len(files), "bytes": os.path.getsize(OUT), "by_top": by_top}
+    by_top["(root)"] = by_top.get("(root)", 0) + 1   # DO_NOT_RUN_FROM_HERE
+    return {"entries": len(files) + 1, "bytes": os.path.getsize(OUT),
+            "by_top": by_top, "launchers_excluded": sorted(LAUNCHERS)}
 
 
 if __name__ == "__main__":
@@ -127,4 +169,6 @@ if __name__ == "__main__":
     for top, n in sorted(info["by_top"].items(), key=lambda kv: -kv[1]):
         print(f"  {n:4d}  {top}")
     print("\nNo .stl / .obj / .ply, no storage/, no key file — asserted, not assumed.")
+    print(f"Launchers withheld so the snapshot cannot be started by "
+          f"accident: {', '.join(info['launchers_excluded'])}")
     sys.exit(0)

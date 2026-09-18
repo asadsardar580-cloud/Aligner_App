@@ -78,6 +78,34 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 CKPT_FPS = os.path.join(CURRENT_DIR, "ToothGroupNetwork", "ckpts", "0707_cosannealing_val.h5")
 CKPT_BDL = CKPT_FPS
 
+# STARTED FROM THE EXPORT MIRROR? SAY SO, RATHER THAN LOOK BROKEN.
+#
+# Aligner_App_AI_Export/ is a snapshot for handing to a reader, and
+# build_ai_export.py skips every .h5/.pth/.ckpt/.pt by design (SKIP_EXT: model
+# checkpoints are not source). But the snapshot is a full tree copy, so it also
+# contains api_core.py and start_backend.bat — and a backend started in there
+# comes up with all of the code and none of the model.
+#
+# The symptom is a FileNotFoundError naming a checkpoint path inside the
+# mirror, which reads as a corrupted install. It is not: it is the wrong
+# working copy, and the fix is to start from the project root. Worth naming
+# because the mirror is refreshed from the tree, so its frontend is CURRENT —
+# the app runs, looks right, and only the AI is missing.
+EXPORT_DIR_NAME = "Aligner_App_AI_Export"
+RUNNING_FROM_EXPORT = (
+    os.path.basename(CURRENT_DIR) == EXPORT_DIR_NAME
+    or (os.sep + EXPORT_DIR_NAME + os.sep) in (CURRENT_DIR + os.sep))
+WRONG_COPY_HINT = (
+    f"Wrong folder: this backend is running from {EXPORT_DIR_NAME}, which is an "
+    f"export snapshot and carries no model checkpoints by design. Stop it and run "
+    f"start_backend.bat from the project root instead."
+)
+if RUNNING_FROM_EXPORT:
+    print("=" * 78)
+    print("[Clinical AI] " + WRONG_COPY_HINT)
+    print(f"              running from: {CURRENT_DIR}")
+    print("=" * 78)
+
 app = FastAPI(title="Virtual Diagnostic Setup API", version="3.0")
 
 app.add_middleware(
@@ -172,7 +200,12 @@ def ai_status():
         # healthy server look dead for its first few seconds.
         "warming": warming,
         "warm_seconds": _SEGMENTATION_STATE["warm_seconds"],
-        "error": model.get("error"),
+        # RUNNING_FROM_EXPORT wins over the raw error: "checkpoint not found:
+        # <a long path>" is true and useless, while the real fault is that the
+        # backend was started in the export snapshot. The chip truncates to 60
+        # characters, so the actionable words go first.
+        "error": (WRONG_COPY_HINT if RUNNING_FROM_EXPORT and not loaded
+                  else model.get("error")),
         "ready_message": ("Loading the AI segmentation model..." if warming
                           else "AI segmentation ready." if loaded
                           else model.get("error") or "AI segmentation unavailable."),
@@ -310,7 +343,15 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
     # the key outright.
     _record(sid, audit.SCAN_LOADED, arch=arch,
             detail=f"{len(verts):,} vertices, {len(faces):,} faces",
-            values={"vertices": int(len(verts)), "faces": int(len(faces)),
+            # COUNTS, AND THE NAMES HAVE TO SAY SO. `faces` is on
+            # audit.FORBIDDEN_KEYS because there it means the triangle ARRAY,
+            # so passing a scalar under that name got the whole entry refused
+            # and EVERY upload went unaudited. The denylist was right; the call
+            # site was wrong. This is the same distinction telemetry.py splits
+            # IDENTIFIER_KEYS from GEOMETRY_KEYS for, and it has now been got
+            # wrong twice - test_failsafes pins every call site against the
+            # denylist so it cannot happen a third time.
+            values={"vertex_count": int(len(verts)), "face_count": int(len(faces)),
                     "welded": int(report.get("welded_vertices", 0)),
                     "open_edges": int(scan_health.get("open_edges", 0)),
                     "sanitize_repaired": bool(sanity["repaired"])})
@@ -1984,7 +2025,37 @@ class StageExportRequest(BaseModel):
     # The opposing arch's session, if loaded. See KinematicsRequest — the two
     # arches are separate sessions and only the client knows both.
     opposing_session_id: str | None = None
+    # Print compensation, in mm, applied to the FUSED solid AFTER the union —
+    # never to the crowns before it.
+    #
+    # WHY NOT BEFORE THE BOOLEAN, which is the obvious reading. This export is
+    # an OpType.Add union that produces the POSITIVE a lab draws a sheet over,
+    # with the sockets filled flush. Dilating each crown before that union
+    # pushes every tooth surface outward, so the finished tray is oversized on
+    # every wall by the full offset. At the 0.15 mm usually quoted for a nested
+    # insert that is 60% of this app's own max_translation_per_stage (0.25 mm)
+    # — the aligner would give away most of a stage of prescribed movement as
+    # slop. Measured on a fissured crown, +0.15 mm takes it from 131.9 to
+    # 153.5 mm3, +16.4%.
+    #
+    # Applied to the fused model instead, it is what it claims to be: a uniform
+    # allowance for a printer that comes out undersized, on a model that is
+    # otherwise true to anatomy. DEFAULT 0.0 — off unless a lab asks for it,
+    # and written into the manifest whenever it is not, so nobody downstream
+    # has to guess whether the model they hold is true-to-anatomy.
+    #
+    # The 0.15 mm in carve_socket / export_nested_pair is untouched: that path
+    # is a nested insert, where a clearance between two parts genuinely belongs.
+    print_compensation_mm: float = 0.0
 
+
+# The per-stage translation limit staging_estimate divides by. Named here so
+# the compensation guard can say what it is comparing against.
+MAX_TRANSLATION_PER_STAGE_MM = 0.25
+# Ceiling on print compensation: twice a full stage of prescribed movement.
+# Anything past this is not a printer allowance, it is a mistake, and it would
+# be invisible in the exported STL — which is exactly why it is refused loudly.
+MAX_PRINT_COMPENSATION_MM = 0.5
 
 # How far the plug is raised into the crown so the two share volume rather than
 # a surface. Well under the shallowest clinical crown, and buried either way.
@@ -2351,6 +2422,15 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
             f"({binding['staging']['driver']}-driven). Reduce the movement or raise "
             f"max_stages deliberately — {total} aligners is a two-year course.")
 
+    comp = float(req.print_compensation_mm or 0.0)
+    if not np.isfinite(comp) or comp < 0.0 or comp > MAX_PRINT_COMPENSATION_MM:
+        raise HTTPException(422,
+            f"print_compensation_mm={req.print_compensation_mm!r} is outside "
+            f"[0.0, {MAX_PRINT_COMPENSATION_MM}]. This is a uniform allowance for a "
+            f"printer that runs undersized, not a place to encode tooth movement — "
+            f"{MAX_PRINT_COMPENSATION_MM} mm is already twice the "
+            f"{MAX_TRANSLATION_PER_STAGE_MM} mm this plan moves a tooth in a whole stage.")
+
     # --- the base, sockets filled FLUSH -----------------------------------
     sealed_v, sealed_f, sockets = _seal_sockets(v, f, sid, extracted, flush=True)
     try:
@@ -2462,6 +2542,17 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
                 f"intersect, which usually means the prescription has moved a tooth clear "
                 f"of the cast.")
 
+        # Print compensation on the FUSED solid. The index buffer is untouched,
+        # so every topological assertion below still measures the model that is
+        # actually written — only the vertex positions move, each along its own
+        # vertex normal. The volume has to be recomputed from the mesh, because
+        # `solid` is the pre-offset Manifold and its .volume() no longer
+        # describes the STL.
+        stage_volume = float(solid.volume())
+        if comp > 0.0:
+            sv = cg.offset_along_normals(sv, sf, comp)
+            stage_volume = float(cg.signed_volume(sv, sf))
+
         name = f"{arch}_Stage_{k:02d}.stl"
         blob = cg.write_binary_stl_bytes(sv, sf)
 
@@ -2515,7 +2606,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
         blobs[name] = blob
         stage_meta.append({
             "stage": k, "file": name, "triangles": int(len(sf)),
-            "volume_mm3": round(float(solid.volume()), 3),
+            "volume_mm3": round(stage_volume, 3),
             "components": int(n_comp),
             "inverted_crumbs_discarded": int(crumbs),
             # "none" on the ordinary path. Anything else means the boolean
@@ -2559,6 +2650,14 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
         "units": "mm",
         "coordinate_space": "raw scanner coordinates — never re-centred or rescaled",
         "socket_treatment": "filled flush at the gingival margin; the tooth sits proud",
+        # Stated on every export, 0.0 included. A lab reading "0.0" knows the
+        # model is true to anatomy; a lab reading nothing has to assume.
+        "print_compensation_mm": round(comp, 4),
+        "print_compensation_note": (
+            "true to anatomy; no allowance applied" if comp <= 0.0 else
+            f"every surface of the FUSED model is offset {comp} mm outward along its "
+            f"vertex normal, applied AFTER the union. The model is deliberately not "
+            f"true to anatomy: subtract {comp} mm before measuring it against the plan."),
         "base_construction": "trim_to_arch -> build_cast_base (never cap_and_close)",
         "trim": {k: val for k, val in trim_info.items() if k not in ("curve", "rim_loop")},
         "cast_base": {k: val for k, val in base_info.items() if k != "prune"},

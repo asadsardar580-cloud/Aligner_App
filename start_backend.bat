@@ -5,6 +5,16 @@ title Aligner - Backend (api_core:app)
 REM Run from the repo root no matter where this was launched from.
 cd /d "%~dp0"
 
+REM REFUSE TO RUN FROM THE EXPORT SNAPSHOT.
+REM
+REM Aligner_App_AI_Export\ is a reading copy. build_ai_export.py strips every
+REM model checkpoint from it by design, but it is a full tree copy otherwise -
+REM so the app STARTS, the viewport WORKS, every recent fix is present, and the
+REM only thing missing is the AI. There is nothing to notice, which is exactly
+REM why this has to be a refusal and not a warning.
+echo "%CD%" | findstr /i "Aligner_App_AI_Export" >nul
+if not errorlevel 1 goto :wrong_copy
+
 set "PY=python"
 if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 
@@ -80,6 +90,27 @@ netstat -ano | findstr "LISTENING" | findstr ":8000"
 echo.
 echo   Either that server is already serving the app - just reload the
 echo   browser - or stop it with:   taskkill /PID ^<pid^> /F
+echo.
+pause
+exit /b 1
+
+
+:wrong_copy
+echo.
+echo ==================================================================
+echo   WRONG FOLDER - this is the export snapshot, not the project.
+echo ==================================================================
+echo.
+echo   You are in:
+echo     %CD%
+echo.
+echo   Aligner_App_AI_Export is a READING COPY for handing to someone
+echo   else. It carries no AI model checkpoints by design, so the app
+echo   would start, look completely normal, and report the AI as
+echo   unavailable with no hint as to why.
+echo.
+echo   Go up one folder and run this from the project root instead:
+echo     ..\%~nx0
 echo.
 pause
 exit /b 1
