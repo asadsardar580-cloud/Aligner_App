@@ -282,6 +282,15 @@ seating the tooth 0.1–2.5mm (52 → 22 but never 0), and eroding the socket by
 (74–104, and at 4 rings the tooth stops touching the base). The count moves with the
 prescription, which is the signature of a tangency rather than a bug.
 
+> **SUPERSEDED 2026-09-20 — the root plug is no longer manufacturing anatomy.**
+> The paragraph below describes `_rim_plug` as the intended manufacturing
+> connector. It is not, and has been removed from the stage export. A plug
+> whose depth is `root_length_mm` travels with the tooth and EMERGES when the
+> tooth extrudes: measured, a 1.2mm extrusion added 28.84mm3 of visible
+> synthetic root. It is replaced by a bounded local target-position interface
+> (`manufacturing.py`) — see §21 and MANUFACTURING_RECONSTRUCTION_CHANGELOG.md.
+> The virtual root remains exactly as described for the VIEWPORT and for C_res.
+
 **Virtual roots are geometry now, not just a number.** `/cut` returns a cone from the cervical
 rim to an apex `root_length_mm` apical, placed from the rim centroid exactly as
 `center_of_resistance` places the pivot. Drawn wireframe at 0.28 opacity in a violet used
@@ -1469,3 +1478,88 @@ reported as verified.
 The claim rests on the existing architecture — refs plus rAF, React kept out of
 the per-frame path — and the prior 12.5 µs/frame scrub measurement, not on
 anything measured this pass.
+
+
+## 21. RESOLVED (PARTIAL): LOCAL TARGET-POSITION CAST RECONSTRUCTION
+
+**The exported cast distorted when a tooth moved, and the cause was
+architectural.** `build_stage_bundle` filled the ORIGINAL socket flush, built
+ONE static cast, then unioned that same cast with `crown + a 9mm root plug`
+transformed by the stage matrix. Nothing reconstructed the cast at the tooth's
+NEW cervical position, and the plug travelled with the tooth — so an extruding
+tooth carried synthetic root material up out of the gingiva as visible positive
+geometry. `_rim_plug`'s own docstring said so: *"DEPTH IS THE ROOT LENGTH, not
+some small seating value."*
+
+Measured before the change, two teeth with one extruded 1.2mm over 5 stages:
+fused volume grew **27579.63 → 27608.44 mm3 (+28.84)** monotonically, and every
+stage read **68–77 welded non-manifold edges** with
+`survives_a_welding_reader: False`. The gate missed all of it because it
+validated the in-memory index buffer rather than the bytes written.
+
+**The interface is BIDIRECTIONAL, and that is the correction.** A moved tooth
+is penetrating (intrusion, tipping in) — tissue must be REMOVED — or separated
+(extrusion, tipping away) — tissue must be ADDED — and usually both around
+different parts of one rim. **Separation is not a refusal.** An ordinary
+extrusion lifts the whole rim clear of the gingiva; refusing that would reject
+the movement local reconstruction exists to handle.
+
+**Five defects were found in the new code by the measurements themselves:**
+
+* **Cast thickness read 0.1mm on a 9mm cast.** A signed-distance march using
+  nearest-VERTEX distance flips sign on a steep cervical wall, so the march
+  "left the solid" immediately and every interface was refused `wall_too_thin`.
+  Möller–Trumbore against the real triangles has no such failure mode.
+* **The ramp was a cylindrical collar** — precisely the artificial annular
+  ledge the brief forbids. Its radius is now per rim point and proportional to
+  that point's lift, so it vanishes where the tooth never left the tissue.
+* **Ramp volume 201mm3 for a 1.2mm lift**, because `_loft` caps both ring
+  interiors and builds a solid frustum rather than a blend.
+* **Unbounded drop rays landed on the base underside 10–12mm down**, which made
+  the envelope check refuse 8 of 10 ordinary movements.
+* **`surface_deviation` reported 3.46mm of "deformation" 18–32mm from any
+  tooth.** Nearest-VERTEX distance on a base whose underside carries very large
+  triangles calls a point sitting exactly ON the original surface a 3.5mm
+  deviation. Point-to-TRIANGLE distance reports mean **0.0046mm**, p95
+  **0.0000mm**.
+
+**A sixth was a positional-argument bug of my own making:** adding `seat_verts`
+to the result dataclass before `diagnostics` meant `diag` was passed into the
+seat slot and then overwritten. Nothing raised; the seat was built correctly and
+every diagnostic silently vanished. The constructor takes keywords now.
+
+**Boolean order, and it was measured rather than assumed:**
+
+```
+base + ramps        build the tissue first
+     − cavities     then cut the socket through it
+     ∪ seats ∪ rigid crowns
+```
+
+Subtracting first removes the cast material the ramp has to land on and orphans
+it — the model went from 1 body to 4 across an extrusion.
+
+**`root_length_mm` no longer reaches the manufacturing path at all**, and the
+proof freezes the stage matrix: varying root length 9→13mm with M held fixed
+leaves the cavity volume, seat volume and depth bit-identical. Varying it
+through the whole pipeline would legitimately move C_res and prove nothing.
+
+**Measured after the change**, same case: welded non-manifold edges per stage
+**0, 1, 0, 1, 0** (was 75, 77, 73, 70, 68); unaffected cast deviation outside
+the ROI mean **0.0046mm**, p95 **0.0000mm**, p99 **0.041mm**, with 23 of 2910
+points reaching 1.15mm on the trim boundary where the boolean retessellates the
+base outline.
+
+**WHAT IS NOT FIXED, and it is a real limitation.** Later stages of an extrusion
+still fuse into more than one body — measured `1, 1, 2, 2, 3` — so only 1 of 5
+stages passes every hard gate. The seat reaches the cast at small movements and
+loses it as the tooth lifts, because the cavity floor and the ramp compete for
+the same millimetre of tissue. `test_staging_export.py::test_every_stage_is_one_fused_watertight_solid`
+and one case in `test_failsafes.py` FAIL on `components == 1` and are **left
+failing deliberately** — they are the only automated signal for this and
+weakening them would erase it.
+
+**The real-scan regression was NOT run.** Nothing in §21 is based on it.
+
+Covered by `test_manufacturing_interface.py` (33 tests) and
+`MANUFACTURING_RECONSTRUCTION_CHANGELOG.md`.

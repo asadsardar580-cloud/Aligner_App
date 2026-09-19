@@ -396,6 +396,16 @@ export default function App() {
    */
   const [rehydrate, setRehydrate] = useState([]);
 
+  // PRINT READY / NOT PRINT READY, and the gate that decided it. Never set
+  // from a successful HTTP status alone - only from the validation report the
+  // backend measured on the written STL.
+  const [printVerdict, setPrintVerdict] = useState(null);
+
+  // Published in an effect BELOW its own declaration. Naming opposingSessionId
+  // directly inside the mount effect - which runs above it - is the temporal
+  // dead zone trap that has white-screened this app five times.
+  const opposingSessionIdRef = useRef(null);
+
   /**
    * Per-FDI segmentation verdicts from the last /segment run, and the banner
    * that fires when the selected tooth's label is not trustworthy.
@@ -630,7 +640,17 @@ export default function App() {
           await fetch(`${API}/api/session/${sid}/tooth/${st.activeTooth}/kinematics`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(clinicalValues)
+            // THE SAME PAYLOAD THE TYPED PATH SENDS. Dragging used to post the
+            // six clinical values alone, omitting opposing_session_id - so the
+            // antagonist collision check silently did not run for a dragged
+            // movement and did run for a typed one. Two routes to the same
+            // commit must not validate differently; the manifest would record
+            // `checked: false` for one and a real verdict for the other, which
+            // reads as "no interference" (CLAUDE.md section 14).
+            body: JSON.stringify({
+              ...clinicalValues,
+              opposing_session_id: opposingSessionIdRef.current?.() ?? null,
+            })
           }).then(async (r) => {
             if (!r.ok) return;
             const d = await r.json();
@@ -1589,6 +1609,12 @@ export default function App() {
     return sessions[other]?.session_id ?? null;
   }, [sessions, active]);
 
+  // The drag path lives in the mount effect, which is declared above this
+  // callback and therefore cannot name it. Publishing through a ref is the
+  // pattern section 17 settled on after the fifth TDZ white screen.
+  useEffect(() => { opposingSessionIdRef.current = opposingSessionId; },
+            [opposingSessionId]);
+
   /**
    * Sidebar -> tooth. The other half of the two-way binding.
    *
@@ -1857,6 +1883,64 @@ export default function App() {
                    : ""));
     } catch (err) {
       setStatus(`Stage export failed: ${err.message}`);
+    } finally { setBusy(false); }
+  };
+
+  /**
+   * ONE validated stage, for printing.
+   *
+   * SEPARATE FROM exportSetup ON PURPOSE. That one ships the setup as loose
+   * parts for inspection and was labelled "Export Printable Cast" - the one
+   * thing it is not. This calls /export/final, which applies the hard gate to
+   * the ACTUAL WRITTEN STL and returns nothing at all if any gate fails, so
+   * the UI cannot download something and call it print ready when it is not.
+   */
+  const exportFinal = async () => {
+    const sid = sessions[active]?.session_id;
+    if (!sid || !staging.total) return;
+    setBusy(true);
+    setPrintVerdict(null);
+    setStatus(`Building and validating the final print STL for stage ${stage || staging.total}...`);
+    try {
+      const res = await fetch(`${API}/api/session/${sid}/export/final`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stage: stage || staging.total,
+                               opposing_session_id: opposingSessionId() }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        let d = text;
+        try { d = JSON.parse(text).detail ?? text; } catch { /* not JSON */ }
+        // NOT PRINT READY carries the gate that failed and what it measured.
+        // "Export failed" on its own tells a clinician nothing actionable.
+        setPrintVerdict({
+          ready: false,
+          detail: (typeof d === "string" ? d : d.error) || "Validation failed.",
+          gates: (typeof d === "object" && d.gates ? d.gates.filter((g) => !g.passed) : []),
+        });
+        setStatus("Final STL was NOT produced - it did not pass manufacturing validation.");
+        return;
+      }
+      const blob = await res.blob();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = `Stage_${stage || staging.total}_FINAL.zip`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(href);
+      setPrintVerdict({
+        ready: true,
+        detail: `Stage ${res.headers.get("X-Stage")}: `
+              + `${res.headers.get("X-Open-Edges")} open edges, `
+              + `${res.headers.get("X-Nonmanifold-Edges")} non-manifold, `
+              + `${res.headers.get("X-Components")} body. Manufacturing geometry `
+              + `validated against engineering gates - not a clinical claim.`,
+        gates: [],
+      });
+      setStatus("Final print STL downloaded and validated.");
+    } catch (err) {
+      setPrintVerdict({ ready: false, detail: err.message, gates: [] });
+      setStatus(`Final export failed: ${err.message}`);
     } finally { setBusy(false); }
   };
 
@@ -2242,12 +2326,34 @@ export default function App() {
             <button onClick={exportSetup} disabled={busy}
                     style={{...S.primary, marginTop: 10,
                             background: "linear-gradient(#3fc6d4,#2a8b96)"}}>
-              Export Printable Cast
+              Export Setup / Inspection
             </button>
             <button onClick={exportStages} disabled={busy || !staging.total}
                     style={{...S.chip, marginTop: 6}}>
-              Export Stages (1&ndash;{staging.total || "?"}) &mdash; fused solids
+              Export All Stages (1&ndash;{staging.total || "?"}) &mdash; fused solids
             </button>
+            <button onClick={exportFinal} disabled={busy || !staging.total}
+                    data-testid="export-final"
+                    style={{...S.primary, marginTop: 6,
+                            background: "linear-gradient(#7ad07a,#3f9d4a)"}}>
+              Export Final Print STL
+            </button>
+            {printVerdict && (
+              <div data-testid="print-verdict"
+                   style={printVerdict.ready ? S.printReady : S.printNotReady}>
+                <b>{printVerdict.ready ? "PRINT READY" : "NOT PRINT READY"}</b>
+                <div style={{marginTop: 4, fontWeight: 400}}>
+                  {printVerdict.detail}
+                </div>
+                {printVerdict.gates?.length > 0 && (
+                  <ul style={{margin: "6px 0 0", paddingLeft: 18}}>
+                    {printVerdict.gates.map((g) => (
+                      <li key={g.gate}>{g.gate}: measured {String(g.measured)}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </Panel>
           </>
         )}
@@ -2325,6 +2431,12 @@ const S = {
                borderRadius: 6, padding: "11px 14px", color: "#ffd9a0",
                fontSize: 12, lineHeight: 1.5, backdropFilter: "blur(4px)" },
   rehydrateHead: { color: "#ffa53c", fontWeight: 700, marginBottom: 5 },
+  printReady: { marginTop: 8, padding: "8px 10px", borderRadius: 5,
+                background: "#12301a", border: "1px solid #2f7d32",
+                color: "#9ae6a4", fontSize: 11, lineHeight: 1.5 },
+  printNotReady: { marginTop: 8, padding: "8px 10px", borderRadius: 5,
+                   background: "#2e1416", border: "1px solid #b3261e",
+                   color: "#ffb4ab", fontSize: 11, lineHeight: 1.5 },
   // Stacked under the re-upload banner when both are live. Same amber family:
   // both are "the software needs something from you", not "something is wrong
   // with the patient".

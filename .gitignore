@@ -33,6 +33,7 @@ storage/
 # --- Generated handover archive ---
 Aligner_App_AI_Export/
 Aligner_App_AI_Export.zip
+Aligner_App_AI_Export_*.zip
 
 # --- Misc ---
 *.log

@@ -33,6 +33,7 @@ import export_clinical_report
 import attachments as attachments_mod
 import audit
 import telemetry
+import manufacturing as mfg
 
 
 # One trail per SESSION, because a session is what a clinician is working in and
@@ -2270,27 +2271,37 @@ def _solid_bodies(solid):
 
 
 def _manufacturing_tooth(rec: dict, verts: np.ndarray):
-    """The crown fused with its plug, once, at T0 — then transformed per stage.
+    """The crown, once, at T0 — then transformed per stage. NO PLUG.
 
-    Built once and reused because manifold3d can transform a Manifold lazily,
-    which turns N stages x M teeth of mesh rebuilding into N batch booleans.
+    THE ROOT PLUG IS GONE FROM THIS PATH, and that deletion is the point of
+    the whole manufacturing correction. This function used to build
+    `_rim_plug(verts[rim], u_oa, depth=rec["root_length_mm"])` and union it
+    into the crown, so every exported tooth carried a 9-13mm synthetic root
+    column that travelled with it. `_rim_plug`'s own docstring said so:
+    *"DEPTH IS THE ROOT LENGTH, not some small seating value."*
 
-    Returns (solid, bodies, crumbs). `bodies` > 1 means the crown and its plug
-    did NOT fuse — which is the decisive signal that the crown is a shell rather
-    than a tooth, and is what the export gate acts on. Measured: a 136mm3 crown
-    gives 1 body, a 63mm3 one gives 3.
+    Two things were wrong with that, and only the second is obvious:
+
+      1. `root_length_mm` is a C_res ESTIMATION parameter. Using it as
+         manufacturing fusion depth welded a clinical estimate to a
+         geometric construction, so changing one silently changed the other.
+      2. A plug that moves with the tooth EMERGES when the tooth extrudes.
+         Measured: a 1.2mm extrusion grew the fused volume by 28.84mm3 of
+         visible synthetic material. That was the cast distortion.
+
+    What replaced it is `manufacturing.build_stage_tooth_interface`, which
+    reconstructs the cast locally at the tooth's target position instead of
+    growing a root to reach the old one. The union needs common volume, and
+    it now gets it from a cavity cut at the NEW rim rather than from a column
+    hanging off the old one.
+
+    Returns (solid, bodies, crumbs). `bodies` > 1 still means the crown itself
+    fractures — a shell rather than a tooth — which is what the export screen
+    acts on. The plug used to serve double duty as that probe; the crown's own
+    decomposition answers it directly and without inventing anatomy.
     """
     crown = _to_manifold(rec["cv"], rec["cf"])
-    rim = np.asarray(rec.get("socket_rim"), np.int64) if rec.get("socket_rim") is not None else None
-    if rim is None or len(rim) < 3:
-        return _solid_bodies(crown)
-    depth = float(rec.get("root_length_mm") or cg.SOCKET_DEPTH_MM)
-    try:
-        pv, pf = _rim_plug(verts[rim], np.asarray(rec["frame"]["u_oa"], float), depth)
-    except ValueError:
-        return _solid_bodies(crown)   # a rim too degenerate to plug
-    plug, _pb, _pc = _solid_bodies(_to_manifold(pv, pf))
-    return _solid_bodies(crown + plug)
+    return _solid_bodies(crown)
 
 
 SHELL_REFUSAL = ("Cannot export raw shell geometry. Crown must be fully extracted and "
@@ -2357,7 +2368,8 @@ def _stage_clinical(clinical: dict, k: int, n: int) -> dict:
             for key in ("tip_deg", "torque_deg", "rotation_deg", "d_md", "d_bl", "d_oa")}
 
 
-def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
+def build_stage_bundle(sid: str, req: StageExportRequest,
+                       require_print_ready: bool = False) -> dict:
     """One FUSED, watertight solid per stage — the models a lab thermoforms over.
 
     Not loose crowns. A vacuum-forming model is a single solid: the gingiva with
@@ -2445,6 +2457,12 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
 
     m3 = _require_manifold3d()
     base_solid = _to_manifold(bv, bf)
+    # Built ONCE for the whole bundle: the cast does not change between teeth
+    # or between stages, and rebuilding the KD-tree per query was 43ms of the
+    # 89ms a crown cost when the antagonist check made that mistake (section 11).
+    cast_probe = mfg.CastProbe(bv, bf)
+    # Kept for the unaffected-cast fidelity comparison at the end of each stage.
+    original_cast = (np.array(bv, copy=True), np.array(bf, copy=True))
     # Screens every crown AND builds its manufacturing solid, once. manifold3d
     # transforms lazily, so a stage then costs one batch boolean rather than
     # rebuilding every mesh.
@@ -2468,12 +2486,107 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
     blobs, stage_meta = {}, []
     t_union = 0.0
     for k in range(1, total + 1):
-        parts = [base_solid]
         interference = []
         ipr_rows, ipr_worst = [], 0.0
+
+        # === LOCAL TARGET-POSITION RECONSTRUCTION ==========================
+        # The architecture this replaces: `parts = [base_solid]` followed by
+        # `parts.append(crown_and_a_9mm_root_plug.transform(M))` and a single
+        # union. That never reconstructed the cast at the tooth's NEW cervical
+        # position, and the plug travelled with the tooth — so an extruding
+        # tooth carried synthetic root material up out of the gingiva as
+        # visible positive geometry. Measured before this change: fused volume
+        # grew 27579.63 -> 27608.44 mm3 monotonically with a 1.2mm extrusion.
+        #
+        # The order is SUBTRACT, then ADD, then UNION:
+        #   cast - cavities            make room where the tooth penetrates
+        #        + emergence ramps     add tissue where the rim lifted clear
+        #        u rigid crowns        the crown, and nothing but the crown
+        interfaces, cavity_tools, ramp_tools, seat_tools = [], [], [], []
+        stage_matrices = {}
         for t in teeth:
             rec, clinical = t["rec"], _stage_clinical(t["clinical"], k, total)
             M = cg.kinematic_matrix(rec["frame"], rec["c_res"], **clinical)
+            stage_matrices[t["tid"]] = M
+
+            rim_t0 = v[np.asarray(rec["socket_rim"], np.int64)]
+            iface = mfg.build_stage_tooth_interface(
+                bv, bf, rec["cv"], rec["cf"], rim_t0,
+                rec["frame"]["u_oa"], M, probe=cast_probe)
+            row = iface.manifest_row()
+            row.update({"stage": k, "tooth_id": t["tid"], "fdi": t["fdi"],
+                        "clinical": clinical})
+
+            if not iface.ok:
+                raise HTTPException(422, _jsonable({
+                    "error": f"Stage {k}: the local target-position interface "
+                             f"could not be built for "
+                             f"{('FDI ' + str(t['fdi'])) if t['fdi'] is not None else 'tooth ' + t['tid'][:8]}.",
+                    "gate": iface.refusal_reason,
+                    "detail": "The manufacturing layer refuses rather than "
+                              "falling back to a synthetic root connector. A "
+                              "model the software had to invent a root for is "
+                              "not the model that was planned.",
+                    "diagnostics": row}))
+
+            # Geodesic ROI — NOT a bounding box. A rectangular XYZ box around a
+            # rim on a curved arch sweeps in the neighbouring teeth and the
+            # gingiva on the far side of the ridge.
+            roi_mask, roi_info = mfg.affected_region(
+                bv, bf, cg.apply_matrix(rim_t0, M), mfg.DEFAULT_POLICY.roi_radius_mm)
+            row.update(roi_info)
+            row["continuity"] = mfg.interface_continuity(
+                cg.apply_matrix(rim_t0, M), iface.cavity_verts)
+
+            interfaces.append(row)
+            cavity_tools.append(_to_manifold(iface.cavity_verts, iface.cavity_faces))
+            if iface.ramp_verts is not None:
+                ramp_tools.append(_to_manifold(iface.ramp_verts, iface.ramp_faces))
+            if iface.seat_verts is not None:
+                # Unioned WITH the crown, not into it: the crown solid stays a
+                # rigid transform of T0 and the rigidity tests measure it alone.
+                seat_tools.append(_to_manifold(iface.seat_verts, iface.seat_faces))
+
+        # Adjacent reconstructions must not merge into one trench.
+        for i in range(len(teeth)):
+            for j in range(i + 1, len(teeth)):
+                Mi, Mj = stage_matrices[teeth[i]["tid"]], stage_matrices[teeth[j]["tid"]]
+                ri = cg.apply_matrix(v[np.asarray(teeth[i]["rec"]["socket_rim"], np.int64)], Mi)
+                rj = cg.apply_matrix(v[np.asarray(teeth[j]["rec"]["socket_rim"], np.int64)], Mj)
+                bridge = mfg.bridge_between(ri, rj)
+                consumed = 2 * mfg.DEFAULT_POLICY.fusion_overlap_mm
+                if bridge > 1e-9 and consumed / bridge > mfg.DEFAULT_POLICY.max_bridge_removal_fraction:
+                    raise HTTPException(422, _jsonable({
+                        "error": f"Stage {k}: two reconstructions would consume the "
+                                 f"gingival bridge between them.",
+                        "gate": "adjacent_reconstruction_overlap",
+                        "bridge_mm": round(bridge, 4),
+                        "would_consume_mm": round(consumed, 4),
+                        "max_fraction": mfg.DEFAULT_POLICY.max_bridge_removal_fraction,
+                        "teeth": [teeth[i]["tid"], teeth[j]["tid"]]}))
+
+        # BATCH, not sequential: one boolean per operation rather than one per
+        # tooth, so tessellation error cannot accumulate across teeth.
+        # ADD THE TISSUE FIRST, THEN CUT THE SOCKET INTO IT.
+        # Subtracting first removes the cast material the emergence ramp has
+        # to land on, so the ramp comes out as a floating body - measured, the
+        # fused model went from 1 body to 4 as the extrusion progressed. This
+        # is also the physically sensible order: gingiva follows the tooth up,
+        # and the socket is then formed through the built-up tissue.
+        prepared = base_solid
+        if ramp_tools:
+            prepared = m3.Manifold.batch_boolean([prepared] + ramp_tools,
+                                                 m3.OpType.Add)
+        if cavity_tools:
+            prepared = m3.Manifold.batch_boolean([prepared] + cavity_tools,
+                                                 m3.OpType.Subtract)
+
+        parts = [prepared] + seat_tools
+        for t in teeth:
+            rec = t["rec"]
+            M = stage_matrices[t["tid"]]
+            clinical = _stage_clinical(t["clinical"], k, total)
+            # THE CROWN, AND NOTHING BUT THE CROWN. No plug, no skirt.
             parts.append(t["solid"].transform(np.asarray(M[:3, :4], float)))
 
             # How far this tooth has closed its embrasures BY THIS STAGE.
@@ -2554,6 +2667,22 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
             stage_volume = float(cg.signed_volume(sv, sf))
 
         name = f"{arch}_Stage_{k:02d}.stl"
+
+        # EXPORT WELD, before the bytes are written. Measured across the five
+        # points the brief asks for, on the OLD pipeline: the raw in-memory
+        # fused mesh read 0 non-manifold edges, and the reread of the written
+        # file read 68 — because the STL round trip merges coincident
+        # positions (5227 -> 5192 vertices) while keeping all 10,466 faces,
+        # and 70 of those become degenerate once their corners coincide.
+        # `weld_vertices` drops exactly those, so they never reach the file.
+        #
+        # This is a SERIALISATION-POLICY fix, not the geometry fix. The
+        # geometry fix is the local reconstruction above; welding stops a
+        # correct solid being corrupted on the way out. Both were needed, and
+        # the five-point measurement is what separated them.
+        pre_weld = cg.manifold_report(sf)
+        sv, sf, export_welded = cg.weld_vertices(sv, sf)
+        post_weld = cg.manifold_report(sf)
         blob = cg.write_binary_stl_bytes(sv, sf)
 
         # WHAT IS ASSERTED, AND WHAT IS ONLY REPORTED — the distinction matters
@@ -2584,24 +2713,39 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
         # So it is measured and written into the manifest per stage. A lab whose
         # slicer welds will see these; one that does not, will not. Refusing on
         # it would block every export while the geometry is in fact closed.
-        rv, rf = stl_io.parse_stl_bytes(blob)
-        welded = cg.manifold_report(rf)
-        # manifold3d's OWN component count, not _face_components. The latter
-        # walks edge adjacency on the index buffer, and the same duplicate
-        # vertices described above split a geometrically joined solid into two
-        # index-disconnected groups — measured, it called a tooth "floating"
-        # while a boolean intersection with the base showed 141 mm3 of overlap.
-        n_comp = n_bodies
-        if n_comp != 1:
+        # === THE HARD GATE, ON THE ACTUAL BYTES =============================
+        # This is the correction the whole validation half of the brief turns
+        # on. The old code DID reread the STL and DID measure it into `welded`
+        # — and then gated on `manifold_report(sf)`, the IN-MEMORY buffer, so
+        # 68-77 non-manifold edges per stage were recorded in the manifest and
+        # shipped regardless. A validator that reads a different object from
+        # the one the lab receives is not a validator.
+        validation = mfg.validate_printable_stl(blob, expect_components=1)
+        welded = {"open_edges": validation["open_edges"],
+                  "nonmanifold_edges": validation["nonmanifold_edges"],
+                  "total_edges": validation["total_edges"],
+                  "watertight": validation["open_edges"] == 0
+                                and validation["nonmanifold_edges"] == 0}
+        n_comp = validation["connected_components"]
+
+        if require_print_ready and not validation["print_ready"]:
+            raise HTTPException(422, _jsonable({
+                "error": f"Stage {k} failed manufacturing validation of the "
+                         f"WRITTEN STL.",
+                "failed_gates": validation["failed_gates"],
+                "gates": validation["gates"],
+                "detail": "Measured on the bytes that would have been shipped, "
+                          "after simulating a downstream reader's weld — not on "
+                          "the in-memory boolean result.",
+                "stage": k}))
+
+        # manifold3d's own body count, cross-checked against the written file's
+        # connected components. They answer different questions and both have
+        # to agree before a stage ships.
+        if require_print_ready and n_bodies != 1:
             raise HTTPException(422,
-                f"Stage {k} fused into {n_comp} separate solids. A tooth has moved clear "
+                f"Stage {k} fused into {n_bodies} separate solids. A tooth has moved clear "
                 f"of the cast and is floating — the model cannot be thermoformed.")
-        closed = cg.manifold_report(sf)
-        if not closed["watertight"]:
-            raise HTTPException(422,
-                f"Stage {k} is not closed: {closed['open_edges']} open and "
-                f"{closed['nonmanifold_edges']} non-manifold edges of "
-                f"{closed['total_edges']}. It is not safe to print.")
 
         blobs[name] = blob
         stage_meta.append({
@@ -2615,6 +2759,37 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
             "csg_repair_stage": csg_info.get("csg_repair_stage", "none"),
             "fallback_reason": csg_info.get("fallback_reason"),
             "fallback_detail": csg_info.get("fallback_detail"),
+
+            # --- local target-position reconstruction, per tooth -----------
+            # Everything the brief's amendment 16 asks to record. The ROI is a
+            # geodesic surface region; the bboxes beside it are DIAGNOSTICS.
+            "interfaces": interfaces,
+            "interface_total_cavity_volume_mm3": round(sum(
+                i.get("cavity_volume_mm3") or 0.0 for i in interfaces), 4),
+            "interface_total_ramp_volume_mm3": round(sum(
+                i.get("ramp_volume_mm3") or 0.0 for i in interfaces), 4),
+            "interface_total_affected_faces": int(sum(
+                i.get("affected_faces") or 0 for i in interfaces)),
+            "interface_total_affected_area_mm2": round(sum(
+                i.get("affected_area_mm2") or 0.0 for i in interfaces), 4),
+
+            # --- the five-point serialisation chain (amendments 11, 12) -----
+            "edges_pre_export_weld": {
+                "open": int(pre_weld["open_edges"]),
+                "nonmanifold": int(pre_weld["nonmanifold_edges"])},
+            "edges_post_export_weld": {
+                "open": int(post_weld["open_edges"]),
+                "nonmanifold": int(post_weld["nonmanifold_edges"])},
+            "export_weld_merged_vertices": int(export_welded),
+            "edges_post_read_and_reader_weld": {
+                "open": int(validation["open_edges"]),
+                "nonmanifold": int(validation["nonmanifold_edges"])},
+            "reader_weld_merged_vertices": int(
+                validation["reader_weld_merged_vertices"]),
+
+            # --- the verdict, from the written bytes -----------------------
+            "stl_validation": validation,
+            "print_ready": bool(validation["print_ready"]),
             "occlusal_interference": interference,
             "occlusal_warning": ANTAGONIST_WARNING if interference else None,
             # YELLOW, not red, and deliberately: closing an embrasure is often
@@ -2738,7 +2913,17 @@ def build_stage_bundle(sid: str, req: StageExportRequest) -> dict:
         repaired_stages=len([s for s in stage_meta if s.get("fallback_reason")]))
 
     return {"buf": buf, "filename": f"{arch}_stages.zip", "manifest": manifest,
-            "stages": total, "out_dir": out_dir, "union_seconds": t_union}
+            "stages": total, "out_dir": out_dir, "union_seconds": t_union,
+            # /export/final picks ONE of these rather than rebuilding the
+            # bundle, so the file it ships is byte-identical to the one that
+            # was validated.
+            "blobs": blobs,
+            # The IMMUTABLE cast this bundle was actually built from. The
+            # fidelity test has to compare the stage against THIS, not against
+            # a cast rebuilt with its own parameters - a different trim margin
+            # or base thickness makes every vertex differ and reads as metres
+            # of phantom deformation.
+            "base_mesh": (bv, bf)}
 
 
 @app.post("/api/session/{sid}/export/stages")
@@ -2769,3 +2954,130 @@ def export_stages(sid: str, req: StageExportRequest):
 def close_session(sid: str):
     STORE.drop(sid)
     return {}
+
+
+class FinalExportRequest(StageExportRequest):
+    """One validated stage, for printing. Inherits the staging settings."""
+    stage: int = 0          # 0 means "the last stage", the planned setup
+
+
+@app.post("/api/session/{sid}/export/final")
+def export_final(sid: str, req: FinalExportRequest):
+    """ONE fused manufacturing STL for one stage, or a refusal. Never both.
+
+    WHY THIS IS A SEPARATE ENDPOINT FROM /export AND /export/stages, and it is
+    not tidiness:
+
+      * `/export` ships the setup for INSPECTION - a base plus one STL per
+        crown, loose parts. It was labelled "Export Printable Cast" in the UI,
+        which is the one thing it is not. A lab handed those files has to
+        assemble them and has no way to know whether the assembly is sound.
+      * `/export/stages` ships every stage so the clinician can review the
+        whole plan. Each stage carries its own verdict; a stage that fails
+        validation still ships, marked NOT PRINT READY, because refusing the
+        review of a plan is not the same as refusing to print it.
+      * THIS endpoint ships ONE file and applies the hard gate. If the written
+        bytes do not pass every gate, there is no file - a 422 naming the gate
+        and its measured value.
+
+    So it is structurally impossible for the UI to download something from
+    here and call it print ready when it is not: the only 200 response is a
+    validated one.
+
+    Returns a ZIP of the STL plus manifest.json. A binary STL cannot carry the
+    verdict or the diagnostics, and a lab that receives a bare STL has no
+    record of what was checked.
+    """
+    try:
+        # Build every stage WITHOUT the global gate, then hard-gate only the
+        # one being printed. Gating the whole bundle here would refuse a
+        # perfectly good stage 1 because stage 4 is not print ready, which
+        # tells the clinician nothing useful about the file they asked for.
+        bundle = build_stage_bundle(sid, req, require_print_ready=False)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Final export failed: {str(e)}")
+
+    manifest = bundle["manifest"]
+    stages = manifest["stage_files"]
+    if not stages:
+        raise HTTPException(422, "No stages were produced; there is nothing to print.")
+
+    wanted = req.stage or stages[-1]["stage"]
+    chosen = next((s for s in stages if s["stage"] == wanted), None)
+    if chosen is None:
+        raise HTTPException(422, _jsonable({
+            "error": f"Stage {wanted} does not exist in this plan.",
+            "available_stages": [s["stage"] for s in stages]}))
+
+    # Belt and braces. build_stage_bundle already refused anything that failed,
+    # so reaching here with print_ready False would mean the gate itself broke.
+    if not chosen.get("print_ready"):
+        raise HTTPException(422, _jsonable({
+            "error": f"Stage {wanted} is NOT PRINT READY.",
+            "failed_gates": chosen["stl_validation"]["failed_gates"],
+            "gates": chosen["stl_validation"]["gates"]}))
+
+    blob = bundle["blobs"][chosen["file"]]
+    name = f"{manifest['arch']}_Stage_{wanted:02d}_FINAL.stl"
+
+    final_manifest = {
+        "generator": "Clinical Micro-Planner",
+        "kind": "ONE fused manufacturing model for a single stage",
+        "arch": manifest["arch"],
+        "stage": wanted,
+        "of_stages": manifest.get("stages"),
+        "file": name,
+        "print_ready": True,
+        "verdict": "PRINT READY",
+        # The exact wording matters. This is an engineering statement about
+        # geometry, not a clinical one about a patient.
+        "verdict_meaning": (
+            "Manufacturing geometry validated against engineering gates, "
+            "measured on the actual written STL after a downstream reader's "
+            "weld. This is NOT a claim of clinical validation."),
+        "validation": chosen["stl_validation"],
+        "interfaces": chosen.get("interfaces"),
+        "volume_mm3": chosen.get("volume_mm3"),
+        "triangles": chosen.get("triangles"),
+        "serialisation_chain": {
+            "pre_export_weld": chosen.get("edges_pre_export_weld"),
+            "post_export_weld": chosen.get("edges_post_export_weld"),
+            "export_weld_merged_vertices": chosen.get("export_weld_merged_vertices"),
+            "post_read_and_reader_weld": chosen.get("edges_post_read_and_reader_weld"),
+            "reader_weld_merged_vertices": chosen.get("reader_weld_merged_vertices"),
+        },
+        "coordinate_space": "raw scanner coordinates — never re-centred or rescaled",
+        "manufacturing_architecture": (
+            "immutable cast -> local target-position interface -> subtract "
+            "cavity -> add emergence ramp -> union rigid crown + bounded seat. "
+            "No root-length plug participates."),
+        "print_compensation_mm": manifest.get("print_compensation_mm", 0.0),
+        "occlusion": manifest.get("occlusion"),
+        "disclaimer": export_clinical_report.DISCLAIMER,
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(name, blob)
+        z.writestr("manifest.json", json.dumps(_jsonable(final_manifest), indent=2))
+    buf.seek(0)
+
+    _record(sid, audit.EXPORTED, arch=manifest["arch"],
+            detail=f"final print STL, stage {wanted}",
+            values={"stage": int(wanted), "triangles": int(chosen["triangles"]),
+                    "print_ready": True})
+
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition":
+                     f'attachment; filename="{manifest["arch"]}_Stage_{wanted:02d}_FINAL.zip"',
+                 "X-Print-Ready": "true",
+                 "X-Stage": str(wanted),
+                 "X-Open-Edges": str(chosen["stl_validation"]["open_edges"]),
+                 "X-Nonmanifold-Edges": str(chosen["stl_validation"]["nonmanifold_edges"]),
+                 "X-Components": str(chosen["stl_validation"]["connected_components"]),
+                 "Access-Control-Expose-Headers":
+                     "X-Print-Ready, X-Stage, X-Open-Edges, X-Nonmanifold-Edges, X-Components"})

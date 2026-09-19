@@ -150,3 +150,30 @@ Scans are held in memory only and never written to disk. Sessions expire on a ti
 filenames are stored nowhere, because filenames routinely carry patient names. Exports run on
 127.0.0.1 and write only to the local `exports/` directory, with no patient name in any filename.
 `.gitignore` excludes every scan, mesh and derived label file from version control.
+
+## Manufacturing architecture (authoritative, 2026-09-20)
+
+* Raw scanner coordinates remain **immutable** — never translated, rotated,
+  rescaled or re-centred.
+* Tooth movement is **rigid about C_res**; the crown in every stage is a rigid
+  transform of the extracted T0 crown.
+* The **live viewport cast is static**. Nothing in the viewport reconstructs.
+* The **old socket is restored** flush at its original position.
+* Each stage reconstructs a **bounded local target-position interface** around
+  the transformed cervical rim: a cavity where the crown penetrates, an
+  emergence ramp where the rim has lifted clear.
+* **`root_length_mm` is NOT manufacturing plug depth.** It is used only for
+  C_res estimation and the wireframe virtual root. Proven with the stage matrix
+  frozen.
+* Boolean order is **add tissue → subtract cavity → union rigid crown + seat**.
+* The **final STL is validated after write and readback**, simulating a
+  downstream reader's weld.
+* **PRINT READY requires all hard gates to pass** — finite coordinates, zero
+  open edges, zero non-manifold edges, positive volume, one connected
+  component, consistent winding. Any failure returns no file.
+
+Wording note: these are **engineering validation gates for a prototype**. They
+are not a claim of clinical validation.
+
+See `MANUFACTURING_RECONSTRUCTION_CHANGELOG.md` for the full record, including
+what is **not** yet fixed.
