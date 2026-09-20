@@ -676,20 +676,37 @@ line settles it.*
 * The **live viewport cast is static**. Nothing in the viewport reconstructs.
 * The **old socket is restored** flush at its original position.
 * Each stage reconstructs a **bounded local target-position interface** around
-  the transformed cervical rim: a cavity where the crown penetrates, an
-  emergence ramp where the rim has lifted clear.
+  the transformed cervical rim — ONE transition collar, not a cavity plus a
+  ramp. It is solved per rim point against the measured signed distance to the
+  actual crown and the actual cast, so a penetrating tooth, a separated one and
+  a mixed one all use the same construction.
+* **The collar ENCLOSES the crown's cervical crease.** That is the load-bearing
+  property: every self-touch in the fused solid was measured to sit where a
+  synthetic surface crossed a CREASE, and a self-touching solid is
+  inexpressible in a position-based format like STL. See CLAUDE.md §23.
 * **`root_length_mm` is NOT manufacturing plug depth.** It is used only for
   C_res estimation and the wireframe virtual root. Proven with the stage matrix
-  frozen.
-* Boolean order is **add tissue → subtract cavity → union rigid crown + seat**.
+  frozen, over 9–13 mm.
+* Boolean order is **cast − crown-derived local clearance → union rigid crown +
+  collar**, and the order is exercisable: `build_stage_bundle(part_order=...)`
+  takes forward / reverse / sequential and the three are compared as SURFACES.
 * The **final STL is validated after write and readback**, simulating a
   downstream reader's weld.
-* **PRINT READY requires all hard gates to pass** — finite coordinates, zero
-  open edges, zero non-manifold edges, positive volume, one connected
-  component, consistent winding. Any failure returns no file.
+* **TWO VERDICTS, and they are not the same claim.**
+  `validate_printable_stl` returns **PASSES / FAILS BOOLEAN/TOPOLOGY
+  REGRESSION** on the written bytes and names what it does not cover.
+  **`manufacturing.aggregate_print_gate` is the only thing entitled to say
+  PRINT READY** — sixteen gates including no self-touching boundary, synthetic
+  exposure, two-sided cast fidelity, ROI compliance, transition quality,
+  old-site quality, crown rigidity and the gingival bridge. It is a pure
+  function of the stage record, so a MISSING measurement fails it exactly as a
+  bad one does. `POST /export/final` enforces it and returns no file on failure;
+  the client reads `X-Print-Ready` rather than inferring from HTTP 200.
 
 Wording note: these are **engineering validation gates for a prototype**. They
-are not a claim of clinical validation.
+are not a claim of clinical validation, and **no real de-identified scan has
+been run through them** — `real_scan_regression.py` reaches tooth selection on
+`case_lower.stl` and stops there, printing the measurements that say why.
 
 See `MANUFACTURING_RECONSTRUCTION_CHANGELOG.md` for the full record, including
 what is **not** yet fixed.

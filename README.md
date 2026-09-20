@@ -165,15 +165,34 @@ filenames are stored nowhere, because filenames routinely carry patient names. E
 * **`root_length_mm` is NOT manufacturing plug depth.** It is used only for
   C_res estimation and the wireframe virtual root. Proven with the stage matrix
   frozen.
-* Boolean order is **add tissue → subtract cavity → union rigid crown + seat**.
+* Boolean order is **cast − crown-derived local clearance → union rigid crown
+  + transition collar**. The clearance is an exact Minkowski dilation of the
+  transformed crown and is emitted only when the subtraction leaves the cast as
+  one body; a withheld tool is recorded with its reason.
+* The connector is a **bounded transition collar that ENCLOSES the crown's
+  cervical crease**, with both rings placed by measured signed distance against
+  the actual crown and the actual cast. That is what stops the fused solid
+  touching itself — see CLAUDE.md §23.
 * The **final STL is validated after write and readback**, simulating a
   downstream reader's weld.
-* **PRINT READY requires all hard gates to pass** — finite coordinates, zero
-  open edges, zero non-manifold edges, positive volume, one connected
-  component, consistent winding. Any failure returns no file.
+* **TWO VERDICTS, and they are not the same claim.**
+  `validate_printable_stl` returns **PASSES / FAILS BOOLEAN/TOPOLOGY
+  REGRESSION** on the written bytes — finite coordinates, zero open edges, zero
+  non-manifold edges, positive volume, one connected component, consistent
+  winding — and carries a `gate_scope` naming what it does not cover.
+  **`manufacturing.aggregate_print_gate` is the only thing entitled to say
+  PRINT READY**, and it adds: no self-touching boundary, synthetic exposure
+  within bound, no exposed clearance wall, two-sided unaffected-cast fidelity,
+  reconstruction inside the allowed envelope, interface continuity, transition
+  quality, old-site quality, crown rigidity, gingival bridge, root-length
+  independence and clinical consistency. It is a pure function of the stage
+  record, so a MISSING measurement fails it exactly as a bad one does.
+  `POST /export/final` enforces it and returns no file on failure.
 
 Wording note: these are **engineering validation gates for a prototype**. They
-are not a claim of clinical validation.
+are not a claim of clinical validation, and **no real de-identified scan has
+been run through them** — `real_scan_regression.py` reaches tooth selection on
+`case_lower.stl` and stops there, for reasons it measures and prints.
 
 See `MANUFACTURING_RECONSTRUCTION_CHANGELOG.md` for the full record, including
 what is **not** yet fixed.

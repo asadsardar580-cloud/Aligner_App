@@ -452,3 +452,273 @@ it covers and, explicitly, what it does not: transition quality, interface
 continuity, old-site quality, two-sided cast fidelity, ROI compliance,
 seat/ramp exposure, crown rigidity, prescription consistency. The final-export
 endpoint carries the same narrowed verdict and a `verdict_scope`.
+
+---
+
+## V. 2026-09-21 — THE SOLID WAS TOUCHING ITSELF; THE TRANSITION COLLAR, AND THE AGGREGATE GATE
+
+### What the defect actually was, and how the last explanation was wrong
+
+The five failing matrix cases were not five problems. They were one, and the
+account in section U above was **refuted by its own control**.
+
+**A coincident position in manifold3d's output means the boundary TOUCHES
+ITSELF.** That is now established rather than assumed, by running the engine on
+cases whose answer is known:
+
+| union | coincident positions | non-manifold after weld |
+|---|---|---|
+| two cubes overlapping, axis aligned | 0 | 0 |
+| two cubes overlapping, one rotated 13/27/41° | 0 | 0 |
+| cube ∪ sphere (transversal) | 0 | 0 |
+| two cubes meeting FACE TO FACE (tangent) | 0 | 0 |
+| **two cubes meeting along an EDGE** | **2** | **1** |
+
+So a clean transversal union produces none, a face tangency produces none, and
+only a genuinely self-touching solid produces them. Binary STL stores
+POSITIONS, so a reader welds whether or not we do — and welding a self-touch is
+exactly what turns it into a non-manifold edge.
+
+**"A small movement is worse than a large one" is FALSE.** Measured across the
+whole extrusion sweep with seats and crowns fused, self-touch counts per stage:
+
+| extrusion | stage 1 / 2 / 3 |
+|---|---|
+| 0.0 mm | 9 / 16 / 27 |
+| 0.25 mm | 7 / 18 / 34 |
+| 1.0 mm | 26 / 19 / 33 |
+| 1.2 mm | 23 / 27 / 43 |
+| 2.0 mm | 12 / 33 / 47 |
+
+The 1.2 mm case — the one section U called clean across five stages — carries
+the defect at every stage. It passed because every edge it produced happened to
+be short enough for `collapse_short_nonmanifold_edges` to take. **The defect was
+universal; the repair rung's success was not.**
+
+### Where the solid touched itself, proven with provenance
+
+Every input solid is now stamped with a manifold3d original id
+(`Manifold.as_original()`), which survives the boolean and comes back on
+`run_original_id` / `run_index`. So every triangle in a fused stage can be
+traced to the geometry it came from, and every offending edge reported with the
+sources meeting on it.
+
+On extrusion 0.25 mm stage 1, all six touches read **distance-to-rim 0.08889 mm
+and distance-to-nearest-cast-vertex 0.17222 mm — the same two numbers to five
+decimals.** They lie on the boundary edge of the cast's flat flush socket cap,
+at the midpoint of a rim edge. The rest sat on the crown's own cervical rim.
+
+**All three geometries were built from ONE loop.** The crown is cut at
+`socket_rim`, the old site is capped at `socket_rim`, and the connector was
+lofted from `socket_rim` transformed — so the connector's wall crossed the cast
+and the crown exactly where each has a sharp edge. A surface crossing another
+surface AT ITS CREASE is a tangential contact.
+
+### The fix: a transition collar that encloses the crease
+
+The connector is no longer a plug lofted from the rim into the crown. It is a
+bounded collar whose solid CONTAINS the crown's cervical crease and whose own
+surface meets the crown and the cast only where both are smooth. Both rings are
+placed by MEASURED signed distance against the actual transformed crown and the
+actual cast, never by an offset chosen in advance:
+
+* **upper ring** — starts `max(emergence_height_mm, local lift)` above the rim,
+  then marches up while it is inside the cast and outward while it is inside
+  the crown, until it is at least `clearance_mm` clear of both.
+* **lower ring** — seeded `seat_bottom_outset_mm` outward, dropped onto the
+  cast with a shrink ladder, then marched INWARD ALONG −grad(signed distance)
+  until it is `fusion_overlap_mm + clearance_mm` inside real cast material.
+* the radial direction is taken about the rim's own centroid and every offset
+  is OUTWARD, which cannot fold a star-shaped loop.
+
+CASE A (penetrating), CASE B (separated) and CASE C (mixed) all use this one
+construction and need no partition, because both rings are solved PER RIM POINT
+against the real surfaces.
+
+**Six things had to be measured rather than reasoned, and each one was a
+separate wrong answer first:**
+
+1. **The upper ring must clear the CAST, not just sit above the rim.** On a
+   penetrating tooth the cast surface is above the cervical margin, so
+   `rim + 0.30 mm` is still buried. Every residual touch read
+   distance-to-rim 0.30000 — exactly the starting height — until the ring was
+   solved against the cast's signed distance instead.
+2. **The lower ring must SEAT, not merely get inside.** Stopping at
+   `clearance_mm` settled it 0.08 mm under the surface, so its bottom disc ran
+   nearly PARALLEL to the flat old-site cap a fraction of a millimetre away —
+   and the forensics named that touch `EMERGENCE_RECONSTRUCTION +
+   OLD_SOCKET_REPAIR`. Measured on the 18-case matrix, everything else fixed:
+   0.05 mm → 15 of 18, **0.30 mm → 16 of 18**, 0.60 mm → 13, 1.20 mm → 3. The
+   value that works is `fusion_overlap_mm + clearance_mm`, which the policy
+   already names.
+3. **The downward march must follow the field, not the axis.** Descending the
+   tooth's long axis is right where the cast beneath is a floor and wrong where
+   it is a wall: on a steep interproximal face the axis runs ALONG the surface
+   and 1.2 mm of marching never gets inside — a 1.2 mm extrusion was refused
+   `wall_too_thin` on a cast measured 18.77 mm thick.
+4. **The shrink ladder is load-bearing.** A lingual rim point seeded 1.2 mm
+   outward lands OVER THE ARCH OPENING, where there is no cast: one point in 44
+   fell through and the nearest surface was 3.93 mm away.
+5. **The loft's end caps must be CONES.** A fan to the loop's own centroid is a
+   dished surface whenever the loop is non-planar, and the upper ring is
+   deliberately non-planar — 0.30 mm of rise at some points and 1.96 mm at
+   others on one tipped tooth. The dish sagged BELOW the crease it was meant to
+   enclose.
+6. **The upper ring must clear the whole rim NEAR it, not only its own point.**
+   `top[i] = rim[i] + rise[i]` follows the cervical scallop, so where the
+   margin falls away the NEIGHBOURING ring point sits below the rim point
+   beside it — measured, `top[k]` was 0.078 mm under `rim[i]`, and the two
+   crease points left unenclosed were inside by only 0.025 mm and 0.014 mm. A
+   running maximum over ±3 indices fills those local dips and leaves the ring
+   low wherever the rim is genuinely low, so the collar does not become a tower
+   to fix a notch.
+
+**The collar rises as far as the tooth has lifted.** With a fixed 0.30 mm start
+the upper ring stayed just above the cervical margin while the rim had risen
+0.6 mm, so the whole emergence was compressed into the wall below it: measured
+by `transition_quality`, **0.771 mm of a 0.946 mm fall landed in ONE 0.25 mm
+ring — 82 % of it**, which is the "abrupt ring / vertical wall" the brief asks
+to reject, and the gate rejected it. Rising with the lift spreads the same fall
+across the crown's own flare instead of inventing a shelf to stand on: the same
+stage now reads 0.312 mm of a 0.446 mm fall, share 0.699, not a ledge.
+
+### CASE A: the crown-derived local clearance, and why it is withheld
+
+The tool is an EXACT dilation of the transformed crown — a Minkowski sum with a
+`clearance_mm` sphere, computed once per tooth on its T0 crown and carried by
+the same stage matrix the crown gets, because dilation commutes with a rigid
+transform. Measured on a 250-triangle crown: 8 segments cost 325 ms and 12 cost
+520 ms for volumes 49.836 and 50.107 mm³, a 0.5 % difference on a 0.05 mm
+clearance. The array alternative — a vertex-normal offset — gives 46.86 mm³ and
+**can fold**: it showed up in a fused stage as a `LOCAL_CLEARANCE` self-touch,
+which is the normal-offset failure section 8 tabulated, in a third place.
+
+**It is emitted only when the measured guard passes.** The subtraction is
+performed, `decompose()` is counted, and the result kept only if the cast is
+still ONE body — because subtracting the dilated crown fragmented the cast into
+**4 bodies** on extrusion 0.25 mm stage 1, where the crown passes through the
+thin lip between the old socket cap and the gingival wall. A withheld tool is
+recorded with its reason, never silently dropped, and
+`interface_total_cavity_volume_mm3` now reports what was ACTUALLY REMOVED
+(measured as a volume difference) rather than the volume of a tool that was
+never used — which told a lab 85.16 mm³ of cast had been excavated on a stage
+where nothing was cut at all.
+
+### Four measurement defects that were failing gates on correct geometry
+
+* **`_point_to_surface` was an approximation calling itself exact.** It took
+  the `candidates=24` triangles whose CENTROIDS are nearest, and on a cast
+  whose underside triangles are 20 mm across the triangle a point actually sits
+  on is not among them: 793 of 4710 fused-stage vertices reported distances of
+  exactly 9.0000 mm — the distance to whatever unrelated triangle made the
+  shortlist — while the cast reproduced through manifold3d to 2e-6 mm. Now
+  Open3D's BVH, exact, with the candidate search as the fallback.
+* **The fidelity reference carried 4497 phantom vertices.** `bv` legitimately
+  keeps every vertex the trim removed (rule 3.1 forbids rebuilding the scan's
+  array). Sampling them as surface points reported **3.39 mm of "cast
+  deformation"** from points that are not on the cast at all. The comparison
+  copy is compacted; the scan's array is untouched.
+* **The old-site height field was reading the cast's UNDERSIDE.** A
+  nearest-centroid query in the rim plane happily returns a triangle on the
+  bottom of the base: the old site read a **crater 22.58 mm deep** — the cast's
+  own thickness — and 13 disconnected patches. Faces are now restricted to
+  those facing occlusally before anything is measured.
+* **An old site the tooth still covers is not a defect.** A barely-moved tooth
+  stands over the site it will leave, so the finished model's surface there is
+  the CROWN and the nearest cast triangle is on the socket wall. Reading its
+  height reported a 2.4 mm crater at a site nothing had touched. Samples with
+  no cast surface within 2.5 grid cells are reported as obscured; below a
+  quarter of the site assessable, the answer is `assessable: false` with the
+  obscured fraction — a determinate answer, not an unchecked one.
+
+### The aggregate manufacturing gate
+
+`validate_printable_stl` answers a narrow question and says so in its own
+`gate_scope`. **`mfg.aggregate_print_gate` is now the only thing in this
+codebase entitled to say PRINT READY**, and it is a pure function of the stage
+record, so a measurement that was never taken fails it exactly as a bad one
+does — `NOT_CHECKED` is not `CLEAR`. Sixteen gates:
+
+written-STL topology · single positive Manifold body · body count agrees with
+the STL · **no self-touching boundary** · synthetic exposure within bound · no
+exposed clearance wall · two-sided unaffected-cast fidelity · reconstruction
+inside the envelope · every interface built · interface continuous around every
+rim · no transition ledge · old site restored · crown is an exact rigid
+transform · gingival bridge preserved · root-length independent · clinical
+consistency.
+
+An empty stage record fails **all sixteen**, which is asserted.
+
+`/export/final` enforces this gate, not the narrow one, and its manifest carries
+the gate's own answer rather than a hard-coded `print_ready: True`. The client
+reads `X-Print-Ready` from the response instead of inferring readiness from
+HTTP 200.
+
+**Exposure is measurable only because of provenance.** A triangle that survives
+to the fused boundary and came from the connector IS exposed synthetic anatomy;
+one buried by the crown or the cast is simply absent from the output. No
+heuristic. Measured on extrusion 0.25 mm stage 1: 8379.20 mm² cast, 164.70 mm²
+connector, 6.87 mm² old-site closure, 84.59 mm² crown — **1.99 %** synthetic,
+0.00 mm² unattributed, and 0.00 mm² of clearance wall.
+
+### The allowed reconstruction envelope, enforced
+
+`affected_region` is no longer diagnostic-only. The envelope is the union, over
+every moved tooth, of the cast surface within `roi_radius_mm + seat_bottom_outset_mm`
+of the TARGET rim and of the T0 rim — target site and old site, the only two
+places this pipeline may change the cast. Every cast point that moved further
+than `max_unaffected_deviation_mm` must lie inside it, and outside it the cast
+is compared BOTH ways by point-to-TRIANGLE distance, never by vertex index.
+Measured on extrusion 0.25 mm: final→original max **0.0 mm**, original→final max
+**0.0 mm**, 0 modified points outside the envelope.
+
+### Order independence was testing the wrong thing
+
+The old test reversed the PRESCRIPTION LIST — `[d_oa=1.0, d_md=0.8]` against
+`[d_md=0.8, d_oa=1.0]` — which does not reverse an order, it gives the two teeth
+each other's movement. That is a different model, entitled to a different
+surface: measured, the two "orders" differ by **0.580 mm**, while their VOLUMES
+agree to 5e-4 because the total material is much the same. **A volume
+comparison could never have caught it.**
+
+`build_stage_bundle` now takes `part_order` — forward, reverse or sequential —
+which changes ONLY the sequence the identical solids are handed to the boolean
+in. The test compares the written STLs by two-sided point-to-triangle distance,
+topology, body count, volume and ROI compliance across all three.
+
+### Adjacent, crowded and converging teeth
+
+The bridge check compared the gingival bridge with `2 * fusion_overlap_mm` — a
+nominal 0.5 mm describing no geometry that was ever built, so it passed for a
+trench of any width. It is now the **minimum distance between the two connector
+solids**, and the connector clamps its own reach: each may take
+`0.5 × max_bridge_removal_fraction × d_neighbour − 2 × clearance_mm`, derived
+from the rule rather than chosen, so the pair can never take more than half.
+
+**The fraction GATES; only a merged pair is REFUSED.**
+`max_bridge_removal_fraction` is 0.50 with no measurement behind it, and
+CLAUDE.md section 14's rule is explicit — promote a threshold to a refusal only
+with numbers behind it. Refusing on it would block ordinary crowding: measured
+on two teeth 2.36 mm apart the pair takes 50.9 % and leaves 1.16 mm of
+interdental tissue, which is a papilla, not a trench. So it fails the aggregate
+gate, where it is visible and named, and two reconstructions that have actually
+merged are refused outright.
+
+### What is measured per stage now
+
+Per stage: self-touch groups and their source pairs · edge forensics (edge id,
+endpoint coordinates, length, incident face ids, areas, normals, provenance,
+at each of the five points of the serialisation chain) · synthetic exposure by
+source · two-sided cast fidelity · ROI compliance · volumes separated into
+original cast / after clearance / removed / connectors / crowns / crown-cast
+overlap / connector-cast overlap / fused · adjacent bridges · clinical
+consistency · per-phase seconds. Per tooth: interface mode, continuity,
+transition quality, old-site quality, rigidity (edge lengths, sampled pairwise
+distances, triangle areas, RᵀR−I, det−1), clearance decision and reason.
+
+The unwelded serialisation probe is now GATED. Benchmarked on a 203,522-face
+mesh — the real cast base is 190,036 — the write, parse, weld and two reports
+cost **0.90 s PER STAGE**, so a 31-stage plan paid ~28 s of forensics on top of
+a 4.2 s export, and `/export/final` paid it again. It answers a question that
+only arises when something is wrong, so it runs when something is wrong, and it
+is wrapped: a diagnostic must never be the thing that fails an export.

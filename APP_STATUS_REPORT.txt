@@ -1100,6 +1100,77 @@ Final gate                in-memory index buffer              the WRITTEN STL af
 Unaffected cast           never measured                      mean 0.0046mm p95 0.0000mm
                                                               p99 0.041mm
 
-NOT FIXED: later extrusion stages fuse into 2-3 bodies (1/5 stages PRINT READY).
-Two pre-existing tests are left FAILING to record this. Real-scan regression NOT
-run. See MANUFACTURING_RECONSTRUCTION_CHANGELOG.md sections N and S.
+SUPERSEDED 2026-09-21 - the lines above describe the state at that date and
+two of their claims have since been refuted by measurement. See CLAUDE.md
+section 23 and MANUFACTURING_RECONSTRUCTION_CHANGELOG.md section V.
+
+================================================================================
+MANUFACTURING RECONSTRUCTION - CURRENT STATE, 2026-09-21
+================================================================================
+
+WHAT THE DEFECT WAS. The fused stage solid was TOUCHING ITSELF. manifold3d
+records that as two vertices at an identical position under different indices;
+a control on known cases shows a clean transversal union produces none, a face
+tangency produces none, and only two cubes meeting along an EDGE produce them.
+Binary STL stores positions, so a reader welds whether or not we do, and
+welding a self-touch is what creates a non-manifold edge.
+
+WHERE. Per-triangle provenance (manifold3d original ids) put every touch on a
+CREASE - the boundary of the cast's flat flush socket cap, or the crown's own
+cervical rim. All three geometries are built from ONE loop (socket_rim), so the
+connector's wall crossed the cast and the crown exactly where each has a sharp
+edge.
+
+THE FIX. The connector is a bounded TRANSITION COLLAR whose solid ENCLOSES the
+crown's cervical crease, with both rings placed by measured signed distance
+against the actual transformed crown and the actual cast. CASE A (penetrating),
+CASE B (separated) and CASE C (mixed) all use it; the rings are solved per rim
+point, so no partition is needed.
+
+CORRECTED CLAIMS
+  "manifold3d's output is clean"        FALSE - it carries coincident positions
+                                        wherever the solid touches itself
+  "a small movement is worse than a     FALSE - self-touch counts are the same
+   large one"                           order at 0.0, 0.25, 1.0, 1.2 and 2.0mm
+  "1.2mm is clean across five stages"   FALSE - it had the defect at every
+                                        stage and passed only because its edges
+                                        were short enough for the repair rung
+  "what is missing is a connector that  FALSE - the connector was crossing
+   bites the post-clearance cast"       creases, and the clearance is a
+                                        separate, secondary question
+
+MEASUREMENT DEFECTS FOUND WHILE INTEGRATING THE GATES
+  _point_to_surface       24-candidate approximation; reported exactly 9.0000mm
+                          for 793 of 4710 correct vertices. Now Open3D's BVH.
+  fidelity reference      carried 4497 unreferenced vertices, reporting 3.39mm
+                          of phantom "cast deformation". Compacted.
+  old-site height field   read the cast's UNDERSIDE: a 22.58mm crater, the
+                          cast's own thickness. Occlusal-facing faces only.
+  old-site assessability  a site the tooth still covers is not a defect; below
+                          25% assessable the answer is "not assessable" with
+                          the obscured fraction.
+
+THE AGGREGATE GATE. manufacturing.aggregate_print_gate is now the ONLY thing
+entitled to say PRINT READY: sixteen gates, a pure function of the stage
+record, so a MISSING measurement fails it exactly as a bad one does. An empty
+record fails all sixteen, which is asserted. /export/final enforces it.
+
+TESTS. test_manufacturing_matrix.py 25 cases ALL PASSING (was 18 with 5 failing
+by design), test_manufacturing_interface.py 38. The five cases the previous
+report left failing - extrusion 0.25mm, tip 8deg+0.5mm, rotation, combined and
+order independence - all pass, and the order-independence one was rewritten
+because it had been testing the wrong thing: reversing the prescription LIST
+gives the two teeth each other's movement, which is a different model, not a
+different order.
+
+REAL-SCAN MANUFACTURING REGRESSION = EXECUTED THROUGH TOOTH SELECTION ONLY.
+real_scan_regression.py drives case_lower.stl through upload, conditioning,
+occlusal plane, tooth selection, cut, movement and staging entry, and stops
+there because no single-tooth crown can be produced headlessly:
+  - the wand's auto tolerance returns 25.00mm on all twelve labelled teeth and
+    floods 26,408 of 94,848 vertices; best IoU against any label over
+    tolerances 1-8mm is 0.01 to 0.05;
+  - the stored segmentation labels are not spatially coherent on this mesh -
+    FDI 31's 4,337 labelled vertices span a 33.8 x 34.4 x 15.3mm box, and the
+    largest connected component of its faces is 157 vertices.
+Nothing in the current state is based on the real scan.

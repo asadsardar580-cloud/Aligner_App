@@ -8,6 +8,7 @@ import traceback
 import asyncio
 import threading
 import numpy as np
+from scipy.spatial import cKDTree
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -2242,6 +2243,36 @@ def _batch_union_with_cascade(m3, part_arrays, label: str):
         f"tray that was never made.")
 
 
+def _provenance_labels(mesh, sources: dict, old_site_pts=None,
+                       old_site_tol_mm: float = 0.25):
+    """Per-triangle geometry source for a fused stage.
+
+    The manifold3d runs give CAST / CROWN / SEAT / EMERGENCE / CLEARANCE
+    directly. OLD_SOCKET_REPAIR cannot come from a run, because the flush
+    closure of the site the tooth left is welded into the cast's own vertex
+    array long before any boolean - so it is separated GEOMETRICALLY, by the
+    triangle centroid lying on the cap the closure built. That is stated
+    rather than implied: a cast triangle within `old_site_tol_mm` of a cap
+    triangle's centroid is reported as OLD_SOCKET_REPAIR.
+    """
+    tri = np.asarray(mesh.tri_verts, np.int64)
+    lab = np.array(["UNATTRIBUTED"] * len(tri), dtype=object)
+    rid = np.asarray(mesh.run_original_id)
+    ridx = np.asarray(mesh.run_index)
+    for i, oid in enumerate(rid):
+        lab[ridx[i] // 3:ridx[i + 1] // 3] = sources.get(int(oid),
+                                                         f"ORIGINAL_{int(oid)}")
+    if old_site_pts is not None and len(old_site_pts):
+        vp = np.asarray(mesh.vert_properties, float)[:, :3]
+        cast = np.where(lab == "ORIGINAL_CAST")[0]
+        if len(cast):
+            cent = vp[tri[cast]].mean(axis=1)
+            d, _ = cKDTree(np.asarray(old_site_pts, float)).query(
+                cent, workers=-1)
+            lab[cast[d <= old_site_tol_mm]] = "OLD_SOCKET_REPAIR"
+    return lab
+
+
 def _solid_bodies(solid):
     """Drop inverted crumbs. Returns (solid, bodies, crumbs_discarded).
 
@@ -2369,7 +2400,8 @@ def _stage_clinical(clinical: dict, k: int, n: int) -> dict:
 
 
 def build_stage_bundle(sid: str, req: StageExportRequest,
-                       require_print_ready: bool = False) -> dict:
+                       require_print_ready: bool = False,
+                       part_order: str = "forward") -> dict:
     """One FUSED, watertight solid per stage — the models a lab thermoforms over.
 
     Not loose crowns. A vacuum-forming model is a single solid: the gingiva with
@@ -2391,6 +2423,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
     Measured on the real scan: base (178k tris) union crown (14k tris) = 0.162s,
     so a 31-stage 14-crown case is roughly 70s of boolean work.
     """
+    t_bundle0 = time.perf_counter()
     _t_stage = time.perf_counter()
     try:
         v, f = STORE.require(sid, "verts"), STORE.require(sid, "faces")
@@ -2456,13 +2489,60 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         raise HTTPException(422, f"The cast base could not be built. {e}")
 
     m3 = _require_manifold3d()
-    base_solid = _to_manifold(bv, bf)
+    # PROVENANCE. Every input solid is given a manifold3d "original" id, which
+    # survives the boolean and comes back on `run_original_id` / `run_index` -
+    # so every triangle in a fused stage can be traced to the geometry it came
+    # from, and an offending edge can be reported with the sources meeting on
+    # it rather than with a guess. `as_original()` is free; it only stamps an
+    # id on the solid.
+    geometry_sources: dict[int, str] = {}
+
+    def _tag(solid, label):
+        s_ = solid.as_original()
+        geometry_sources[int(s_.original_id())] = label
+        return s_
+
+    base_solid = _tag(_to_manifold(bv, bf), "ORIGINAL_CAST")
     # Built ONCE for the whole bundle: the cast does not change between teeth
     # or between stages, and rebuilding the KD-tree per query was 43ms of the
     # 89ms a crown cost when the antagonist check made that mistake (section 11).
     cast_probe = mfg.CastProbe(bv, bf)
-    # Kept for the unaffected-cast fidelity comparison at the end of each stage.
-    original_cast = (np.array(bv, copy=True), np.array(bf, copy=True))
+    # Kept for the unaffected-cast fidelity comparison at the end of each
+    # stage, and COMPACTED for it. `bv` legitimately carries every vertex the
+    # trim removed - rule 3.1 forbids rebuilding the scan's array - and 4497
+    # of this cast's 8372 vertices are unreferenced. Sampling them as if they
+    # were surface points reported 3.39mm of "cast deformation" from phantoms
+    # that are not on the cast at all. The same defect, in a third place.
+    _ref_used = np.unique(np.asarray(bf, np.int64))
+    _ref_map = np.zeros(len(bv), np.int64)
+    _ref_map[_ref_used] = np.arange(len(_ref_used))
+    original_cast = (np.array(bv[_ref_used], copy=True),
+                     _ref_map[np.asarray(bf, np.int64)])
+    original_cast_unreferenced = int(len(bv) - len(_ref_used))
+    # THE OLD SITE, kept as a point set so a cast triangle can be attributed to
+    # it. `_seal_sockets(flush=True)` welds the closure into the cast's own
+    # vertex array, so there is no run id to read it off afterwards - the cap's
+    # own triangle centroids are what separates OLD_SOCKET_REPAIR from
+    # ORIGINAL_CAST, and rebuilding them here is the same call `_seal_sockets`
+    # made with the same inputs.
+    old_site_pts = []
+    for _t in teeth:
+        _rec = _t["rec"]
+        _raw_rim = _rec.get("socket_rim")
+        if _raw_rim is None:
+            continue
+        _rim = np.asarray(_raw_rim, np.int64)
+        if len(_rim) < 3:
+            continue
+        try:
+            _pts, _cup, _ = cg.build_socket_cup(
+                v[_rim], np.asarray(_rec["frame"]["u_oa"], float), depth_mm=0.0)
+        except Exception:                                # noqa: BLE001
+            continue
+        _cv = np.vstack([v[_rim], np.asarray(_pts, float)])
+        old_site_pts.append(_cv[np.asarray(_cup, np.int64)].mean(axis=1))
+    old_site_pts = (np.vstack(old_site_pts) if old_site_pts
+                    else np.zeros((0, 3)))
     # Screens every crown AND builds its manufacturing solid, once. manifold3d
     # transforms lazily, so a stage then costs one batch boolean rather than
     # rebuilding every mesh.
@@ -2473,6 +2553,9 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
     ant = _antagonist(req.opposing_session_id)
     t_collide = 0.0
     t_ipr = 0.0
+    t_metrics = 0.0
+    t_iface = 0.0
+    t_cast = round(time.perf_counter() - t_bundle0, 3)
 
     # PER-STAGE INTERPROXIMAL, not once on the final pose. A tooth that is clear
     # at T0 and clear at the setup can still close an embrasure to nothing in
@@ -2503,6 +2586,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         #        + emergence ramps     add tissue where the rim lifted clear
         #        u rigid crowns        the crown, and nothing but the crown
         interfaces, cavity_tools, ramp_tools, seat_tools = [], [], [], []
+        connector_pts = {}
         crown_solids = {}
         stage_matrices = {}
         for t in teeth:
@@ -2511,9 +2595,25 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             stage_matrices[t["tid"]] = M
 
             rim_t0 = v[np.asarray(rec["socket_rim"], np.int64)]
+            # THE NEIGHBOURS' TARGET RIMS, so the connector can clamp its own
+            # reach and the gingival bridge cannot be consumed by construction
+            # rather than only detected afterwards.
+            nb = []
+            for other in teeth:
+                if other["tid"] == t["tid"]:
+                    continue
+                o_rec = other["rec"]
+                o_M = cg.kinematic_matrix(
+                    o_rec["frame"], o_rec["c_res"],
+                    **_stage_clinical(other["clinical"], k, total))
+                nb.append(cg.apply_matrix(
+                    v[np.asarray(o_rec["socket_rim"], np.int64)], o_M))
+            _t_if = time.perf_counter()
             iface = mfg.build_stage_tooth_interface(
                 bv, bf, rec["cv"], rec["cf"], rim_t0,
-                rec["frame"]["u_oa"], M, probe=cast_probe)
+                rec["frame"]["u_oa"], M, probe=cast_probe,
+                neighbour_rims=nb)
+            t_iface += time.perf_counter() - _t_if
             row = iface.manifest_row()
             row.update({"stage": k, "tooth_id": t["tid"], "fdi": t["fdi"],
                         "clinical": clinical})
@@ -2536,10 +2636,18 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             roi_mask, roi_info = mfg.affected_region(
                 bv, bf, cg.apply_matrix(rim_t0, M), mfg.DEFAULT_POLICY.roi_radius_mm)
             row.update(roi_info)
-            row["continuity"] = mfg.interface_continuity(
-                cg.apply_matrix(rim_t0, M), iface.cavity_verts)
+            # MEASURED AGAINST THE CONNECTOR, which is the geometry that IS
+            # the interface. It used to be measured against `cavity_verts`,
+            # which is None whenever no material is removed, so every tooth in
+            # every shipped manifest read `continuous: false, reason: "no
+            # interface geometry"` while the connector was in fact a
+            # continuous band covering the whole rim.
+            row["continuity"] = iface.diagnostics.get("continuity") or (
+                mfg.interface_continuity(cg.apply_matrix(rim_t0, M),
+                                         iface.seat_verts))
 
-            crown_solid = t["solid"].transform(np.asarray(M[:3, :4], float))
+            crown_solid = _tag(
+                t["solid"].transform(np.asarray(M[:3, :4], float)), "CROWN")
             crown_solids[t["tid"]] = crown_solid
 
             # NO SUBTRACTION. This is the last structural correction, and it
@@ -2567,16 +2675,36 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             # see the long note there for the graze counts that decided it.
             # The wiring stays so the manifest can state that nothing was
             # removed, rather than being silent about it.
-            if iface.cavity_verts is not None:
-                cavity_tools.append(
-                    _to_manifold(iface.cavity_verts, iface.cavity_faces))
-            if iface.ramp_verts is not None:
-                ramp_tools.append(_to_manifold(iface.ramp_verts, iface.ramp_faces))
+            # CASE A: the crown-derived local clearance tool, built HERE
+            # because an exact dilation is a Minkowski sum and that is the CSG
+            # engine's job. Two facts make it affordable: dilation COMMUTES
+            # with a rigid transform, so the sum is taken once per tooth on
+            # its T0 crown and then carried by the same stage matrix the crown
+            # gets; and the sphere is coarse on purpose - measured on a
+            # 250-triangle crown, 8 segments cost 325ms and 12 cost 520ms for
+            # volumes 49.836 and 50.107mm3, a 0.5% difference on a 0.05mm
+            # clearance. The array alternative, a vertex-normal offset, gives
+            # 46.86mm3 and can fold.
+            if iface.diagnostics.get("clearance_required"):
+                dil = t.get("dilated")
+                if dil is None:
+                    dil = m3.Manifold.minkowski_sum(
+                        t["solid"],
+                        m3.Manifold.sphere(mfg.DEFAULT_POLICY.clearance_mm, 8))
+                    t["dilated"] = dil
+                tool = _tag(dil.transform(np.asarray(M[:3, :4], float)),
+                            "LOCAL_CLEARANCE")
+                cavity_tools.append(tool)
+                row["clearance_tool_volume_mm3"] = round(float(tool.volume()), 4)
             if iface.seat_verts is not None:
                 # Unioned WITH the crown, not into it: the crown solid stays a
                 # rigid transform of T0 and the rigidity tests measure it alone.
-                seat_solid = _to_manifold(iface.seat_verts, iface.seat_faces)
+                seat_solid = _tag(
+                    _to_manifold(iface.seat_verts, iface.seat_faces),
+                    "EMERGENCE_RECONSTRUCTION"
+                    if iface.diagnostics.get("rim_points_lifted") else "SEAT")
                 seat_tools.append(seat_solid)
+                connector_pts[t["tid"]] = np.asarray(iface.seat_verts, float)
                 # REAL INTERSECTION VOLUMES. A nominal 0.25mm overlap is not
                 # evidence that anything fuses; the measured common volume is.
                 # A connector with nominal dimensions and zero actual
@@ -2596,14 +2724,35 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                 ri = cg.apply_matrix(v[np.asarray(teeth[i]["rec"]["socket_rim"], np.int64)], Mi)
                 rj = cg.apply_matrix(v[np.asarray(teeth[j]["rec"]["socket_rim"], np.int64)], Mj)
                 bridge = mfg.bridge_between(ri, rj)
-                consumed = 2 * mfg.DEFAULT_POLICY.fusion_overlap_mm
-                if bridge > 1e-9 and consumed / bridge > mfg.DEFAULT_POLICY.max_bridge_removal_fraction:
+                # MEASURED FROM THE RECONSTRUCTIONS, not from a nominal
+                # constant. `2 * fusion_overlap_mm` is 0.5mm whatever was
+                # built, so it passed for a trench of any width.
+                gi = connector_pts.get(teeth[i]["tid"])
+                gj = connector_pts.get(teeth[j]["tid"])
+                if gi is None or gj is None:
+                    continue
+                gap = float(cKDTree(gj).query(gi, workers=-1)[0].min())
+                consumed = max(0.0, bridge - gap)
+                # REFUSE ONLY WHEN THE BRIDGE IS ACTUALLY GONE, and gate on
+                # the rest. `max_bridge_removal_fraction` is 0.50 with no
+                # measurement behind it, and CLAUDE.md section 14's rule is
+                # explicit: promote a threshold to a refusal only with numbers
+                # behind it. Refusing on it would block ordinary crowding -
+                # measured on two teeth 2.36mm apart, the pair takes 50.9% and
+                # leaves 1.16mm of interdental tissue, which is a papilla, not
+                # a trench. So the fraction FAILS THE AGGREGATE GATE, where it
+                # is visible and named, and only two reconstructions that have
+                # actually merged are refused outright.
+                if bridge > 1e-9 and gap <= 0.0:
                     raise HTTPException(422, _jsonable({
-                        "error": f"Stage {k}: two reconstructions would consume the "
-                                 f"gingival bridge between them.",
+                        "error": f"Stage {k}: two reconstructions have merged "
+                                 f"and the gingival bridge between them is gone.",
                         "gate": "adjacent_reconstruction_overlap",
                         "bridge_mm": round(bridge, 4),
                         "would_consume_mm": round(consumed, 4),
+                        "clear_gap_between_reconstructions_mm": round(gap, 4),
+                        "measure": "minimum distance between the two connector "
+                                   "solids, not 2 * fusion_overlap_mm",
                         "max_fraction": mfg.DEFAULT_POLICY.max_bridge_removal_fraction,
                         "teeth": [teeth[i]["tid"], teeth[j]["tid"]]}))
 
@@ -2633,21 +2782,60 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # exists to be damaged, and it removes only 0.05mm around the crown -
         # far too little to take away the surface the ramp lands on.
         prepared = base_solid
+        clearance_report = {"tools_built": len(cavity_tools), "emitted": False,
+                            "reason": None if cavity_tools else "no penetrating tooth",
+                            "cast_bodies_after_subtract": None,
+                            "removed_volume_mm3": None}
         if cavity_tools:
-            prepared = m3.Manifold.batch_boolean([prepared] + cavity_tools,
-                                                 m3.OpType.Subtract)
+            # EMIT ONLY IF IT DOES NOT BREAK THE CAST. Subtracting the dilated
+            # crown fragmented the cast into 4 bodies on extrusion 0.25mm
+            # stage 1 - the crown passes through the thin lip left between the
+            # old socket cap and the gingival wall, and isolates it. That is a
+            # measured guard, not a preference: the subtraction is performed,
+            # `decompose()` is counted, and the result is kept only if the cast
+            # is still ONE body. A withheld tool is recorded with its reason,
+            # never silently dropped.
+            trial = m3.Manifold.batch_boolean([prepared] + cavity_tools,
+                                              m3.OpType.Subtract)
+            bodies_after = len(trial.decompose())
+            clearance_report["cast_bodies_after_subtract"] = int(bodies_after)
+            if bodies_after == 1 and not trial.is_empty():
+                removed = float(base_solid.volume()) - float(trial.volume())
+                clearance_report.update(
+                    emitted=True, reason=None,
+                    removed_volume_mm3=round(removed, 4))
+                prepared = trial
+            else:
+                clearance_report["reason"] = (
+                    f"withheld: the subtraction leaves {bodies_after} cast "
+                    f"bodies, which would sever the reconstruction")
+        for r_ in interfaces:
+            if r_.get("clearance_measured"):
+                r_["clearance_tool_emitted"] = bool(clearance_report["emitted"])
+                r_["clearance_withheld_reason"] = clearance_report["reason"]
         if ramp_tools:
             prepared = m3.Manifold.batch_boolean([prepared] + ramp_tools,
                                                  m3.OpType.Add)
-        # `cavity_tools` is empty by design - see the note above. It is kept so
-        # a future interface that genuinely needs to remove material has a
-        # wired path to do it, and so the manifest can say it removed nothing.
         diag_cavity_tools = len(cavity_tools)
 
         # THE CROWN, AND NOTHING BUT THE CROWN. No plug, no skirt. The same
         # Manifold objects that were used as cutters, so the cut and the fill
         # are the identical solid and cannot disagree numerically.
-        parts = [prepared] + seat_tools + [crown_solids[t["tid"]] for t in teeth]
+        # ORDER INDEPENDENCE IS A PROPERTY OF THE GEOMETRY, so it has to be
+        # exercisable. `part_order` changes ONLY the sequence the solids are
+        # handed to the boolean in - never which solids, never their geometry -
+        # so a difference in the result is a difference the engine introduced.
+        # "batch" is the shipped path.
+        crown_parts = [crown_solids[t["tid"]] for t in teeth]
+        if part_order == "reverse":
+            parts = [prepared] + crown_parts[::-1] + seat_tools[::-1]
+        elif part_order == "sequential":
+            acc = prepared
+            for q in seat_tools + crown_parts:
+                acc = m3.Manifold.batch_boolean([acc, q], m3.OpType.Add)
+            parts = [acc]
+        else:
+            parts = [prepared] + seat_tools + crown_parts
 
         # Per-tooth measurements that do not affect the geometry: interproximal
         # closure and the antagonist check. Both are reported, never blocking.
@@ -2715,6 +2903,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         t_union += time.perf_counter() - t0
         sv = np.asarray(mesh.vert_properties, float)[:, :3]
         sf = np.asarray(mesh.tri_verts, np.int64)
+        stage_labels = _provenance_labels(mesh, geometry_sources, old_site_pts)
         if len(sf) == 0:
             raise HTTPException(422,
                 f"Stage {k} fused to an empty solid. The crowns and the base did not "
@@ -2765,29 +2954,58 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # file does anyway - this only moves that rounding to BEFORE the weld
         # instead of after it.
         sv = sv.astype(np.float32).astype(np.float64)
+        _pre_weld_v, sf_pre_weld = sv, sf
 
-        # WHAT WOULD A READER DO IF WE DID NOT WELD? This is the control for
-        # the whole serialisation argument, and without it the chain cannot
-        # tell "our weld created this" from "any reader would have".
-        # Measured: manifold3d's output is clean (NM 0), our weld merges the
-        # coincident vertices it deliberately kept distinct and that is what
-        # produces the non-manifold edges. So the question is whether a reader
-        # welding the UNWELDED bytes lands in the same place.
-        _probe_blob = cg.write_binary_stl_bytes(sv, sf)
-        _ppv, _ppf = stl_io.parse_stl_bytes(_probe_blob)
-        _praw = cg.manifold_report(_ppf)
-        _pwv, _pwf, _pmerged = cg.weld_vertices(_ppv, _ppf)
-        _pw = cg.manifold_report(_pwf)
-        unwelded_probe = {
-            "written_unwelded_faces": int(len(sf)),
-            "reread_open": int(_praw["open_edges"]),
-            "reread_nonmanifold": int(_praw["nonmanifold_edges"]),
-            "reader_weld_merged": int(_pmerged),
-            "after_reader_weld_open": int(_pw["open_edges"]),
-            "after_reader_weld_nonmanifold": int(_pw["nonmanifold_edges"])}
+        # SELF-TOUCH, MEASURED BEFORE THE WELD. manifold3d records a boundary
+        # that touches itself as two vertices at an IDENTICAL position under
+        # different indices; the control in mfg.self_touch_report shows a
+        # clean transversal union produces none. Binary STL stores positions,
+        # so welding is not optional - which means every self-touch the
+        # boolean leaves becomes a non-manifold edge in the file. This is the
+        # number that actually predicts the gate, so it is recorded on EVERY
+        # stage, passing or not.
+        touch = mfg.self_touch_report(sv, sf, stage_labels, limit=12)
 
-        sv, sf, export_welded = cg.weld_vertices(sv, sf)
+        # THE WELD DROPS DEGENERATE FACES, so the provenance array has to come
+        # with it: measured, 9448 labelled triangles against 9444 surviving
+        # ones, and indexing one with the other is an error that only shows up
+        # on the stages where something actually collapsed.
+        sv, sf, export_welded, _kept = mfg._weld_with_face_map(sv, sf)
+        stage_labels = stage_labels[_kept]
         post_weld = cg.manifold_report(sf)
+
+        # WHAT WOULD A READER DO IF WE DID NOT WELD? The control for the whole
+        # serialisation argument: without it the chain cannot tell "our weld
+        # created this" from "any reader would have".
+        #
+        # GATED, AND NOT BECAUSE IT IS UNIMPORTANT. Benchmarked on a
+        # 203,522-face mesh - the real cast base is 190,036 - the write, parse,
+        # weld and two reports cost 0.90s PER STAGE, so a 31-stage plan paid
+        # ~28s of forensics on top of a 4.2s export, and /export/final paid it
+        # again. It answers a question that only arises when something is
+        # wrong, so it runs when something is wrong. Wrapped, because a
+        # diagnostic must never be the thing that fails an export: compare the
+        # interproximal block above.
+        unwelded_probe = {"ran": False,
+                          "reason": "no non-manifold edge after the export weld"}
+        if post_weld["nonmanifold_edges"] or pre_weld["nonmanifold_edges"]:
+            try:
+                _pb = cg.write_binary_stl_bytes(_pre_weld_v, sf_pre_weld)
+                _ppv, _ppf = stl_io.parse_stl_bytes(_pb)
+                _praw = cg.manifold_report(_ppf)
+                _pwv, _pwf, _pmerged = cg.weld_vertices(_ppv, _ppf)
+                _pw = cg.manifold_report(_pwf)
+                unwelded_probe = {
+                    "ran": True,
+                    "written_unwelded_faces": int(len(sf_pre_weld)),
+                    "reread_open": int(_praw["open_edges"]),
+                    "reread_nonmanifold": int(_praw["nonmanifold_edges"]),
+                    "reader_weld_merged": int(_pmerged),
+                    "after_reader_weld_open": int(_pw["open_edges"]),
+                    "after_reader_weld_nonmanifold": int(_pw["nonmanifold_edges"])}
+            except Exception as e:                        # noqa: BLE001
+                unwelded_probe = {"ran": False,
+                                  "reason": f"{type(e).__name__}: {e}"}
 
         # A RECORDED REPAIR RUNG, not a silent one. A grazing CSG contact at
         # the cervical margin leaves one or two very short edges carrying four
@@ -2807,15 +3025,206 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             better = (after["nonmanifold_edges"] == 0
                       and after["open_edges"] == 0
                       and cg._winding_is_consistent(cf2))
-            nm_repair = {"attempted": True, "kept": bool(better), **rinfo,
+            rinfo_json = {kk: vv for kk, vv in rinfo.items()
+                          if kk != "kept_faces"}
+            nm_repair = {"attempted": True, "kept": bool(better), **rinfo_json,
                          "nonmanifold_before": int(post_weld["nonmanifold_edges"]),
                          "nonmanifold_after": int(after["nonmanifold_edges"]),
                          "open_after": int(after["open_edges"])}
             if better:
                 sv, sf = cv2, cf2
+                stage_labels = stage_labels[rinfo["kept_faces"]]
                 post_weld = after
 
+        # === EVERY REQUIRED MEASUREMENT, ON THE MODEL THAT WAS WRITTEN =====
+        #
+        # These used to be functions with tests and no caller. A metric that is
+        # tested and not integrated proves the arithmetic and gates nothing, so
+        # each one is computed here, recorded per stage, and read by
+        # mfg.aggregate_print_gate - which fails on a MISSING measurement
+        # exactly as it fails on a bad one.
+        t_metrics0 = time.perf_counter()
+
+        # THE ALLOWED RECONSTRUCTION ENVELOPE. Geodesic, not a box: a
+        # rectangular XYZ region around a rim on a curved arch sweeps in the
+        # neighbouring teeth and the gingiva on the far side of the ridge. It
+        # is the union, over every moved tooth, of the cast surface within
+        # roi_radius_mm of the TARGET rim and of the T0 rim - target site and
+        # old site, which are the only two places this pipeline is allowed to
+        # change the cast.
+        env_pts = []
+        for t in teeth:
+            rim0_ = v[np.asarray(t["rec"]["socket_rim"], np.int64)]
+            env_pts.append(rim0_)
+            env_pts.append(cg.apply_matrix(rim0_, stage_matrices[t["tid"]]))
+        env_pts = np.vstack(env_pts) if env_pts else np.zeros((0, 3))
+        env_radius = (mfg.DEFAULT_POLICY.roi_radius_mm
+                      + mfg.DEFAULT_POLICY.seat_bottom_outset_mm)
+
+        # The cast, as it survives in the finished model. Provenance is what
+        # makes this exact: only triangles that came from the cast are
+        # compared with the cast, so a crown 2mm above the gingiva cannot be
+        # mistaken for the gingiva having moved.
+        cast_mask = np.isin(stage_labels, ["ORIGINAL_CAST", "OLD_SOCKET_REPAIR"])
+        cast_f = sf[cast_mask]
+        ov_, of_ = original_cast
+        fidelity = {"measured": False, "reason": "no cast surface survived"}
+        roi_compliance = {"compliant": False, "reason": "not measured"}
+        if len(cast_f):
+            keep_v = np.unique(cast_f)
+            cast_pts = sv[keep_v]
+            d_env = (cKDTree(env_pts).query(cast_pts, workers=-1)[0]
+                     if len(env_pts) else np.full(len(cast_pts), 1e9))
+            outside = d_env > env_radius
+            # TWO-SIDED, because one direction cannot see the other's holes:
+            # original -> final misses material that was ADDED, final ->
+            # original misses material that was REMOVED.
+            f2o = mfg.surface_deviation(ov_, of_, sv, cast_f,
+                                        exclude_pts=env_pts,
+                                        exclude_radius_mm=env_radius)
+            o2f = mfg.surface_deviation(sv, cast_f, ov_, of_,
+                                        exclude_pts=env_pts,
+                                        exclude_radius_mm=env_radius)
+            fidelity = {"measured": True,
+                        "envelope_radius_mm": round(float(env_radius), 4),
+                        "final_to_original": f2o,
+                        "original_to_final": o2f}
+
+            # ROI COMPLIANCE. Every cast point that MOVED must be inside the
+            # envelope. Measured by triangle-surface distance, never by vertex
+            # index: a boolean retessellates, so index equality would fail on
+            # a perfect result and pass on a resampled bad one.
+            moved_d = mfg._point_to_surface(cast_pts, ov_, of_)
+            moved = moved_d > mfg.DEFAULT_POLICY.max_unaffected_deviation_mm
+            viol = moved & outside
+            tri_ok = np.isin(cast_f, keep_v[viol]).any(axis=1)
+            viol_area = float(mfg._face_areas(sv, cast_f[tri_ok]).sum())
+            roi_compliance = {
+                "compliant": bool(not viol.any()),
+                "cast_points_compared": int(len(cast_pts)),
+                "points_outside_envelope": int(outside.sum()),
+                "modified_points": int(moved.sum()),
+                "modified_points_outside_envelope": int(viol.sum()),
+                "outside_envelope_area_mm2": round(viol_area, 4),
+                "worst_outside_deviation_mm": round(
+                    float(moved_d[outside].max()) if outside.any() else 0.0, 6),
+                "envelope_definition": "surface neighbourhood of the T0 rim and "
+                                       "the target rim, roi_radius + "
+                                       "seat_bottom_outset",
+            }
+
+        exposure = mfg.synthetic_exposure(sv, sf, stage_labels)
+
+        # VOLUMES, SEPARATED. One total tells a lab nothing about where the
+        # material came from; these say exactly how much cast there was, how
+        # much the clearance took out, how much the connectors and the crowns
+        # put back, and how much of that was already shared.
+        volumes = {
+            "original_cast_mm3": round(float(base_solid.volume()), 4),
+            "cast_after_local_clearance_mm3": round(float(prepared.volume()), 4),
+            "local_clearance_removed_mm3":
+                clearance_report["removed_volume_mm3"] or 0.0,
+            "connector_total_mm3": round(float(sum(
+                r.get("connector_volume_mm3") or 0.0 for r in interfaces)), 4),
+            "crown_total_mm3": round(float(sum(
+                float(crown_solids[t["tid"]].volume()) for t in teeth)), 4),
+            "crown_cast_overlap_mm3": round(float(sum(
+                r.get("overlap_crown_cast_mm3") or 0.0 for r in interfaces)), 4),
+            "connector_cast_overlap_mm3": round(float(sum(
+                r.get("overlap_seat_cast_mm3") or 0.0 for r in interfaces)), 4),
+            "fused_mm3": round(float(solid.volume()), 4),
+        }
+
+        for row in interfaces:
+            tid = row["tooth_id"]
+            rec = next(t["rec"] for t in teeth if t["tid"] == tid)
+            M_ = stage_matrices[tid]
+            rim0_ = v[np.asarray(rec["socket_rim"], np.int64)]
+            rim_k_ = cg.apply_matrix(rim0_, M_)
+            u_k = M_[:3, :3] @ np.asarray(rec["frame"]["u_oa"], float)
+            u_k = u_k / (np.linalg.norm(u_k) or 1.0)
+            try:
+                row["transition"] = mfg.transition_quality(sv, sf, rim_k_, u_k)
+            except Exception as e:                       # noqa: BLE001
+                row["transition"] = {"error": f"{type(e).__name__}: {e}"}
+            try:
+                row["old_site"] = mfg.old_site_quality(
+                    ov_, of_, sv, cast_f if len(cast_f) else sf, rim0_,
+                    u_oa=np.asarray(rec["frame"]["u_oa"], float))
+            except Exception as e:                       # noqa: BLE001
+                row["old_site"] = {"measured": False,
+                                   "reason": f"{type(e).__name__}: {e}"}
+            row["rigidity"] = mfg.rigidity_report(
+                rec["cv"], cg.apply_matrix(rec["cv"], M_), rec["cf"],
+                matrix=M_)
+
+        # ADJACENT RECONSTRUCTIONS, MEASURED. The old check compared the
+        # gingival bridge with `2 * fusion_overlap_mm` - a nominal number that
+        # describes no geometry that was built. What actually threatens the
+        # bridge is how much of it the two CONNECTORS occupy, so that is what
+        # is measured: the clear gap left between the two reconstruction
+        # solids, against the bridge that was there before them.
+        adjacent = []
+        for i_ in range(len(teeth)):
+            for j_ in range(i_ + 1, len(teeth)):
+                ti_, tj_ = teeth[i_]["tid"], teeth[j_]["tid"]
+                ri_ = cg.apply_matrix(
+                    v[np.asarray(teeth[i_]["rec"]["socket_rim"], np.int64)],
+                    stage_matrices[ti_])
+                rj_ = cg.apply_matrix(
+                    v[np.asarray(teeth[j_]["rec"]["socket_rim"], np.int64)],
+                    stage_matrices[tj_])
+                bridge = mfg.bridge_between(ri_, rj_)
+                gi, gj = connector_pts.get(ti_), connector_pts.get(tj_)
+                if gi is None or gj is None or bridge <= 1e-9:
+                    adjacent.append({"teeth": [ti_, tj_],
+                                     "bridge_mm": round(float(bridge), 4),
+                                     "ok": True,
+                                     "note": "no reconstruction geometry to compare"})
+                    continue
+                gap = float(cKDTree(gj).query(gi, workers=-1)[0].min())
+                consumed = max(0.0, bridge - gap)
+                frac = consumed / bridge
+                adjacent.append({
+                    "teeth": [ti_, tj_],
+                    "bridge_mm": round(float(bridge), 4),
+                    "clear_gap_between_reconstructions_mm": round(gap, 4),
+                    "consumed_mm": round(consumed, 4),
+                    "consumed_fraction": round(frac, 4),
+                    "max_fraction": mfg.DEFAULT_POLICY.max_bridge_removal_fraction,
+                    "ok": bool(frac <= mfg.DEFAULT_POLICY.max_bridge_removal_fraction),
+                    "measure": "minimum distance between the two connector solids, "
+                               "not 2 * fusion_overlap_mm"})
+
+        # THE STAGE'S PRESCRIPTION IS ITS OWN SHARE OF THE COMMITTED ONE, and
+        # the final stage IS the committed one. Checked rather than assumed,
+        # because a staging bug would otherwise reach the lab as geometry.
+        clin_bad = []
+        for t in teeth:
+            want = {kk: float(vv) * k / total
+                    for kk, vv in t["clinical"].items()}
+            got = _stage_clinical(t["clinical"], k, total)
+            for kk in want:
+                if abs(float(got.get(kk, 0.0)) - want[kk]) > 1e-9:
+                    clin_bad.append({"tooth_id": t["tid"], "field": kk,
+                                     "expected": want[kk],
+                                     "got": float(got.get(kk, 0.0))})
+
+        t_metrics += time.perf_counter() - t_metrics0
+
         blob = cg.write_binary_stl_bytes(sv, sf)
+
+        edge_forensics = {"ran": False, "reason": "no offending edge"}
+        if post_weld["nonmanifold_edges"] or post_weld["open_edges"]:
+            try:
+                edge_forensics = mfg.serialisation_forensics(
+                    _pre_weld_v, sf_pre_weld, stage_labels, limit=8,
+                    write=cg.write_binary_stl_bytes,
+                    read=stl_io.parse_stl_bytes)
+                edge_forensics["ran"] = True
+            except Exception as e:                        # noqa: BLE001
+                edge_forensics = {"ran": False,
+                                  "reason": f"{type(e).__name__}: {e}"}
 
         # WHAT IS ASSERTED, AND WHAT IS ONLY REPORTED — the distinction matters
         # and is not the one /export uses.
@@ -2906,8 +3315,13 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             # Everything the brief's amendment 16 asks to record. The ROI is a
             # geodesic surface region; the bboxes beside it are DIAGNOSTICS.
             "interfaces": interfaces,
-            "interface_total_cavity_volume_mm3": round(sum(
-                i.get("cavity_volume_mm3") or 0.0 for i in interfaces), 4),
+            # WHAT WAS ACTUALLY REMOVED FROM THE CAST, measured as the volume
+            # difference the subtraction made. Reporting the tool's own volume
+            # here told a lab 85.16mm3 of cast had been excavated on a stage
+            # where nothing was cut at all.
+            "interface_total_cavity_volume_mm3":
+                clearance_report["removed_volume_mm3"] or 0.0,
+            "clearance": clearance_report,
             "interface_total_ramp_volume_mm3": round(sum(
                 i.get("ramp_volume_mm3") or 0.0 for i in interfaces), 4),
             "interface_total_affected_faces": int(sum(
@@ -2925,6 +3339,14 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             "export_weld_merged_vertices": int(export_welded),
             "nonmanifold_edge_repair": nm_repair,
             "unwelded_serialisation_probe": unwelded_probe,
+            # THE OFFENDING EDGES THEMSELVES, not just how many. Edge id,
+            # endpoint coordinates, length, every incident face with its area,
+            # its normal and the geometry it came from, at each point of the
+            # chain. Computed only when there is something to explain - the
+            # dissection is cheap, but writing and rereading the STL a second
+            # time is not.
+            "edge_forensics": edge_forensics,
+            "self_touch": touch,
             "edges_post_read_and_reader_weld": {
                 "open": int(validation["open_edges"]),
                 "nonmanifold": int(validation["nonmanifold_edges"])},
@@ -2932,6 +3354,15 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                 validation["reader_weld_merged_vertices"]),
 
             # --- the verdict, from the written bytes -----------------------
+            # --- every integrated manufacturing measurement ---------------
+            "synthetic_exposure": exposure,
+            "cast_fidelity": fidelity,
+            "roi_compliance": roi_compliance,
+            "adjacent_bridges": adjacent,
+            "clinical_consistent": not clin_bad,
+            "clinical_consistency_detail": clin_bad or None,
+            "volumes_mm3": volumes,
+
             "stl_validation": validation,
             # manifold3d's own account of the solid, recorded after the last
             # boolean. It answers a DIFFERENT question from the STL gates -
@@ -2939,8 +3370,10 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             # verdict below requires both.
             "manifold_status": mstat,
             "manifold_bodies": int(n_bodies),
-            "print_ready": bool(validation["print_ready"]
-                                and mstat.get("single_positive_body")),
+            # NARROW verdict from the file alone. The aggregate gate below is
+            # the only thing entitled to say a stage may be manufactured.
+            "passes_boolean_topology_regression": bool(
+                validation["print_ready"] and mstat.get("single_positive_body")),
             "occlusal_interference": interference,
             "occlusal_warning": ANTAGONIST_WARNING if interference else None,
             # YELLOW, not red, and deliberately: closing an embrasure is often
@@ -2967,6 +3400,15 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                        "clinical": _stage_clinical(t["clinical"], k, total)}
                       for t in teeth],
         })
+
+        # === THE AGGREGATE MANUFACTURING GATE =============================
+        # The ONLY thing in this codebase entitled to say PRINT READY. It is a
+        # pure function of the record just built, so a measurement that was
+        # never taken fails it exactly as a bad one does.
+        gate = mfg.aggregate_print_gate(stage_meta[-1])
+        stage_meta[-1]["manufacturing_gate"] = gate
+        stage_meta[-1]["print_ready"] = bool(gate["print_ready"])
+        stage_meta[-1]["verdict"] = gate["verdict"]
 
     manifest = {
         "generator": "Clinical Micro-Planner",
@@ -2995,7 +3437,22 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                    "binds_the_case": t["staging"]["stages_required"] == total,
                    "root_length_mm": t["rec"].get("root_length_mm")} for t in teeth],
         "stage_files": stage_meta,
+        # WHERE THE TIME GOES, per phase, measured rather than assumed. No
+        # premature optimisation: these are recorded so a future change has a
+        # baseline to beat, and so a lab waiting on an export can be told
+        # honestly what it is waiting for.
         "union_seconds": round(t_union, 2),
+        "phase_seconds": {
+            "cast_build": round(t_cast, 3),
+            "local_interfaces": round(t_iface, 3),
+            "boolean_union": round(t_union, 3),
+            "quality_metrics": round(t_metrics, 3),
+            "interproximal": round(t_ipr, 3),
+            "antagonist_collision": round(t_collide, 3),
+            "total_bundle": round(time.perf_counter() - t_bundle0, 3),
+            "stages": total,
+            "teeth": len(teeth),
+        },
         # Case-level occlusion summary. `checked` false means the opposing arch
         # was never loaded — which is NOT the same as "no interference", and the
         # manifest says so rather than leaving a lab to assume clearance.
@@ -3050,7 +3507,22 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
     _record(sid, audit.EXPORTED, arch=arch,
             detail=f"{total} staged manufacturing models",
             values={"stages": int(total), "teeth": len(teeth),
-                    "union_seconds": round(t_union, 2),
+                    # WHERE THE TIME GOES, per phase, measured rather than assumed. No
+        # premature optimisation: these are recorded so a future change has a
+        # baseline to beat, and so a lab waiting on an export can be told
+        # honestly what it is waiting for.
+        "union_seconds": round(t_union, 2),
+        "phase_seconds": {
+            "cast_build": round(t_cast, 3),
+            "local_interfaces": round(t_iface, 3),
+            "boolean_union": round(t_union, 3),
+            "quality_metrics": round(t_metrics, 3),
+            "interproximal": round(t_ipr, 3),
+            "antagonist_collision": round(t_collide, 3),
+            "total_bundle": round(time.perf_counter() - t_bundle0, 3),
+            "stages": total,
+            "teeth": len(teeth),
+        },
                     "interproximal_seconds": round(t_ipr, 2),
                     "collision_seconds": round(t_collide, 2),
                     "stages_yellow": len([s for s in stage_meta
@@ -3163,13 +3635,22 @@ def export_final(sid: str, req: FinalExportRequest):
             "error": f"Stage {wanted} does not exist in this plan.",
             "available_stages": [s["stage"] for s in stages]}))
 
-    # Belt and braces. build_stage_bundle already refused anything that failed,
-    # so reaching here with print_ready False would mean the gate itself broke.
-    if not chosen.get("print_ready"):
+    # THE AGGREGATE GATE DECIDES, and nothing else may. `build_stage_bundle`
+    # enforces the boolean/topology gate; this is where the rest of the list -
+    # transition quality, interface continuity, old-site quality, two-sided
+    # cast fidelity, ROI compliance, synthetic exposure, crown rigidity,
+    # gingival bridge, clinical consistency - has to hold before a file is
+    # handed over as ready to manufacture.
+    gate = chosen.get("manufacturing_gate") or {}
+    if not gate.get("print_ready"):
         raise HTTPException(422, _jsonable({
             "error": f"Stage {wanted} is NOT PRINT READY.",
-            "failed_gates": chosen["stl_validation"]["failed_gates"],
-            "gates": chosen["stl_validation"]["gates"]}))
+            "failed_gates": gate.get("failed_gates"),
+            "gates": gate.get("gates"),
+            "boolean_topology_gate": chosen["stl_validation"]["failed_gates"],
+            "detail": "The written file may still pass the narrower "
+                      "boolean/topology regression; the aggregate "
+                      "manufacturing gate is what this endpoint enforces."}))
 
     blob = bundle["blobs"][chosen["file"]]
     name = f"{manifest['arch']}_Stage_{wanted:02d}_FINAL.stl"
@@ -3181,23 +3662,21 @@ def export_final(sid: str, req: FinalExportRequest):
         "stage": wanted,
         "of_stages": manifest.get("stages"),
         "file": name,
-        "print_ready": True,
-        # NOT "PRINT READY". This endpoint enforces the boolean/topology gate
-        # on the written bytes plus the single-body Manifold check; the
-        # aggregate manufacturing verdict also requires transition quality,
-        # interface continuity, old-site quality, two-sided cast fidelity, ROI
-        # compliance and seat/ramp exposure, which are not yet evaluated here.
-        # Claiming the stronger verdict on the weaker evidence is exactly the
-        # kind of over-statement this codebase refuses elsewhere.
-        "verdict": "PASSES BOOLEAN/TOPOLOGY REGRESSION",
-        "verdict_scope": chosen["stl_validation"].get("gate_scope"),
+        # EARNED, not asserted. This is the aggregate gate's own answer, and
+        # the endpoint above refuses the export when it is False.
+        "print_ready": bool(gate.get("print_ready")),
+        "verdict": gate.get("verdict"),
+        "verdict_scope": gate.get("gate_scope"),
+        "boolean_topology_verdict": chosen["stl_validation"].get("verdict"),
         # The exact wording matters. This is an engineering statement about
         # geometry, not a clinical one about a patient.
         "verdict_meaning": (
-            "Boolean and topology gates passed on the actual written STL "
-            "after a downstream reader's weld, plus one positive-volume "
-            "manifold body. This is NOT a claim of clinical validation and "
-            "NOT the aggregate manufacturing verdict - see verdict_scope."),
+            "Every gate in `manufacturing_gate` passed, measured on the "
+            "actual written STL after a downstream reader's weld and on the "
+            "reconstruction that produced it. This is NOT a claim of clinical "
+            "validation, and NO REAL DE-IDENTIFIED SCAN has been run through "
+            "this gate - every number behind it is synthetic."),
+        "manufacturing_gate": gate,
         "validation": chosen["stl_validation"],
         "interfaces": chosen.get("interfaces"),
         "volume_mm3": chosen.get("volume_mm3"),
@@ -3228,13 +3707,14 @@ def export_final(sid: str, req: FinalExportRequest):
     _record(sid, audit.EXPORTED, arch=manifest["arch"],
             detail=f"final print STL, stage {wanted}",
             values={"stage": int(wanted), "triangles": int(chosen["triangles"]),
-                    "print_ready": True})
+                    "print_ready": bool(gate.get("print_ready"))})
 
     return StreamingResponse(
         buf, media_type="application/zip",
         headers={"Content-Disposition":
                      f'attachment; filename="{manifest["arch"]}_Stage_{wanted:02d}_FINAL.zip"',
-                 "X-Print-Ready": "true",
+                 "X-Print-Ready": ("true" if gate.get("print_ready")
+                                   else "false"),
                  "X-Stage": str(wanted),
                  "X-Open-Edges": str(chosen["stl_validation"]["open_edges"]),
                  "X-Nonmanifold-Edges": str(chosen["stl_validation"]["nonmanifold_edges"]),

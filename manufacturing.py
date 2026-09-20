@@ -62,9 +62,15 @@ class InterfacePolicy:
     should stop and say so", not "how deep is a tooth".
     """
 
-    # Where the adaptive search STARTS when the crown does not penetrate at
-    # all. A tooth sitting exactly on the surface still needs a seat cut for
-    # the union to have common volume.
+    # Where the collar's upper ring STARTS, above the transformed cervical
+    # rim, before it is marched out to a measured clearance from the cast and
+    # the crown. It is a starting point for a search, never an anatomical
+    # claim: the ring ends wherever the measured signed distances put it, and
+    # `collar_top_rise_max_mm` reports how far that was.
+    emergence_height_mm: float = 0.30
+
+    # RETIRED as construction geometry, kept so an old manifest still parses.
+    # It was the depth of the generic socket cup the interface no longer cuts.
     emergence_depth_mm: float = 1.5
 
     # Hard ceiling on how far the cavity may descend. A real cervical seat is
@@ -96,18 +102,33 @@ class InterfacePolicy:
     # took the reader-weld count from 31 to 0 on the stages it was measured on.
     cavity_outset_mm: float = 0.15
 
-    # Carry the cut above the gingival surface so the subtract is not coplanar
-    # with it. Part of the SAME cup solid, not a second tool - two tools
-    # sharing a wall reintroduce the coincidence being removed.
+    # RETIRED with the socket cup. The clearance tool is the transformed
+    # crown dilated by `clearance_mm`, so there is no separate cut to raise.
     cavity_raise_mm: float = 0.30
 
-    # The seat is a truncated cone: narrow at the top where it must sit inside
-    # the crown, wide at the bottom where it must reach past the cavity wall
-    # into cast material. Neither face may coincide with a crown or cavity
-    # surface, which is why both offsets are non-zero.
+    # The collar is a truncated cone. `seat_bottom_outset_mm` is how far
+    # OUTWARD of the rim its lower ring is seeded before being dropped onto the
+    # cast; `seat_depth_mm` caps how far below that landing it may march to
+    # reach `clearance_mm` of real cast material. The upper ring has no fixed
+    # offset any more - it is solved against the measured signed distance to
+    # the crown and the cast, which is what stopped the connector crossing
+    # either of them at a crease.
+    #
+    # RETIRED: the upper ring used to be inset into the crown by this much,
+    # which put its wall's exit from the crown 0.089mm above the cervical
+    # crease and was the direct cause of the CROWN/SEAT self-touches.
     seat_top_inset_mm: float = 0.15
     seat_bottom_outset_mm: float = 1.20
     seat_depth_mm: float = 1.20
+
+    # REPORTING THRESHOLD, not a gate. The connector's wall and the cast's
+    # surface should MEET rather than run alongside each other - two
+    # nearly-parallel surfaces meeting is a tangency - and
+    # `collar_wall_shallow_points` counts how many ring points are below this
+    # angle. Correcting them by marching deeper was tried and made things
+    # worse (see the note in build_stage_tooth_interface); what fixed the
+    # tangency was the seat depth.
+    min_crossing_angle_deg: float = 20.0
 
     # Never remove more than this fraction of the locally measured cast
     # thickness. The cast is a shell over a flat-bottomed base; cutting
@@ -121,6 +142,21 @@ class InterfacePolicy:
     # Two adjacent reconstructions may not consume more than this fraction of
     # the gingival bridge between them.
     max_bridge_removal_fraction: float = 0.50
+
+    # How much of the finished model's outside surface may be geometry the
+    # software invented. A cervical emergence profile is legitimate and
+    # visible; a skirt around every tooth is not.
+    max_exposed_synthetic_fraction: float = 0.15
+
+    # Outside the allowed reconstruction envelope the cast must be the cast.
+    # 0.05mm is the scanner's own resolution band (20-50 microns), so anything
+    # under it is not a deformation anyone could have measured.
+    max_unaffected_deviation_mm: float = 0.05
+
+    # The site the tooth LEFT. A crater or a tower past this is a new defect,
+    # not a restoration.
+    max_old_site_defect_mm: float = 1.00
+    max_old_site_step_mm: float = 0.50
 
     # How far the cervical rim may lift clear of the cast and still be
     # reconstructable locally. Separation is NOT a refusal in itself - an
@@ -440,10 +476,16 @@ class InterfaceResult:
     ok: bool
     refusal_reason: str | None = None
 
-    cavity_verts: np.ndarray | None = None
-    cavity_faces: np.ndarray | None = None
-    ramp_verts: np.ndarray | None = None
-    ramp_faces: np.ndarray | None = None
+    # NO CAVITY OR RAMP ARRAYS. The clearance tool is an EXACT dilation of the
+    # transformed crown, which is a Minkowski sum and therefore belongs to the
+    # CSG engine rather than to an array offset: measured on a real crown, a
+    # 0.05mm vertex-normal offset gives 46.86mm3 against the true 49.84mm3 and
+    # can fold wherever the offset exceeds the local medial-axis distance -
+    # the failure CLAUDE.md section 8 tabulated for normal offsets, and which
+    # showed up here as a LOCAL_CLEARANCE self-touch in the fused stage. This
+    # builder decides WHETHER to cut and measures by how much; the caller,
+    # which holds the crown Manifold, builds the tool. The emergence ramp is
+    # no longer a separate solid at all - it is one face of the connector.
     # The bounded fusion seat. NOT part of the crown - the crown stays a rigid
     # transform of T0 and is measured as such.
     seat_verts: np.ndarray | None = None
@@ -488,17 +530,34 @@ def _loop_order(rim):
     return np.arange(len(rim))
 
 
-def _loft(loop_a, loop_b):
+def _loft(loop_a, loop_b, axis=None):
     """Closed solid between two same-length ordered loops.
 
-    Side wall plus a fan cap at each end. Both caps use their own loop's
-    centroid, so the solid is closed by construction and the only way it can
-    be non-manifold is if a loop passes through itself - which the caller
-    checks with is_edge_manifold_closed rather than trusting.
+    Side wall plus a fan cap at each end. The solid is closed by construction
+    and the only way it can be non-manifold is if a loop passes through
+    itself - which the caller checks with is_edge_manifold_closed rather than
+    trusting.
+
+    THE CAPS ARE CONES WHEN AN AXIS IS GIVEN, and that is not cosmetic. A fan
+    to the loop's own CENTROID is a dished surface whenever the loop is
+    non-planar, and the connector's upper ring is deliberately non-planar -
+    each point rises only as far as its own local cast surface requires, which
+    measured 0.30mm at some points and 1.96mm at others on one tipped tooth.
+    The dish then sagged BELOW the cervical crease the collar exists to
+    enclose, leaving 3 of 46 crease points outside it however far the wall was
+    pushed sideways, and that is exactly where the last self-touch sat. Lifting
+    each apex past the furthest point of its own ring makes the cap a cone
+    that cannot sag into the solid.
     """
     n = len(loop_a)
-    verts = np.vstack([loop_a, loop_b,
-                       loop_a.mean(axis=0)[None, :], loop_b.mean(axis=0)[None, :]])
+    ca_pt = loop_a.mean(axis=0)
+    cb_pt = loop_b.mean(axis=0)
+    if axis is not None:
+        u = np.asarray(axis, float)
+        u = u / (np.linalg.norm(u) or 1.0)
+        ca_pt = ca_pt + u * max(0.0, float(((loop_a - ca_pt) @ u).max()))
+        cb_pt = cb_pt - u * max(0.0, float((-(loop_b - cb_pt) @ u).max()))
+    verts = np.vstack([loop_a, loop_b, ca_pt[None, :], cb_pt[None, :]])
     ca, cb = 2 * n, 2 * n + 1
     faces = []
     for i in range(n):
@@ -517,6 +576,7 @@ def build_stage_tooth_interface(
     stage_matrix,
     policy: InterfacePolicy | None = None,
     probe: CastProbe | None = None,
+    neighbour_rims=None,
 ):
     """The local target-position interface for ONE tooth at ONE stage.
 
@@ -632,287 +692,568 @@ def build_stage_tooth_interface(
         return InterfaceResult(False, "interface_unbuildable_wall_too_thin",
                                diagnostics=diag)
 
-    # === THE CUTTER IS THE CROWN ITSELF ===================================
+    # === WHAT ACTUALLY CREATES THE BAD TOPOLOGY, MEASURED =================
     #
-    # Where material must come out, it comes out where the crown ACTUALLY IS -
-    # not from a synthetic socket of some chosen depth. `cast - crown` removes
-    # exactly the volume the crown occupies and not one cubic millimetre more,
-    # which is what "remove only the necessary local cast material" means, and
-    # it cannot over-cut a thin wall or reach below the tooth.
+    # The fused stage solid TOUCHES ITSELF. manifold3d records that as two
+    # vertices at an IDENTICAL float64 position under different indices, and
+    # the control says so unambiguously: a clean transversal union of two
+    # cubes, of two rotated cubes, of a cube and a sphere, and even of two
+    # cubes meeting FACE TO FACE all produce zero coincident positions, while
+    # two cubes meeting along an EDGE - a genuinely self-touching solid -
+    # produce exactly one coincident pair and one non-manifold edge. So a
+    # coincident position in manifold3d's output is not a run boundary or a
+    # tolerance artefact. It is a self-touch.
     #
-    # The caller supplies the transformed crown Manifold it already holds, so
-    # nothing is rebuilt here. `cavity_verts` stays None: there is no separate
-    # socket solid any more.
+    # WHERE the solid touched itself, measured with per-triangle provenance
+    # (`Manifold.as_original` + `run_original_id`) on the failing cases: every
+    # touch sat on a CREASE. On extrusion 0.25mm stage 1, all six touches read
+    # distance-to-rim 0.08889 and distance-to-nearest-cast-vertex 0.17222 - the
+    # SAME two numbers to five decimals - because they lie on the boundary edge
+    # of the cast's flat flush socket cap, at the midpoint of a rim edge. The
+    # rest sat on the crown's own cervical rim.
     #
-    # This also removes the last place an arbitrary depth could enter the
-    # manufacturing path.
-    # Outward radial direction about the rim's own centroid. Used by the ramp
-    # and the seat; previously defined beside the socket cup that is now gone.
+    # THE CAUSE IS THAT ALL THREE GEOMETRIES ARE BUILT FROM ONE LOOP. The
+    # crown is cut at `socket_rim`, the old site is capped at `socket_rim`, and
+    # the connector was lofted from `socket_rim` transformed - so the
+    # connector's wall crossed the cast and the crown exactly where each has a
+    # sharp edge. A surface crossing another surface AT ITS CREASE is a
+    # tangential contact, and that is what manifold3d answers with coincident
+    # vertices.
+    #
+    # It is also why "a small movement is worse than a large one" is FALSE.
+    # Measured across the whole extrusion sweep with seats and crowns fused,
+    # self-touch counts were 9/16/27 at 0.0mm, 7/18/34 at 0.25mm and 23/27/43
+    # at 1.2mm. The 1.2mm case passed only because every non-manifold edge it
+    # produced happened to be short enough for `collapse_short_nonmanifold_edges`
+    # to take. The defect is universal; the repair rung's success was not.
+    #
+    # === THE CONNECTOR IS A TRANSITION COLLAR THAT ENCLOSES THE CREASE =====
+    #
+    # So the connector is no longer a plug lofted from the rim into the crown.
+    # It is a bounded collar whose solid CONTAINS the crown's cervical crease,
+    # and whose own surface meets the crown and the cast only where both are
+    # smooth. Both rings are placed by MEASURED signed distance against the
+    # actual transformed crown and the actual cast - not by an offset chosen in
+    # advance:
+    #
+    #   upper ring  marched up along u_oa while it is inside the cast, and out
+    #               along the rim's own radial direction while it is inside the
+    #               crown, until it is at least `clearance_mm` clear of BOTH
+    #   lower ring  dropped onto the cast `seat_bottom_outset_mm` outward of the
+    #               rim, then marched down until it is at least `clearance_mm`
+    #               INSIDE the cast
+    #
+    # The radial direction is taken about the rim's own centroid, and the
+    # offsets are OUTWARD, which cannot fold a star-shaped loop - the failure
+    # mode CLAUDE.md section 8 measured for inward offsets.
+    #
+    # CASE A (penetrating), CASE B (separated) and CASE C (mixed) all use this
+    # one construction and need no partition, because both rings are solved PER
+    # RIM POINT against the real surfaces: a lifted sector's lower ring lands on
+    # tissue below it, a buried sector's lower ring marches down from a landing
+    # that is already inside, and the upper ring rises only as far as that
+    # point's own local cast surface requires.
     centre = rim_k.mean(axis=0)
     radial = rim_k - centre
     rnorm = np.linalg.norm(radial, axis=1, keepdims=True)
     inset_dir = np.divide(radial, np.where(rnorm < 1e-12, 1.0, rnorm))
 
-    # === CASE A: PENETRATION -> CROWN-DERIVED LOCAL CLEARANCE ============
+    # The crown's OWN exact signed distance. Built on the transformed crown, so
+    # "inside the crown" is measured against the tooth that is actually there.
+    crown_probe = CastProbe(crown_k, crown_faces)
+    margin = max(pol.clearance_mm, 1e-4)
+
+    # --- CASE A: crown-derived local clearance ----------------------------
     #
-    # THE TOOL IS THE CROWN DILATED, NOT THE CROWN. That distinction is the
-    # whole fix, and the previous pass got it wrong in the opposite direction.
-    # Cutting with the crown ITSELF is `(cast - crown) u crown`, an identity on
-    # geometry and not on topology: the cavity wall IS the crown's surface and
-    # the union lays that same surface back on top of itself, so manifold3d
-    # emits coincident-but-distinct vertices and a weld turns every one into a
-    # non-manifold edge. Measured across a 1.2mm extrusion, 0,11,5,9,5 with the
-    # crown-cut against 0,0,0,1,0 without. Removing the cut was right.
+    # Where the crown is genuinely inside the cast, cast material is removed -
+    # and the tool is derived from the ACTUAL TRANSFORMED CROWN, dilated by
+    # `clearance_mm` so the cavity wall stands that distance AWAY from the
+    # crown and no surface in the result is a copy of any other. Cutting with
+    # the crown itself would be `(cast - crown) u crown`, an identity on
+    # geometry and not on topology.
     #
-    # WHAT REMOVING IT LEFT BEHIND is the defect this now fixes. With no cut,
-    # a barely-moved crown sits almost exactly in its original socket, so its
-    # outer surface and the cast's gingival surface are THE SAME SCAN
-    # TRIANGLES a few microns apart over a long band. manifold3d unions them
-    # into a solid that TOUCHES ITSELF along that band - valid as an indexed
-    # mesh, and inexpressible in any position-based format. Measured on
-    # extrusion 0.25mm stage 2: the boolean output is clean (0 non-manifold
-    # edges), the written STL rereads with 40, and welding leaves 3. A small
-    # movement is WORSE than a large one for exactly this reason - at 1.2mm
-    # the crown is clear of the old socket wall and nothing grazes.
-    #
-    # Dilating the crown by `clearance_mm` before subtracting breaks the
-    # coincidence without reintroducing it: the cavity wall now stands that
-    # distance AWAY from the crown, so no surface in the result is a copy of
-    # any other. The crown itself is untouched and stays exactly a rigid
-    # transform of T0 - the tool is a separate solid built from it, and the
-    # rigidity test still measures the crown alone.
-    #
-    # The clearance is the SMALLEST that removes the coincidence, not a
-    # margin chosen for comfort: it has to exceed the scanner's own resolution
-    # (20-50 microns) so the two surfaces cannot be the same measurement, and
-    # `clearance_mm` is 0.05 for that reason. It is not a socket depth and
-    # cannot become one - the tool's extent is the crown's extent.
+    # IT IS EMITTED ONLY IF IT DOES NOT BREAK THE CAST, and that is a MEASURED
+    # guard rather than a preference: subtracting the dilated crown fragmented
+    # the cast into 4 bodies on extrusion 0.25mm stage 1, because the crown
+    # passes through the thin lip left between the old socket cap and the
+    # gingival wall. The caller measures `decompose()` on the prepared cast and
+    # reports `clearance_tool_emitted` with the reason it was withheld.
     needs_cut = mode in ("penetrating", "mixed")
     diag["cut_with_crown"] = False            # never the crown itself
     diag["clearance_measured"] = bool(needs_cut)
     diag["clearance_mm"] = float(pol.clearance_mm) if needs_cut else 0.0
+    diag["clearance_tool_emitted"] = False    # unconditional: absent != false
+    diag["clearance_tool_volume_mm3"] = None
+    diag["cavity_volume_mm3"] = None          # set by the caller if it cuts
     diag["depth_used_mm"] = round(float(penetration), 4) if needs_cut else 0.0
     diag["depth_wanted_mm"] = round(float(penetration), 4)
     diag["depth_clamped_by"] = None
-    cav_v = cav_f = None
+    diag["clearance_required"] = bool(needs_cut)
+    # `crown_signed` is already the exact signed distance of every crown vertex
+    # to the cast, computed above. Recomputing it here cost a second Open3D
+    # sweep over every crown vertex for an array that had not changed.
+    sd_crown_to_cast = crown_signed
+    diag["crown_min_signed_distance_mm"] = round(float(sd_crown_to_cast.min()), 4)
+    diag["crown_max_signed_distance_mm"] = round(float(sd_crown_to_cast.max()), 4)
+    # NEAR-COINCIDENT means |signed distance| < the band, and nothing else.
+    # The earlier `crown_points_in_graze_band` counted every vertex that was
+    # not deeply buried, which includes every vertex in free space: it read
+    # 113 of 127 where the near-coincident count was 29, and the conclusion
+    # drawn from it - that there is no buried region to hold the fusion - was
+    # an artefact of the metric.
+    band = max(pol.cavity_outset_mm, 1e-6)
+    near = np.abs(sd_crown_to_cast) < band
+    diag["clearance_band_mm"] = round(float(band), 4)
+    diag["near_coincident_fraction"] = round(float(near.mean()), 4)
+    diag["crown_points_near_coincident"] = int(near.sum())
+    diag["crown_points_deeply_buried"] = int((sd_crown_to_cast <= -band).sum())
+    diag["crown_points_clear_of_cast"] = int((sd_crown_to_cast >= band).sum())
     if needs_cut:
-        # CASE B (pure separation) never reaches here, so no generic socket is
-        # ever cut merely because the rim moved. CASE C (mixed) uses the same
-        # tool and needs no partition: a solid built from the crown removes
-        # material only where the crown actually is, so penetrating sectors get
-        # clearance and separated sectors are untouched by construction.
-        # THE OFFSET IS PER VERTEX, AND IT CHANGES SIGN WITH DEPTH. A uniform
-        # dilation was tried first and is too blunt: it removes the cast
-        # everywhere the crown is, INCLUDING the deep penetration that is the
-        # fusion. Measured, it fixed extrusion 0.25mm and broke five other
-        # cases into two bodies - the tooth and its bridge severed from a cast
-        # they no longer touched, with seat-to-cast overlap still reading 51
-        # to 67 mm3 against the pre-cut cast.
-        #
-        # So the tool is pushed OUT where the two surfaces graze and pulled IN
-        # where the crown is properly buried:
-        #
-        #   at the surface (sd = 0)      +clearance_mm   -> breaks the tangency
-        #   at depth (sd <= -band)       -fusion_overlap -> leaves real
-        #                                                   common volume
-        #
-        # blended linearly between, so there is no step for the boolean to
-        # resolve. Where the offset is negative the cavity wall lies INSIDE
-        # the crown and the union covers it, which is why that half cannot
-        # reintroduce a coincident surface either.
-        band = max(pol.cavity_outset_mm, 1e-6)
-        sd = probe.signed(crown_k)
-        w = np.clip(-sd / band, 0.0, 1.0)          # 0 at the surface, 1 deep
-        offset = pol.clearance_mm * (1.0 - w) - pol.fusion_overlap_mm * w
-        cav_f = np.asarray(crown_faces, np.int64)
-        tool_v = (np.asarray(crown_k, float)
-                  + cg.vertex_normals(crown_k, cav_f) * offset[:, None])
-
-        # MEASURED, NOT CUT - and the measurement is why. `graze` counts crown
-        # vertices whose distance to the cast is inside the band, i.e. whose
-        # surface is near-coincident with the cast's. On this fixture it reads
-        # 113 of 127, and 121 of 132 on the second tooth: the crown sits in
-        # ITS OWN FILLED SOCKET, so the crown's surface IS the cast's surface
-        # over almost its whole area and there is no deeply-buried region to
-        # keep the fusion alive. Subtracting this tool therefore clears the
-        # cast away from nearly the entire crown, and the union falls to TWO
-        # BODIES - measured, 8 of 18 matrix cases, with seat-to-cast overlap
-        # still reading 51-67mm3 against the PRE-cut cast, which is what made
-        # the severance confusing until the graze count was added.
-        #
-        # Both variants were built and measured: a uniform +0.05mm dilation,
-        # and this depth-modulated form that pulls the tool INSIDE the crown
-        # where it is buried. Both fix extrusion 0.25mm and both sever the
-        # tipping, rotation and buccolingual cases, because the modulation has
-        # almost nothing to hold on to.
-        #
-        # The tool is therefore NOT emitted. What is missing before it can be
-        # is a connector that is guaranteed to bite the POST-clearance cast -
-        # today `overlap_seat_cast_mm3` is measured against the original cast
-        # and cannot see the void the clearance creates. That is the next
-        # change, and inventing a bigger seat to paper over it would be the
-        # parameter sweep this work is explicitly not doing.
-        diag["clearance_tool_emitted"] = False
-        diag["clearance_band_mm"] = round(float(band), 4)
-        diag["crown_min_signed_distance_mm"] = round(float(sd.min()), 4)
-        diag["crown_max_signed_distance_mm"] = round(float(sd.max()), 4)
-        diag["near_coincident_fraction"] = round(
-            float((np.abs(sd) < band).mean()), 4)
-        diag["clearance_offset_min_mm"] = round(float(offset.min()), 4)
-        diag["clearance_offset_max_mm"] = round(float(offset.max()), 4)
-        diag["crown_points_in_graze_band"] = int((w < 1.0).sum())
-        diag["crown_points_deeply_buried"] = int((w >= 1.0).sum())
-        diag["clearance_tool_volume_mm3"] = round(
-            float(abs(cg.signed_volume(tool_v, cav_f))), 4)
         diag["crown_volume_mm3"] = round(
-            float(abs(cg.signed_volume(crown_k, cav_f))), 4)
-        cav_v = cav_f = None          # measured above; deliberately not cut
-    diag["cavity_volume_mm3"] = diag.get("clearance_tool_volume_mm3")
+            float(abs(cg.signed_volume(crown_k,
+                                       np.asarray(crown_faces, np.int64)))), 4)
 
-    # === ONE INTEGRATED TRANSITION VOLUME =================================
-    #
-    # The ramp and the seat used to be two separate solids. On a MIXED tooth -
-    # part of the rim buried, part lifted, which is what any tipping or bodily
-    # movement produces - they both existed around the same rim and OVERLAPPED
-    # EACH OTHER below the cervical margin. Four solids then met along one
-    # curve (cast, crown, ramp, seat) and the welded STL showed edges with four
-    # faces on them. Measured at stage 5: both remaining non-manifold edges sat
-    # 0.19-0.76mm from crown1, rim1, ramp1 AND seat1 simultaneously.
-    #
-    # They are now ONE loft. The top ring is a single curve buried inside the
-    # crown; the bottom ring is chosen PER POINT by that point's own
-    # relationship to the cast:
-    #
-    #   lifted  -> the landing on the cast surface   (an emergence bridge)
-    #   seated  -> down and out into the cast        (a fusion seat)
-    #
-    # A tooth that is lifted all the way round gets a pure bridge; one that is
-    # seated all the way round gets a pure seat; a tipped tooth gets a single
-    # continuous volume that is a bridge on one side and a seat on the other,
-    # with no seam between them and nothing overlapping anything else.
+    # === THE TRANSITION COLLAR ============================================
     lift = np.clip(rim_signed, 0.0, None)
     is_lifted = lift > pol.fusion_overlap_mm
     diag["rim_points_lifted"] = int(is_lifted.sum())
     diag["rim_points_seated"] = int((~is_lifted).sum())
 
-    # Bottom ring, seated default: down along the axis and out into the cast.
-    bottom = (rim_k + inset_dir * pol.seat_bottom_outset_mm
-              - u_oa_k * pol.seat_depth_mm)
+    # --- upper ring -------------------------------------------------------
+    STEP = 0.04
+    reach = float(pol.max_reconstruction_depth_mm)
+    # THE COLLAR RISES AS FAR AS THE TOOTH HAS LIFTED, because that is the
+    # height the tissue actually has to climb. With a fixed 0.30mm start the
+    # upper ring stayed just above the cervical margin while the rim had
+    # risen 0.6mm, so the whole emergence was compressed into the wall below
+    # it: measured by `transition_quality` on a 0.6mm extrusion, 0.771mm of a
+    # 0.946mm fall landed in ONE 0.25mm ring - 82% of it - which is the
+    # "abrupt ring / vertical wall" the brief asks to reject, and the gate
+    # rejected it. Rising with the lift spreads the same fall across the
+    # crown's own flare instead of inventing a shelf to stand on.
+    top = rim_k + u_oa_k * np.maximum(pol.emergence_height_mm, lift)[:, None]
+    up = np.zeros(len(top))
+    out = np.zeros(len(top))
+    for _ in range(int(reach / STEP) + 4):
+        sc = probe.signed(top)
+        sk = crown_probe.signed(top)
+        need_up = (sc < margin) & (up < reach)
+        need_out = (sk < margin) & (out < reach)
+        if not (need_up | need_out).any():
+            break
+        du = np.where(need_up, STEP, 0.0)
+        do = np.where(need_out, STEP, 0.0)
+        top = top + u_oa_k * du[:, None] + inset_dir * do[:, None]
+        up += du
+        out += do
+    # THE UPPER RING MUST CLEAR THE WHOLE RIM NEAR IT, not only its own point.
+    # `top[i] = rim[i] + rise[i]` makes the ring follow the cervical scallop,
+    # so where the margin falls away the NEIGHBOURING ring point sits BELOW
+    # the rim point beside it - measured on a tipped tooth, top[k] was 0.078mm
+    # under rim[i], the collar's upper boundary passed through the rim's own
+    # neighbourhood, and the two crease points left unenclosed were inside by
+    # only 0.025mm and 0.014mm. A running maximum over a small angular window
+    # fills those local dips and leaves the ring low wherever the rim is
+    # genuinely low, so the collar does not become a tower to fix a notch.
+    _h = (top - centre) @ u_oa_k
+    _w = 3
+    _stack = np.stack([np.roll(_h, d) for d in range(-_w, _w + 1)], axis=0)
+    _lift = np.maximum(_stack.max(axis=0) - _h, 0.0)
+    top = top + u_oa_k * _lift[:, None]
+    diag["collar_top_window_lift_max_mm"] = round(float(_lift.max()), 4)
+    diag["collar_top_window_lift_points"] = int((_lift > 1e-9).sum())
 
-    if is_lifted.any():
-        # THE APRON RADIUS IS PER POINT AND PROPORTIONAL TO THE LOCAL LIFT, so
-        # the blend vanishes where the tooth never left the tissue rather than
-        # flaring material out of nowhere.
-        radius = np.minimum(pol.ramp_radius_mm, lift)[:, None]
-        landing_seed = rim_k + inset_dir * radius
-        drop_cap = pol.max_reconstruction_depth_mm
-        landing, hit = probe.drop_to_surface(landing_seed, u_oa_k, drop_cap)
-        # WHICH ATTEMPT ANSWERED, per point. -1 = never landed, 0 = the full
-        # apron radius, 1..3 = the shrink ladder, 4 = the direction-free
-        # fallback. Without this the diagnostics can say how many points landed
-        # but not whether they landed where the apron wanted them or only after
-        # collapsing inward onto the rim, and those are different geometries
-        # with the same success count.
-        retry_level = np.where(hit, 0, -1).astype(np.int64)
-        for step, shrink in enumerate((0.5, 0.25, 0.0), start=1):
-            if hit.all():
-                break
-            retry, retry_hit = probe.drop_to_surface(
-                rim_k + inset_dir * (radius * shrink), u_oa_k, drop_cap)
-            take = (~hit) & retry_hit
-            landing[take] = retry[take]
-            retry_level[take] = step
-            hit |= take
-        ray_hits = int(hit.sum())
-
-        # DIRECTION-FREE FALLBACK. The drop follows the TOOTH's long axis,
-        # which is right for a bodily movement and wrong for a tipped one: on a
-        # 6 degree tip the ray leaves at an angle and exits the side of the
-        # cast, so 21 of 44 rim points reported "no cast beneath me" while
-        # sitting over solid gingiva. Nearest-surface-point has no direction to
-        # be wrong about, and is still bounded by the same envelope.
-        need = ~hit
-        if need.any():
-            d_near, i_near = probe.tree.query(landing_seed[need], workers=-1)
-            ok_near = d_near <= pol.max_reconstruction_depth_mm
-            idx = np.where(need)[0]
-            landing[idx[ok_near]] = probe.verts[i_near[ok_near]]
-            hit[idx[ok_near]] = True
-            retry_level[idx[ok_near]] = 4
-        diag["ramp_landing_by_ray"] = ray_hits
-        diag["ramp_landing_by_nearest_surface"] = int(hit.sum()) - ray_hits
-        diag["ramp_landing_misses"] = int((~hit).sum())
-        # 0 = landed at the full apron radius, 1-3 = the shrink ladder (the
-        # apron COLLAPSED INWARD toward the rim to find tissue), 4 = the
-        # direction-free nearest-surface fallback, -1 = never landed.
-        diag["ramp_retry_levels"] = {
-            str(k): int((retry_level[is_lifted] == k).sum())
-            for k in (-1, 0, 1, 2, 3, 4)}
-        diag["ramp_collapsed_inward_points"] = int(
-            ((retry_level >= 1) & (retry_level <= 3) & is_lifted).sum())
-        drop = np.linalg.norm(landing - landing_seed, axis=1)
-        diag["ramp_landing_distance_max_mm"] = round(
-            float(drop[is_lifted & hit].max()) if (is_lifted & hit).any() else 0.0, 4)
-        diag["ramp_landing_distance_mean_mm"] = round(
-            float(drop[is_lifted & hit].mean()) if (is_lifted & hit).any() else 0.0, 4)
-
-        # A MISS STAYS A MISS. This used to be overwritten with `hit[:] = True`,
-        # which made the refusal below unreachable and turned "no cast found"
-        # into a silent success. A lifted point with nothing beneath it has no
-        # tissue to bridge to, and that is a refusal.
-        unreachable = is_lifted & (~hit)
-        if unreachable.any():
-            diag["unreachable_lifted_points"] = int(unreachable.sum())
-            diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
-            return InterfaceResult(False, "no_cast_beneath_target_rim",
-                                   diagnostics=diag)
-
-        # BLEND, DO NOT SWITCH. Assigning the landing only to lifted points
-        # makes the bottom ring jump between two quite different positions at
-        # the boundary between a lifted sector and a seated one, and the loft
-        # twists across that step. Weighting by the point's own lift gives a
-        # continuous ring, so a tipped tooth gets one smooth transition volume
-        # rather than a bridge stitched to a seat.
-        w = np.clip(lift / max(pol.fusion_overlap_mm, 1e-9), 0.0, 1.0)[:, None]
-        bottom = bottom * (1.0 - w) + landing * w
-        reach = float(np.linalg.norm(rim_k - bottom, axis=1).max())
-        diag["ramp_reach_mm"] = round(reach, 4)
-        if reach > pol.ramp_radius_mm + pol.max_reconstruction_depth_mm:
-            diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
-            return InterfaceResult(False, "outside_reconstruction_envelope",
-                                   diagnostics=diag)
-
-    # Top ring: buried INSIDE the crown. At rim_k exactly it would be the
-    # crown's own cervical edge - a coincident surface, which is the tangency
-    # this whole construction exists to avoid.
-    top = (rim_k - inset_dir * pol.seat_top_inset_mm
-           + u_oa_k * pol.fusion_overlap_mm)
-
-    seat_v = seat_f = None
-    try:
-        sv_, sf_ = _loft(top, bottom)
-        sf_ = cg.make_consistent_winding(sv_, sf_)
-        if cg.is_edge_manifold_closed(sf_):
-            vol = abs(cg.signed_volume(sv_, sf_))
-            if vol > 1e-9:
-                seat_v, seat_f = sv_, sf_
-                diag["connector_volume_mm3"] = round(float(vol), 4)
-                diag["seat_volume_mm3"] = round(float(vol), 4)   # legacy key
-    except Exception as e:                                # noqa: BLE001
-        diag["connector_error"] = f"{type(e).__name__}: {e}"
-
-    if seat_v is None:
+    top_cast = probe.signed(top)
+    top_crown = crown_probe.signed(top)
+    diag["collar_top_rise_max_mm"] = round(float(up.max()), 4)
+    diag["collar_top_rise_mean_mm"] = round(float(up.mean()), 4)
+    diag["collar_top_outset_max_mm"] = round(float(out.max()), 4)
+    diag["collar_top_clear_of_cast_min_mm"] = round(float(top_cast.min()), 4)
+    diag["collar_top_clear_of_crown_min_mm"] = round(float(top_crown.min()), 4)
+    if top_cast.min() < margin or top_crown.min() < margin:
+        diag["collar_top_unresolved_points"] = int(
+            ((top_cast < margin) | (top_crown < margin)).sum())
         diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
         return InterfaceResult(False, "interface_construction_failed",
                                diagnostics=diag)
 
+    # --- lower ring -------------------------------------------------------
+    #
+    # THE REACH IS CLAMPED BY THE NEIGHBOUR, PER RIM POINT. Two collars that
+    # meet consume the gingival bridge between them, and the fused solid stays
+    # perfectly watertight while the cast grows a trench - measured on two
+    # teeth 2.28mm apart, the pair took 2.04mm of it and left a 0.24mm gap.
+    # Each reconstruction may therefore reach at most a QUARTER of the way to
+    # its nearest neighbour's rim, so the two together can never take more
+    # than half. Below `fusion_overlap_mm` there is not enough left to fuse
+    # with, so the clamp stops there and the caller's bridge gate is what
+    # refuses the case - shrinking silently past the point of working would be
+    # the failure this check exists to catch.
+    outset = np.full(len(rim_k), float(pol.seat_bottom_outset_mm))
+    # ONE BUDGET FOR EVERY OUTWARD MOVE. The seed outset is not the only thing
+    # that reaches toward the neighbour - the nesting fix and the enclosure
+    # push do too - so clamping the seed alone left the pair consuming 60% of
+    # a 2.28mm bridge where 50% is the ceiling. The budget is per rim point
+    # and every outward step spends it.
+    outward_budget = np.full(len(rim_k), float(pol.ramp_radius_mm))
+    if neighbour_rims is not None and len(neighbour_rims):
+        from scipy.spatial import cKDTree
+        near = np.vstack([np.asarray(r, float) for r in neighbour_rims
+                          if r is not None and len(r)])
+        if len(near):
+            d_nb, _ = cKDTree(near).query(rim_k, workers=-1)
+            # DERIVED FROM THE RULE, not chosen. The pair may consume
+            # `max_bridge_removal_fraction` of the bridge, so each may take
+            # half of that - less two clearance bands, because the nesting fix
+            # is entitled to add one on each side and the measurement is taken
+            # between the two solids' surfaces, not between their seeds.
+            # Measured on a 2.25mm bridge: half-share alone left the pair at
+            # 55%, and this leaves them at 45%.
+            allowed = np.maximum(
+                0.5 * pol.max_bridge_removal_fraction * d_nb
+                - 2.0 * pol.clearance_mm,
+                pol.fusion_overlap_mm)
+            outward_budget = np.minimum(outward_budget, allowed)
+            clamped = np.minimum(outset, allowed)
+            diag["collar_outset_clamped_points"] = int(
+                (clamped < outset - 1e-9).sum())
+            diag["collar_outset_min_mm"] = round(float(clamped.min()), 4)
+            diag["nearest_neighbour_rim_mm"] = round(float(d_nb.min()), 4)
+            outset = clamped
+    diag["collar_outset_max_mm"] = round(float(outset.max()), 4)
+    seed = rim_k + inset_dir * outset[:, None]
+    landing, hit = probe.drop_to_surface(seed, u_oa_k, reach)
+    # WHICH ATTEMPT ANSWERED, per point. -1 = never landed, 0 = the drop along
+    # the tooth's own long axis at the full outset, 1-3 = the outset SHRUNK
+    # inward to find tissue, 4 = the direction-free nearest-surface fallback.
+    # Kept because "how many landed" and "where they landed" are different
+    # facts and only the second one is geometry.
+    retry_level = np.where(hit, 0, -1).astype(np.int64)
+    ray_hits = int(hit.sum())
+    # THE SHRINK LADDER IS LOAD-BEARING, not defensive. A rim point on the
+    # lingual side seeded a full 1.2mm outward lands OVER THE ARCH OPENING,
+    # where there is no cast at all: measured on a 1.2mm extrusion, one point
+    # in 44 fell through and the nearest surface was 3.93mm away, on a wall
+    # the downward march could never get inside. Pulling the seed back in is
+    # what finds real tissue under that point.
+    for step_i, shrink in enumerate((0.66, 0.33, 0.0), start=1):
+        if hit.all():
+            break
+        retry_seed = rim_k + inset_dir * (outset * shrink)[:, None]
+        retry, retry_hit = probe.drop_to_surface(retry_seed, u_oa_k, reach)
+        take = (~hit) & retry_hit
+        landing[take] = retry[take]
+        seed[take] = retry_seed[take]
+        retry_level[take] = step_i
+        hit |= take
+    need = ~hit
+    if need.any():
+        # DIRECTION-FREE FALLBACK. The drop follows the TOOTH's long axis,
+        # which is right for a bodily movement and wrong for a tipped one: the
+        # ray leaves at an angle and exits the side of the cast. Nearest
+        # surface point has no direction to be wrong about.
+        d_near, i_near = probe.tree.query(seed[need], workers=-1)
+        ok_near = d_near <= reach
+        idx = np.where(need)[0]
+        landing[idx[ok_near]] = probe.verts[i_near[ok_near]]
+        hit[idx[ok_near]] = True
+        retry_level[idx[ok_near]] = 4
+    diag["ramp_landing_by_ray"] = ray_hits
+    diag["ramp_landing_by_nearest_surface"] = int(hit.sum()) - ray_hits
+    diag["ramp_landing_misses"] = int((~hit).sum())
+    diag["ramp_retry_levels"] = {
+        str(kk): int((retry_level == kk).sum()) for kk in (-1, 0, 1, 2, 3, 4)}
+    diag["ramp_collapsed_inward_points"] = 0
+    drop = np.linalg.norm(landing - seed, axis=1)
+    diag["ramp_landing_distance_max_mm"] = round(
+        float(drop[hit].max()) if hit.any() else 0.0, 4)
+    diag["ramp_landing_distance_mean_mm"] = round(
+        float(drop[hit].mean()) if hit.any() else 0.0, 4)
+    # A MISS STAYS A MISS. This used to be overwritten with `hit[:] = True`,
+    # which made the refusal unreachable and turned "no cast found" into a
+    # silent success.
+    if (~hit).any():
+        diag["unreachable_lifted_points"] = int((~hit).sum())
+        diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
+        return InterfaceResult(False, "no_cast_beneath_target_rim",
+                               diagnostics=diag)
+
+    # MARCH ALONG THE FIELD, NOT ALONG THE AXIS. Descending the tooth's own
+    # long axis is right where the cast beneath the landing is a floor and
+    # wrong where it is a wall - on a steep interproximal face the axis runs
+    # ALONG the surface and 1.2mm of marching never gets inside, which is
+    # exactly how a 1.2mm extrusion was refused `wall_too_thin` on a cast
+    # measured 18.77mm thick. The inward direction is -grad(signed distance),
+    # which is the surface normal wherever the field is smooth and needs no
+    # assumption about how the cast is shaped.
+    # HOW DEEP IS "INSIDE"? Stopping at `clearance_mm` was wrong and the
+    # production forensics caught it: the lower ring settled 0.08mm under the
+    # surface, so its bottom disc ran nearly PARALLEL to the flat flush closure
+    # of the old site a fraction of a millimetre away, and two nearly-parallel
+    # surfaces that close is a tangency. The connector has to SEAT - reach a
+    # real depth of real cast material - bounded by the wall it may not breach.
+    # HOW DEEP IS "INSIDE"? Not `clearance_mm`: stopping there settled the
+    # lower ring 0.08mm under the surface, so its bottom disc ran nearly
+    # PARALLEL to the flat flush closure of the old site a fraction of a
+    # millimetre away, and two nearly-parallel surfaces that close is a
+    # tangency - which the production forensics reported as
+    # EMERGENCE_RECONSTRUCTION + OLD_SOCKET_REPAIR. The connector has to SEAT:
+    # reach the fusion overlap the union needs PLUS the clearance band that
+    # keeps surfaces apart. Both numbers already exist and already mean that.
+    #
+    # Measured on the 18-case matrix, everything else held fixed:
+    #   0.05mm (clearance only)  15 of 18
+    #   0.30mm (this)            16 of 18
+    #   0.60mm                   13 of 18
+    #   1.20mm (seat_depth)       3 of 18
+    # so it is neither "as shallow as possible" nor "as deep as possible", and
+    # the value that works is the one the policy already names.
+    seat_target = float(pol.fusion_overlap_mm + pol.clearance_mm)
+    diag["collar_seat_target_mm"] = round(seat_target, 4)
+    bottom = landing.copy()
+    down = np.zeros(len(bottom))
+    H = 1e-3
+    for _ in range(int(pol.seat_depth_mm / STEP) + 8):
+        sb = probe.signed(bottom)
+        need_dn = (sb > -seat_target) & (down < pol.seat_depth_mm)
+        if not need_dn.any():
+            break
+        grad = np.stack([
+            probe.signed(bottom + e * H) - probe.signed(bottom - e * H)
+            for e in np.eye(3)], axis=1) / (2 * H)
+        gl = np.linalg.norm(grad, axis=1, keepdims=True)
+        inward = -grad / np.where(gl < 1e-9, 1.0, gl)
+        # Where the field is flat enough to be meaningless, fall back to the
+        # tooth's long axis rather than to a random direction.
+        inward[gl[:, 0] < 1e-9] = -u_oa_k
+        dd = np.where(need_dn, STEP, 0.0)
+        bottom = bottom + inward * dd[:, None]
+        down += dd
+    bot_sd = probe.signed(bottom)
+
+    # THE WALL MUST CROSS THE CAST TRANSVERSALLY, and this is the last thing
+    # that had to be measured rather than assumed. With the crown's crease
+    # enclosed, the surviving self-touch was reported by the production
+    # forensics as EMERGENCE_RECONSTRUCTION + OLD_SOCKET_REPAIR: the collar's
+    # lower wall runs out 1.2mm while dropping only a few tenths, so where it
+    # leaves the cast across the FLAT flush closure of the old site the two
+    # surfaces are nearly parallel, and two nearly-parallel surfaces meeting is
+    # a tangency whatever their creases do.
+    #
+    # MEASURED AND REPORTED, NOT CORRECTED - and the attempt to correct it is
+    # why. Marching the shallow points deeper does steepen the wall, but it
+    # cost 2.4mm of extra depth to move two points and tripped the
+    # reconstruction envelope instead: the matrix went from 15 of 18 to 13.
+    # What actually fixed the tangency was seating the lower ring to
+    # `fusion_overlap_mm + clearance_mm` so its bottom disc is not beside the
+    # old-site cap in the first place. The angle stays as a diagnostic, because
+    # a collar whose wall lies along the cast is worth seeing in the manifest
+    # even when the topology comes out clean.
+    def _wall_normals(t_, b_):
+        tang = np.roll(b_, -1, axis=0) - np.roll(b_, 1, axis=0)
+        w_ = b_ - t_
+        n_ = np.cross(tang, w_)
+        ln = np.linalg.norm(n_, axis=1, keepdims=True)
+        return n_ / np.where(ln < 1e-12, 1.0, ln)
+
+    def _field_normal(pts):
+        g = np.stack([probe.signed(pts + e * 1e-3) - probe.signed(pts - e * 1e-3)
+                      for e in np.eye(3)], axis=1) / 2e-3
+        ln = np.linalg.norm(g, axis=1, keepdims=True)
+        return g / np.where(ln < 1e-9, 1.0, ln)
+
+    # Two surfaces meet at the angle between their NORMALS, so tangency is
+    # |n_wall . n_cast| near 1 and a clean crossing is that dot product below
+    # cos(min_crossing_angle_deg).
+    cos_floor = float(np.cos(np.radians(pol.min_crossing_angle_deg)))
+    n_cast = _field_normal(landing)
+    par = np.abs((_wall_normals(top, bottom) * n_cast).sum(axis=1))
+    angles = np.degrees(np.arccos(np.clip(par, 0.0, 1.0)))
+    diag["collar_wall_cast_crossing_angle_min_deg"] = round(float(angles.min()), 3)
+    diag["collar_wall_cast_crossing_angle_mean_deg"] = round(float(angles.mean()), 3)
+    diag["collar_wall_shallow_points"] = int((par > cos_floor).sum())
+    bot_sd = probe.signed(bottom)
+    diag["collar_bottom_depth_max_mm"] = round(float(down.max()), 4)
+    diag["collar_bottom_inside_cast_max_mm"] = round(float(bot_sd.max()), 4)
+    diag["seat_depth_mm"] = round(float(down.max()), 4)
+    if bot_sd.max() > -margin:
+        diag["collar_bottom_unresolved_points"] = int((bot_sd > -margin).sum())
+        diag["collar_bottom_shallowest_mm"] = round(float(bot_sd.max()), 4)
+        diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
+        return InterfaceResult(False, "interface_unbuildable_wall_too_thin",
+                               diagnostics=diag)
+
+    # THE LOWER RING MUST SIT BELOW THE CREASE IT HAS TO ENCLOSE. On a
+    # PENETRATING tooth the cast surface is ABOVE the cervical rim, so the
+    # landing is above it too and `landing - seat_target` can still be above
+    # it - which leaves the rim outside the collar no matter how far the wall
+    # is pushed outward. Measured on a tipped tooth, 3 of 46 crease points
+    # stayed 0.07mm outside through eight outward pushes, and that was exactly
+    # where the surviving CROWN + OLD_SOCKET_REPAIR touch sat.
+    below = ((bottom - rim_k) * u_oa_k).sum(axis=1)
+    need_low = below > -margin
+    if need_low.any():
+        drop_extra = np.where(need_low, below + margin, 0.0)
+        bottom = bottom - u_oa_k * drop_extra[:, None]
+        down = down + drop_extra
+        diag["collar_bottom_lowered_to_clear_crease_points"] = int(need_low.sum())
+        diag["collar_bottom_lowered_max_mm"] = round(float(drop_extra.max()), 4)
+        bot_sd = probe.signed(bottom)
+    diag["collar_bottom_below_crease_max_mm"] = round(
+        float(((bottom - rim_k) * u_oa_k).sum(axis=1).max()), 4)
+
+    # NESTING. The loft folds if the lower ring comes inside the upper one, so
+    # the lower ring is pushed radially out until it is clear. Outward radial
+    # offset of a star-shaped loop cannot self-intersect; inward offset can,
+    # which is why only this direction is used.
+    tr = np.linalg.norm(top - centre, axis=1)
+    br = np.linalg.norm(bottom - centre, axis=1)
+    short = br < tr + pol.clearance_mm
+    if short.any():
+        need_out = np.where(short, (tr + pol.clearance_mm) - br, 0.0)
+        need_out = np.minimum(need_out, np.maximum(0.0, outward_budget - outset))
+        bottom = bottom + inset_dir * need_out[:, None]
+        outset = outset + need_out
+        diag["collar_bottom_pushed_out_points"] = int(short.sum())
+
+    # THE BRIDGE INVARIANT, ENFORCED ON THE POINTS THEMSELVES. Clamping the
+    # seed was not enough: the lower ring is also moved by the shrink ladder,
+    # by the nesting fix and by the gradient march, and the march's inward
+    # direction has a lateral component - measured, the pair still reached 51%
+    # of a 2.36mm bridge where 50% is the ceiling.
+    #
+    # In one dimension with rims at 0 and B, connector 0 spanning out to r0
+    # and connector 1 back to B - r1, the gap is B - r0 - r1, so "the pair may
+    # take at most `max_bridge_removal_fraction` of B" is exactly "every point
+    # of each connector stays at least (1 - f/2)*B from the OTHER rim". That
+    # is a per-point condition, so it can simply be imposed.
+    if neighbour_rims is not None and len(neighbour_rims):
+        from scipy.spatial import cKDTree as _KD
+        _near = np.vstack([np.asarray(r, float) for r in neighbour_rims
+                           if r is not None and len(r)])
+        if len(_near):
+            _tree = _KD(_near)
+            _B = float(_tree.query(rim_k, workers=-1)[0].min())
+            _thresh = (1.0 - 0.5 * pol.max_bridge_removal_fraction) * _B
+            moved = 0
+            for _ring in (top, bottom):
+                _d, _i = _tree.query(_ring, workers=-1)
+                _bad = _d < _thresh
+                if _bad.any():
+                    _away = _ring[_bad] - _near[_i[_bad]]
+                    _ln = np.linalg.norm(_away, axis=1, keepdims=True)
+                    _away = _away / np.where(_ln < 1e-12, 1.0, _ln)
+                    _ring[_bad] += _away * (_thresh - _d[_bad])[:, None]
+                    moved += int(_bad.sum())
+            diag["bridge_clamped_ring_points"] = moved
+            diag["bridge_clamp_threshold_mm"] = round(_thresh, 4)
+            diag["bridge_between_rims_mm"] = round(_B, 4)
+
+    reach_mm = float(np.linalg.norm(rim_k - bottom, axis=1).max())
+    diag["ramp_reach_mm"] = round(reach_mm, 4)
+    if reach_mm > pol.ramp_radius_mm + pol.max_reconstruction_depth_mm:
+        diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
+        return InterfaceResult(False, "outside_reconstruction_envelope",
+                               diagnostics=diag)
+
+    # THE CREASE MUST BE INSIDE THE COLLAR, and that is ENFORCED by
+    # measurement rather than assumed from the construction. `rim_k` is the
+    # crown's own cervical crease; a crease left outside is exactly where the
+    # self-touch comes back - measured on a tipped tooth, 4 of 46 rim points
+    # fell outside and the fused stage reported one CROWN + OLD_SOCKET_REPAIR
+    # touch and one non-manifold edge. Where a point is not enclosed, its two
+    # rings are pushed radially outward - the direction that cannot fold a
+    # star-shaped loop - and the collar is rebuilt and re-measured.
+    seat_v = seat_f = None
+    rim_in = None
+    collar_probe = None
+    enclose_push = np.zeros(len(rim_k))
+    for attempt in range(8):
+        try:
+            sv_, sf_ = _loft(top, bottom, axis=u_oa_k)
+            sf_ = cg.make_consistent_winding(sv_, sf_)
+            if not cg.is_edge_manifold_closed(sf_):
+                diag["connector_error"] = "the loft is not closed"
+                break
+            vol = abs(cg.signed_volume(sv_, sf_))
+            if vol <= 1e-9:
+                diag["connector_error"] = "the loft has no volume"
+                break
+        except Exception as e:                            # noqa: BLE001
+            diag["connector_error"] = f"{type(e).__name__}: {e}"
+            break
+        seat_v, seat_f = sv_, sf_
+        diag["connector_volume_mm3"] = round(float(vol), 4)
+        diag["seat_volume_mm3"] = round(float(vol), 4)    # legacy key
+        collar_probe = CastProbe(seat_v, seat_f)
+        rim_in = collar_probe.signed(rim_k)
+        outside = rim_in > -pol.clearance_mm
+        push = np.where(outside, 0.08, 0.0)
+        push = np.minimum(push, np.maximum(0.0, outward_budget - outset
+                                           - enclose_push))
+        if not outside.any() or push.max() <= 1e-9:
+            break
+        top = top + inset_dir * push[:, None]
+        bottom = bottom + inset_dir * push[:, None]
+        enclose_push += push
+    diag["collar_enclosure_attempts"] = int(attempt + 1)
+    diag["collar_enclosure_push_max_mm"] = round(float(enclose_push.max()), 4)
+    diag["collar_total_outward_reach_max_mm"] = round(
+        float((outset + enclose_push).max()), 4)
+
+    if seat_v is None or rim_in is None:
+        diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
+        return InterfaceResult(False, "interface_construction_failed",
+                               diagnostics=diag)
+    diag["crease_inside_collar_max_mm"] = round(float(rim_in.max()), 4)
+    diag["crease_points_outside_collar"] = int((rim_in > -1e-9).sum())
+    # The OLD SITE's crease - the boundary of the flush socket cap, at the
+    # UNTRANSFORMED rim. Reported, not gated: for a large movement it is
+    # legitimately far from the collar, and then the collar never crosses it.
+    # CONTINUITY, MEASURED AGAINST THE SOLID rather than against its vertices.
+    # `interface_continuity` compares each rim point with the nearest
+    # connector VERTEX at a 1mm tolerance, which was right for a loft whose
+    # top ring hugged the rim and is wrong for a collar that ENCLOSES it: the
+    # rim is now inside the solid, and the nearest ring vertex can legitimately
+    # be 2mm away. Inside-ness is the property that matters and the signed
+    # distance answers it exactly.
+    covered = rim_in < 0.0
+    _cc = rim_k - rim_k.mean(axis=0)
+    _, _, _vt = np.linalg.svd(_cc, full_matrices=False)
+    _ang = np.arctan2(_cc @ _vt[1], _cc @ _vt[0])
+    _o = np.argsort(_ang)
+    _a, _c = _ang[_o], covered[_o]
+    _gaps, _run = [], None
+    for _i in range(len(_a)):
+        if not _c[_i]:
+            _run = _a[_i] if _run is None else _run
+        elif _run is not None:
+            _gaps.append(_a[_i] - _run)
+            _run = None
+    _worst = float(max(_gaps)) if _gaps else 0.0
+    diag["continuity"] = {
+        "continuous": bool(covered.all() or
+                           (_worst < np.pi / 6 and covered.mean() > 0.75)),
+        "covered_fraction": round(float(covered.mean()), 4),
+        "largest_angular_gap_deg": round(float(np.degrees(_worst)), 2),
+        "max_rim_signed_distance_to_connector_mm": round(float(rim_in.max()), 4),
+        "measure": "rim points strictly INSIDE the connector solid, by exact "
+                   "signed distance",
+    }
+
+    old_in = collar_probe.signed(rim_t0)
+    diag["old_crease_inside_collar_max_mm"] = round(float(old_in.max()), 4)
+    diag["old_crease_min_distance_to_collar_mm"] = round(
+        float(np.abs(old_in).min()), 4)
+    diag["old_crease_straddles_collar"] = bool(
+        (old_in.min() < 0) and (old_in.max() > 0))
+
     diag["connector_built"] = True
     diag["seat_built"] = True
-    diag["ramp_built"] = bool(is_lifted.any())
-    diag["seat_depth_mm"] = round(pol.seat_depth_mm, 4)
+    diag["ramp_built"] = bool(is_lifted.any())   # one face of the connector
     diag["seat_lift_mm"] = round(pol.fusion_overlap_mm, 4)
     diag["seat_independent_of_root_length"] = True
-    ramp_v = ramp_f = None      # folded into the connector
+    diag["emergence_height_mm"] = round(float(pol.emergence_height_mm), 4)
 
     diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
     # KEYWORDS, NOT POSITION. `diagnostics` sits after the geometry fields, so
@@ -923,8 +1264,6 @@ def build_stage_tooth_interface(
     # manifest. Keyword arguments cannot drift like that.
     return InterfaceResult(
         ok=True, refusal_reason=None,
-        cavity_verts=cav_v, cavity_faces=cav_f,
-        ramp_verts=ramp_v, ramp_faces=ramp_f,
         seat_verts=seat_v, seat_faces=seat_f,
         diagnostics=diag)
 
@@ -996,12 +1335,31 @@ def _point_to_surface(pts, verts, faces, candidates=24):
     from any of its corners - and a nearest-VERTEX measure calls that a
     3.5mm deviation when the point is exactly ON the original surface.
 
-    Candidate triangles come from a KD-tree over centroids; the exact
-    point-triangle distance is then computed for the nearest `candidates` of
-    them. Brute force over every triangle would be correct too and about
-    fifty times slower.
+    OPEN3D'S BVH FIRST, AND THE CANDIDATE SEARCH IS THE FALLBACK - because
+    the candidate search is an APPROXIMATION and it was caught being one. It
+    takes the `candidates` triangles whose CENTROIDS are nearest, and on the
+    cast's underside, where a triangle can be 20mm across, the triangle a
+    point actually sits on is not among them: measured on a fused stage, 793
+    of 4710 vertices reported distances of exactly 9.0000mm - the distance to
+    whatever unrelated triangle did make the shortlist - while the cast was
+    reproduced through manifold3d to 2e-6mm. That is the same class of defect
+    as the nearest-VERTEX signed distance this module was corrected for, and
+    it was quietly failing the unaffected-cast fidelity gate.
+
+    `RaycastingScene.compute_distance` is exact and is already a dependency.
     """
     from scipy.spatial import cKDTree
+    try:
+        import open3d as o3d
+        _sc = o3d.t.geometry.RaycastingScene()
+        _sc.add_triangles(
+            o3d.core.Tensor(np.asarray(verts, np.float32), o3d.core.float32),
+            o3d.core.Tensor(np.asarray(faces, np.uint32), o3d.core.uint32))
+        return _sc.compute_distance(
+            o3d.core.Tensor(np.atleast_2d(np.asarray(pts, np.float32)),
+                            o3d.core.float32)).numpy().astype(float)
+    except Exception:                                     # noqa: BLE001
+        pass
     pts = np.atleast_2d(np.asarray(pts, float))
     verts = np.asarray(verts, float)
     faces = np.asarray(faces, np.int64)
@@ -1099,7 +1457,7 @@ def surface_deviation(ref_verts, ref_faces, test_verts, test_faces,
 # Rigidity (Phase 2 / amendment 14)
 # ---------------------------------------------------------------------------
 
-def rigidity_report(pts_t0, pts_k, faces=None, sample=4000):
+def rigidity_report(pts_t0, pts_k, faces=None, sample=4000, matrix=None):
     """Intrinsic geometry preserved? Edge lengths, distances, triangle areas.
 
     A transform can be wrong in ways a determinant does not see, so this
@@ -1140,6 +1498,25 @@ def rigidity_report(pts_t0, pts_k, faces=None, sample=4000):
                 out.get("max_edge_length_error_mm", 0.0))
     out["ok"] = bool(worst < 1e-6)
     out["worst_mm"] = float(worst)
+    # Names the aggregate gate reads, and the two checks on the MATRIX itself.
+    # |det - 1| alone does NOT catch a transposition - det(M^T) = det(M) for
+    # every matrix there is - so R^T R - I is measured beside it, which is the
+    # one that moves when a convention drifts.
+    out["max_pairwise_change_mm"] = out.get("max_pairwise_distance_error_mm", 0.0)
+    out["max_edge_length_change_mm"] = out.get("max_edge_length_error_mm", 0.0)
+    if matrix is not None:
+        R = np.asarray(matrix, float)[:3, :3]
+        out["orthonormality_error"] = float(
+            np.abs(R.T @ R - np.eye(3)).max())
+        out["det_error"] = float(abs(np.linalg.det(R) - 1.0))
+    else:
+        out["orthonormality_error"] = None
+        out["det_error"] = None
+    out["rigid"] = bool(
+        out["ok"]
+        and (out["orthonormality_error"] is None
+             or out["orthonormality_error"] < 1e-9)
+        and (out["det_error"] is None or out["det_error"] < 1e-9))
     return out
 
 
@@ -1261,44 +1638,205 @@ def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
 
 
 def old_site_quality(original_verts, original_faces,
-                     final_verts, final_faces, rim_t0, radius_mm=4.0):
-    """Was the ORIGINAL socket restored, or replaced by a new defect?
+                     final_verts, final_faces, rim_t0, u_oa=None,
+                     radius_mm=4.0, tol_mm=0.05, grid_mm=0.4):
+    """Was the site the tooth LEFT restored, or replaced by a new defect?
 
-    The T0 site is closed flush and then never touched again, so nothing in
-    the stage pipeline would notice if that closure left a crater, a plateau
-    or a step. This measures the restored site against the cast that surrounds
-    it: deviation inside the old rim versus deviation in an annulus just
-    outside it. A good restoration looks like its own neighbourhood.
+    TRIANGLE-SURFACE GEOMETRY, NOT NEAREST VERTEX. The first version compared
+    final VERTICES against original VERTICES with a KD-tree, which is the same
+    mistake `surface_deviation` was corrected for: on a cast whose underside
+    carries very large triangles, a point sitting exactly ON the original
+    surface measured 3.46mm from the nearest original vertex. Every distance
+    here is point-to-TRIANGLE.
+
+    The old site is defined in the T0 rim's own frame: the rim is fitted a
+    plane, and the region is everything inside the rim's projected outline.
+    Height is measured along that plane's normal, so "crater" and "plateau"
+    are signed and mean what they say.
+
+    Reported, in the brief's terms:
+      crater_depth_mm      how far the restoration sinks BELOW the rim
+      plateau_height_mm    how far it stands ABOVE it
+      flat_fraction        how much of it is within `tol_mm` of one plane - a
+                           flush cap reads ~1.0, which IS the "large flat
+                           plateau" pathology, and it is reported rather than
+                           hidden
+      largest_local_step_mm  worst height jump between neighbouring samples
+      modified_area_mm2    area of final surface over the site that has moved
+                           further than `tol_mm` from the original cast
+      volume_change_mm3    prism integral of the height change over the site
+      patches              connected components of the modified region; more
+                           than one is a disconnected patch
     """
     from scipy.spatial import cKDTree
     orig = np.asarray(original_verts, float)
+    of = np.asarray(original_faces, np.int64)
     fin = np.asarray(final_verts, float)
+    ff = np.asarray(final_faces, np.int64)
     rim = np.asarray(rim_t0, float)
+    if len(rim) < 3 or not len(ff):
+        return {"measured": False, "reason": "no rim or no final mesh"}
+
     centre = rim.mean(axis=0)
-    r_rim = float(np.linalg.norm(rim - centre, axis=1).max())
+    _, _, vt = np.linalg.svd(rim - centre, full_matrices=False)
+    n = vt[2] / (np.linalg.norm(vt[2]) or 1.0)
+    if u_oa is not None and float(np.dot(n, np.asarray(u_oa, float))) < 0:
+        n = -n
+    e1 = vt[0] / (np.linalg.norm(vt[0]) or 1.0)
+    e2 = np.cross(n, e1)
 
-    d_fin = np.linalg.norm(fin - centre, axis=1)
-    inside = fin[d_fin <= r_rim]
-    annulus = fin[(d_fin > r_rim) & (d_fin <= r_rim + radius_mm)]
-    if not len(inside) or not len(annulus):
+    def uv(p):
+        d = np.atleast_2d(p) - centre
+        return np.stack([d @ e1, d @ e2], axis=1)
+
+    rim_uv = uv(rim)
+    r_rim = float(np.linalg.norm(rim_uv, axis=1).max())
+
+    # Sample the site on a regular grid in the rim plane, keep what is inside
+    # the rim's own outline rather than a circle: a cervical margin is
+    # scalloped and a circle would sweep in the gingiva beside it.
+    g = np.arange(-r_rim, r_rim + grid_mm, grid_mm)
+    gu, gv = np.meshgrid(g, g)
+    samp = np.stack([gu.ravel(), gv.ravel()], axis=1)
+    ang = np.arctan2(rim_uv[:, 1], rim_uv[:, 0])
+    rad = np.linalg.norm(rim_uv, axis=1)
+    order = np.argsort(ang)
+    a_s, r_s = ang[order], rad[order]
+    s_ang = np.arctan2(samp[:, 1], samp[:, 0])
+    s_rad = np.linalg.norm(samp, axis=1)
+    r_at = np.interp(s_ang, a_s, r_s, period=2 * np.pi)
+    inside = s_rad <= r_at * 0.92          # stay clear of the rim itself
+    samp = samp[inside]
+    if len(samp) < 8:
+        return {"measured": False, "reason": "old site too small to sample"}
+
+    p3 = centre + samp[:, 0:1] * e1 + samp[:, 1:2] * e2
+    # Height of each surface above the rim plane, taken as the nearest surface
+    # point's own height - the cast is a height field over this patch.
+    def heights(vv, fff):
+        """Height of the OCCLUSAL surface above the rim plane at each sample.
+
+        THE CAST IS A SOLID, not a height field, so a nearest-centroid query
+        in the rim plane will happily return a triangle on the UNDERSIDE of
+        the base: measured before this filter, the old site read a crater
+        22.58mm deep - the cast's own thickness - and 13 disconnected patches.
+        Faces are therefore restricted to those facing the occlusal side
+        before anything is measured.
+        """
+        cen = vv[fff].mean(axis=1)
+        a_, b_, c_ = vv[fff[:, 0]], vv[fff[:, 1]], vv[fff[:, 2]]
+        nrm = np.cross(b_ - a_, c_ - a_)
+        ln = np.linalg.norm(nrm, axis=1)
+        facing = np.divide(nrm @ n, np.where(ln < 1e-15, 1.0, ln)) > 0.1
+        keep = facing & (np.linalg.norm(
+            np.stack([(cen - centre) @ e1, (cen - centre) @ e2], 1),
+            axis=1) <= r_rim + radius_mm)
+        if keep.sum() < 8:
+            return None
+        cc = cen[keep]
+        t = cKDTree(np.stack([(cc - centre) @ e1, (cc - centre) @ e2], axis=1))
+        dd, idx = t.query(samp, workers=-1)
+        return (cc[idx] - centre) @ n, dd
+
+    hf = heights(fin, ff)
+    ho = heights(orig, of)
+    if ho is None:
         return {"measured": False,
-                "reason": "old site not represented in the final mesh"}
+                "reason": "the original cast has no surface over this site"}
+    if hf is None:
+        # A DETERMINATE ANSWER, NOT AN UNCHECKED ONE. A tooth that has barely
+        # moved is still standing over the site it will leave, so the finished
+        # model's surface there is the crown. There is no restoration to
+        # judge, and saying so is different from failing to look.
+        return {"measured": True, "assessable": False,
+                "obscured_fraction": 1.0,
+                "reason": "the tooth still covers the site it left"}
+    h_fin, d_fin_q = hf
+    h_org, d_org_q = ho
 
-    tree = cKDTree(orig)
-    d_in, _ = tree.query(inside, workers=-1)
-    d_out, _ = tree.query(annulus, workers=-1)
+    # OBSCURED SAMPLES ARE NOT DEFECTS. When the tooth has barely moved it is
+    # still standing over its own old site, so the finished model's surface
+    # there is the CROWN and no cast triangle is anywhere near - the nearest
+    # one is on the socket wall, and reading its height reported a 2.4mm
+    # crater at a site nothing had touched. A sample with no cast surface
+    # within a couple of grid cells is reported as obscured and excluded from
+    # every shape measure, rather than being scored against the wrong surface.
+    seen = (d_fin_q <= grid_mm * 2.5) & (d_org_q <= grid_mm * 2.5)
+    obscured = float(1.0 - seen.mean())
+    # A SHAPE JUDGEMENT NEEDS A SHAPE. Below a quarter of the site the
+    # surviving samples are a scatter around its edge, where the cast falls
+    # away into the socket wall by design - measured, that read a 2.3mm
+    # "crater" and 11 "disconnected patches" at a site nothing had touched.
+    if seen.sum() < 8 or seen.mean() < 0.25:
+        return {"measured": True, "assessable": False,
+                "obscured_fraction": round(obscured, 4),
+                "reason": "the tooth still covers most of the site it left"}
+    samp, h_fin, h_org = samp[seen], h_fin[seen], h_org[seen]
+    p3 = centre + samp[:, 0:1] * e1 + samp[:, 1:2] * e2
+
+    # Local step: neighbouring grid samples, so the spacing is known.
+    #
+    # TWO STEPS, AND THE GATE USES THE SECOND. `largest_local_step_mm` is the
+    # restored surface's own relief, which on a pristine cast already reads
+    # 1.71mm across the socket wall - that is anatomy, not a defect, and
+    # gating on it would refuse an untouched site. `largest_step_change_mm` is
+    # the step in the CHANGE from the original cast, which is zero wherever
+    # the reconstruction left the surface alone and jumps at the rim of a
+    # crater or a plateau the software introduced.
+    tree2 = cKDTree(samp)
+    pairs = tree2.query_pairs(grid_mm * 1.05, output_type="ndarray")
+    step = (np.abs(h_fin[pairs[:, 0]] - h_fin[pairs[:, 1]]).max()
+            if len(pairs) else 0.0)
+
+    dh = h_fin - h_org
+    step_change = (np.abs(dh[pairs[:, 0]] - dh[pairs[:, 1]]).max()
+                   if len(pairs) else 0.0)
+    cell = grid_mm * grid_mm
+    # Distance from the final surface over the site to the ORIGINAL cast.
+    d_site = _point_to_surface(p3 + h_fin[:, None] * n, orig, of)
+    moved = d_site > tol_mm
+    flat = np.abs(h_fin - np.median(h_fin)) <= tol_mm
+
+    # Disconnected patches of the modified region, over grid adjacency.
+    patches = 0
+    if moved.any():
+        mi = np.where(moved)[0]
+        pos = {int(x): k for k, x in enumerate(mi)}
+        parent = list(range(len(mi)))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        for a_, b_ in pairs:
+            if a_ in pos and b_ in pos:
+                ra, rb = find(pos[a_]), find(pos[b_])
+                if ra != rb:
+                    parent[ra] = rb
+        patches = len({find(i) for i in range(len(mi))})
+
     return {
         "measured": True,
+        "assessable": True,
         "old_rim_radius_mm": round(r_rim, 4),
-        "points_inside_old_site": int(len(inside)),
-        "inside_max_deviation_mm": round(float(d_in.max()), 4),
-        "inside_mean_deviation_mm": round(float(d_in.mean()), 4),
-        "surrounding_max_deviation_mm": round(float(d_out.max()), 4),
-        "surrounding_mean_deviation_mm": round(float(d_out.mean()), 4),
-        # The restored site must not stray further from the original cast than
-        # the untouched tissue immediately around it, by more than this margin.
-        "excess_over_surroundings_mm": round(float(d_in.max() - d_out.max()), 4),
-        "threshold_note": "engineering validation threshold for this prototype",
+        "samples": int(len(samp)),
+        "obscured_fraction": round(obscured, 4),
+        "sample_spacing_mm": grid_mm,
+        "crater_depth_mm": round(float(max(0.0, -dh.min())), 4),
+        "plateau_height_mm": round(float(max(0.0, dh.max())), 4),
+        "largest_local_step_mm": round(float(step), 4),
+        "largest_step_change_mm": round(float(step_change), 4),
+        "flat_fraction": round(float(flat.mean()), 4),
+        "modified_area_mm2": round(float(moved.sum() * cell), 4),
+        "modified_fraction": round(float(moved.mean()), 4),
+        "volume_change_mm3": round(float(dh.sum() * cell), 4),
+        "max_deviation_from_original_mm": round(float(d_site.max()), 4),
+        "mean_deviation_from_original_mm": round(float(d_site.mean()), 4),
+        "patches": int(patches),
+        "measure": "point-to-TRIANGLE distance, height along the T0 rim plane normal",
+        "threshold_note": "engineering validation thresholds for this prototype, "
+                          "not clinical tolerances",
     }
 
 
@@ -1333,6 +1871,391 @@ def components(faces):
                         seen[j] = True
                         stack.append(j)
     return n
+
+
+# ---------------------------------------------------------------------------
+# Exposure of synthetic geometry, and the aggregate manufacturing gate
+# ---------------------------------------------------------------------------
+
+SYNTHETIC_SOURCES = ("EMERGENCE_RECONSTRUCTION", "SEAT", "LOCAL_CLEARANCE",
+                     "OLD_SOCKET_REPAIR")
+
+
+def synthetic_exposure(verts, faces, labels, policy=None):
+    """How much invented geometry is ON THE OUTSIDE of the finished model.
+
+    This is only answerable because every input solid carries a manifold3d
+    original id: a triangle that survives to the fused boundary and came from
+    the connector IS exposed synthetic anatomy, and one that was buried by the
+    crown or the cast is simply absent from the output. So the measurement has
+    no heuristic in it at all.
+
+    The connector is ALLOWED to be visible - a cervical emergence profile is
+    what gingiva does - but a clearance wall standing proud of the cast is
+    not: a clearance wall is a CUT surface, and if any of it survives to the
+    boundary the cavity was not refilled by the crown that made it.
+    """
+    pol = policy or DEFAULT_POLICY
+    v = np.asarray(verts, float)
+    f = np.asarray(faces, np.int64)
+    lab = np.asarray(labels, dtype=object)
+    area = _face_areas(v, f)
+    total = float(area.sum())
+    by = {}
+    for src in ("ORIGINAL_CAST",) + SYNTHETIC_SOURCES + ("CROWN",):
+        by[src] = round(float(area[lab == src].sum()), 4)
+    synth = sum(by[s] for s in SYNTHETIC_SOURCES)
+    frac = float(synth / total) if total else 0.0
+    return {
+        "total_area_mm2": round(total, 4),
+        "area_by_source_mm2": by,
+        "exposed_synthetic_area_mm2": round(float(synth), 4),
+        "exposed_synthetic_fraction": round(frac, 6),
+        "exposed_clearance_area_mm2": by["LOCAL_CLEARANCE"],
+        "unattributed_area_mm2": round(
+            float(area[lab == "UNATTRIBUTED"].sum()), 4),
+        "max_exposed_synthetic_fraction": pol.max_exposed_synthetic_fraction,
+        "within_bound": bool(frac <= pol.max_exposed_synthetic_fraction),
+        "clearance_is_buried": bool(by["LOCAL_CLEARANCE"] <= 1e-9),
+    }
+
+
+def aggregate_print_gate(stage: dict, policy=None) -> dict:
+    """The ONE place a stage may be called ready to manufacture.
+
+    `validate_printable_stl` answers a narrower question - is the written file
+    a closed, single-bodied, correctly wound solid - and says so in its own
+    `gate_scope`. This carries the rest of the brief's list, and it is
+    deliberately a pure function of the stage record so nothing can claim
+    readiness without the measurements being present: a MISSING measurement
+    fails, exactly like a bad one. `NOT_CHECKED` is not `CLEAR`.
+    """
+    pol = policy or DEFAULT_POLICY
+    gates = []
+
+    def gate(name, ok, measured, detail):
+        gates.append({"gate": name, "passed": bool(ok),
+                      "measured": measured, "detail": detail})
+
+    v = stage.get("stl_validation") or {}
+    ms = stage.get("manifold_status") or {}
+    gate("written_stl_topology", bool(v.get("print_ready")),
+         v.get("failed_gates"),
+         "finite, closed, one component, positive volume, consistent winding, "
+         "measured on the bytes after a downstream reader's weld")
+    gate("single_positive_manifold_body", bool(ms.get("single_positive_body")),
+         ms.get("decompose_volumes_mm3"),
+         "manifold3d decompose() - physical bodies, not index components")
+    gate("body_count_agrees_with_stl",
+         stage.get("manifold_bodies") == 1 and v.get("connected_components") == 1,
+         [stage.get("manifold_bodies"), v.get("connected_components")],
+         "the engine's body count and the file's component count must agree")
+
+    touch = stage.get("self_touch") or {}
+    gate("no_self_touching_boundary",
+         touch.get("coincident_position_groups") == 0,
+         touch.get("coincident_position_groups"),
+         "a boundary that touches itself is inexpressible in a position-based "
+         "format and becomes a non-manifold edge on the reader's weld")
+
+    exp = stage.get("synthetic_exposure") or {}
+    gate("synthetic_exposure_within_bound", bool(exp.get("within_bound")),
+         exp.get("exposed_synthetic_fraction"),
+         "area of invented geometry surviving to the outside of the model")
+    gate("no_exposed_clearance_wall", bool(exp.get("clearance_is_buried")),
+         exp.get("exposed_clearance_area_mm2"),
+         "a cut surface on the boundary means the cavity was not refilled")
+
+    fid = stage.get("cast_fidelity") or {}
+    fwd = fid.get("original_to_final") or {}
+    rev = fid.get("final_to_original") or {}
+    ok_fid = (fwd.get("max_mm") is not None and rev.get("max_mm") is not None
+              and max(fwd["max_mm"], rev["max_mm"])
+              <= pol.max_unaffected_deviation_mm)
+    gate("unaffected_cast_fidelity_two_sided", ok_fid,
+         {"original_to_final_max_mm": fwd.get("max_mm"),
+          "final_to_original_max_mm": rev.get("max_mm")},
+         "point-to-TRIANGLE distance in BOTH directions, outside the allowed "
+         "reconstruction envelope")
+
+    roi = stage.get("roi_compliance") or {}
+    gate("reconstruction_inside_envelope", bool(roi.get("compliant")),
+         roi.get("outside_envelope_area_mm2"),
+         "every changed cast surface must lie inside "
+         "ALLOWED_RECONSTRUCTION_ENVELOPE")
+
+    rows = stage.get("interfaces") or []
+    gate("every_interface_built", bool(rows) and all(r.get("ok") for r in rows),
+         [r.get("refusal_reason") for r in rows if not r.get("ok")],
+         "a tooth with no local interface has no reconstruction at all")
+    gate("interface_continuous_around_every_rim",
+         bool(rows) and all((r.get("continuity") or {}).get("continuous")
+                            for r in rows),
+         [(r.get("continuity") or {}).get("largest_angular_gap_deg")
+          for r in rows],
+         "the reconstructed band must close around the rim, not be islands")
+    gate("no_transition_ledge",
+         bool(rows) and all(
+             (r.get("transition") or {}).get("looks_like_a_ledge") is False
+             for r in rows),
+         [(r.get("transition") or {}).get("largest_step_share") for r in rows],
+         "a cylindrical collar is watertight and still wrong; the shape is "
+         "what separates a blend from a ledge")
+
+    old = [r.get("old_site") or {} for r in rows]
+    gate("old_site_restored",
+         bool(old) and all(
+             o.get("measured")
+             and (not o.get("assessable", False)
+                  or (o.get("crater_depth_mm", 9e9) <= pol.max_old_site_defect_mm
+                      and o.get("plateau_height_mm", 9e9) <= pol.max_old_site_defect_mm
+                      and o.get("largest_step_change_mm", 9e9) <= pol.max_old_site_step_mm
+                      and o.get("patches", 9) <= 1))
+             for o in old),
+         [{k: o.get(k) for k in ("assessable", "obscured_fraction",
+                                 "crater_depth_mm", "plateau_height_mm",
+                                 "largest_step_change_mm", "patches")}
+          for o in old],
+         "crater, tower, sharp step or a disconnected patch at the site the "
+         "tooth left")
+
+    rig = [r.get("rigidity") or {} for r in rows]
+    gate("crown_is_an_exact_rigid_transform",
+         bool(rig) and all(r.get("rigid") for r in rig),
+         [{k: r.get(k) for k in ("max_edge_length_change_mm",
+                                 "max_pairwise_change_mm",
+                                 "orthonormality_error", "det_error")}
+          for r in rig],
+         "intrinsic edge lengths, sampled pairwise distances, triangle areas, "
+         "R^T R - I and det(R) - 1")
+
+    bridges = stage.get("adjacent_bridges")
+    gate("gingival_bridge_preserved",
+         bridges is not None and all(b.get("ok") for b in bridges),
+         [b for b in (bridges or []) if not b.get("ok")],
+         "measured from the actual reconstruction regions, not from "
+         "2 * fusion_overlap_mm")
+
+    gate("root_length_independent",
+         bool(rows) and all(r.get("seat_independent_of_root_length")
+                            for r in rows),
+         None,
+         "no manufacturing geometry may be derived from root_length_mm")
+
+    gate("clinical_consistency", bool(stage.get("clinical_consistent")),
+         stage.get("clinical_consistency_detail"),
+         "the stage's prescription is its own share of the committed one")
+
+    failed = [g["gate"] for g in gates if not g["passed"]]
+    return {
+        "print_ready": not failed,
+        "failed_gates": failed,
+        "gates": gates,
+        "verdict": ("PRINT READY" if not failed else "NOT PRINT READY"),
+        "gate_scope": {
+            "covers": [g["gate"] for g in gates],
+            "note": "the complete aggregate manufacturing gate. A MISSING "
+                    "measurement fails it, exactly like a bad one.",
+            "not_verified_on": "no real de-identified scan has been run "
+                               "through this gate; every number behind it is "
+                               "synthetic.",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Edge forensics with geometry provenance
+# ---------------------------------------------------------------------------
+
+# The sources a triangle in a fused stage can have come from. They are the
+# labels the caller attaches to each input Manifold with `as_original()`, so
+# they survive the boolean and can be read back off `run_original_id`.
+GEOMETRY_SOURCES = (
+    "ORIGINAL_CAST",            # scan surface retained by the trim
+    "OLD_SOCKET_REPAIR",        # the flush closure of the site the tooth left
+    "LOCAL_CLEARANCE",          # crown-derived subtraction, CASE A
+    "EMERGENCE_RECONSTRUCTION", # the transition collar where the rim lifted
+    "SEAT",                     # the transition collar where the rim is seated
+    "CROWN",                    # the rigid transformed crown
+)
+
+
+def edge_table(verts, faces):
+    """Undirected edges with their incident face ids, in one pass.
+
+    Returns (edge_keys, starts, counts, face_ids_sorted) so a caller can slice
+    `face_ids_sorted[starts[e] : starts[e] + counts[e]]` for edge `e`.
+    """
+    f = np.asarray(faces, np.int64)
+    if not len(f):
+        z = np.zeros((0, 2), np.int64)
+        return z, np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros(0, np.int64)
+    he = np.vstack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+    fid = np.tile(np.arange(len(f)), 3)
+    key = np.sort(he, axis=1)
+    order = np.lexsort((key[:, 1], key[:, 0]))
+    key, fid = key[order], fid[order]
+    uniq, start, cnt = np.unique(key, axis=0, return_index=True,
+                                 return_counts=True)
+    return uniq, start, cnt, fid
+
+
+def dissect_edges(verts, faces, which="nonmanifold", labels=None, limit=12):
+    """Full topology of every offending edge, proven rather than asserted.
+
+    "Non-manifold" here means an edge carried by MORE THAN TWO faces, counted
+    on the mesh as it stands. The incident face ids, their areas and their
+    normals are all reported so the claim can be checked: a long edge is not
+    non-manifold because it is long, and a short one is not non-manifold
+    because it is short.
+    """
+    v = np.asarray(verts, float)
+    f = np.asarray(faces, np.int64)
+    uniq, start, cnt, fid = edge_table(v, f)
+    if which == "open":
+        sel = np.where(cnt == 1)[0]
+    else:
+        sel = np.where(cnt > 2)[0]
+    out = []
+    for e in sel[:limit]:
+        a, b = int(uniq[e][0]), int(uniq[e][1])
+        inc = fid[start[e]:start[e] + cnt[e]]
+        tri = f[inc]
+        A, B, C = v[tri[:, 0]], v[tri[:, 1]], v[tri[:, 2]]
+        n = np.cross(B - A, C - A)
+        area = 0.5 * np.linalg.norm(n, axis=1)
+        unit = n / np.where(area[:, None] < 1e-20, 1.0, 2.0 * area[:, None])
+        rec = {
+            "edge_id": int(e),
+            "vertex_ids": [a, b],
+            "p0": [round(float(x), 6) for x in v[a]],
+            "p1": [round(float(x), 6) for x in v[b]],
+            "length_mm": round(float(np.linalg.norm(v[b] - v[a])), 6),
+            "incident_face_count": int(cnt[e]),
+            "incident_face_ids": [int(x) for x in inc],
+            "face_areas_mm2": [round(float(x), 9) for x in area],
+            "face_normals": [[round(float(y), 4) for y in x] for x in unit],
+        }
+        if labels is not None:
+            rec["provenance"] = [str(labels[i]) for i in inc]
+        out.append(rec)
+    return out
+
+
+def _weld_with_face_map(verts, faces):
+    """`cg.weld_vertices`, plus which input faces survived.
+
+    Identical arithmetic - exact position equality, index-degenerate faces
+    dropped - but it also returns the surviving face indices so a provenance
+    label array can be carried across the weld. Duplicating the arithmetic
+    would risk the two drifting, so this is the one implementation and
+    `cg.weld_vertices` is left alone as the public form.
+    """
+    v = np.asarray(verts, float)
+    f = np.asarray(faces, np.int64)
+    uniq, inverse = np.unique(v, axis=0, return_inverse=True)
+    if len(uniq) == len(v):
+        return v, f, 0, np.arange(len(f))
+    g = inverse.ravel()[f]
+    keep = ((g[:, 0] != g[:, 1]) & (g[:, 1] != g[:, 2]) & (g[:, 0] != g[:, 2]))
+    return uniq, g[keep], int(len(v) - len(uniq)), np.where(keep)[0]
+
+
+def self_touch_report(verts, faces, labels=None, limit=12):
+    """Where a boolean result's boundary TOUCHES ITSELF, and between what.
+
+    manifold3d records a self-touch as two vertices at an identical position
+    under different indices. The control that makes this readable: a clean
+    transversal union of two cubes, two rotated cubes, a cube and a sphere,
+    and even two cubes meeting FACE TO FACE all produce zero coincident
+    positions, while two cubes meeting along an EDGE produce exactly one
+    coincident pair and one non-manifold edge. So a coincident position is not
+    a run boundary or a tolerance artefact - it is the boundary touching
+    itself, and welding it (which binary STL forces, because it stores
+    positions) is what turns it into a non-manifold edge.
+    """
+    v = np.asarray(verts, float)
+    f = np.asarray(faces, np.int64)
+    uniq, inv, cnt = np.unique(v, axis=0, return_inverse=True,
+                               return_counts=True)
+    inv = inv.ravel()
+    groups = np.where(cnt > 1)[0]
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    rep = {"coincident_position_groups": int(len(groups)),
+           "duplicated_vertices": int(len(v) - len(uniq)),
+           "zero_area_triangles": int((area <= 0.0).sum()),
+           "min_triangle_area_mm2": (round(float(area.min()), 12)
+                                     if len(area) else None),
+           "touches": []}
+    if labels is None or not len(groups):
+        return rep
+    vface = {}
+    for t in range(len(f)):
+        for vi in f[t]:
+            vface.setdefault(int(vi), []).append(t)
+    pairs = {}
+    for g in groups[:limit]:
+        mem = np.where(inv == g)[0]
+        srcs = sorted({str(labels[t]) for vi in mem for t in vface.get(int(vi), [])})
+        rep["touches"].append({
+            "position": [round(float(x), 6) for x in v[mem[0]]],
+            "copies": int(len(mem)),
+            "sources": srcs})
+        pairs[" + ".join(srcs)] = pairs.get(" + ".join(srcs), 0) + 1
+    rep["touching_source_pairs"] = pairs
+    return rep
+
+
+def serialisation_forensics(verts, faces, labels=None, limit=8,
+                            write=None, read=None):
+    """The whole chain for one stage, measured at every point, not two.
+
+    in-memory boolean -> our export weld -> written STL bytes -> reread ->
+    the weld a downstream reader performs. Each point reports open and
+    non-manifold edge counts, and every offending edge is dissected with its
+    incident faces and their provenance.
+
+    `write`/`read` are injected so this module does not need to know about the
+    STL layer; the caller passes `cg.write_binary_stl_bytes` and
+    `stl_io.parse_stl_bytes`.
+    """
+    v = np.asarray(verts, float)
+    f = np.asarray(faces, np.int64)
+    lab = None if labels is None else np.asarray(labels, dtype=object)
+    chain = []
+
+    def point(name, vv, ff, ll):
+        r = cg.manifold_report(ff)
+        chain.append({
+            "point": name,
+            "open_edges": int(r["open_edges"]),
+            "nonmanifold_edges": int(r["nonmanifold_edges"]),
+            "worst_edge_faces": int(r["worst_edge_faces"]),
+            "triangles": int(len(ff)),
+            "vertices": int(len(vv)),
+            "open_edge_detail": dissect_edges(vv, ff, "open", ll, limit),
+            "nonmanifold_edge_detail": dissect_edges(vv, ff, "nonmanifold",
+                                                     ll, limit)})
+
+    point("after_boolean_in_memory", v, f, lab)
+    chain[-1]["self_touch"] = self_touch_report(v, f, lab, limit)
+
+    q = v.astype(np.float32).astype(np.float64)
+    wv, wf, merged, kept = _weld_with_face_map(q, f)
+    wl = None if lab is None else lab[kept]
+    point("after_export_weld", wv, wf, wl)
+    chain[-1]["merged_vertices"] = int(merged)
+
+    if write is not None and read is not None:
+        blob = write(wv, wf)
+        rv, rf = read(blob)
+        point("after_stl_write_and_reread", rv, rf, None)
+        rwv, rwf, rmerged, _ = _weld_with_face_map(rv, rf)
+        point("after_reader_weld", rwv, rwf, None)
+        chain[-1]["merged_vertices"] = int(rmerged)
+    return {"chain": chain}
+
 
 
 def collapse_short_nonmanifold_edges(verts, faces, max_len_mm=0.05):
@@ -1372,7 +2295,12 @@ def collapse_short_nonmanifold_edges(verts, faces, max_len_mm=0.05):
     """
     v = np.asarray(verts, float).copy()
     f = np.asarray(faces, np.int64).copy()
+    # `kept_faces` is present on EVERY return path, including the three early
+    # ones. A caller carrying a per-triangle provenance array indexes with it,
+    # and an early return that omitted it would raise a KeyError on exactly the
+    # stages where nothing needed repairing - the common case.
     info = {"collapsed_edges": 0, "removed_faces": 0,
+            "kept_faces": np.arange(len(np.asarray(faces, np.int64))),
             "max_len_mm": float(max_len_mm), "edge_lengths_mm": []}
     if not len(f):
         return v, f, info
@@ -1412,6 +2340,11 @@ def collapse_short_nonmanifold_edges(verts, faces, max_len_mm=0.05):
     degenerate = ((f2[:, 0] == f2[:, 1]) | (f2[:, 1] == f2[:, 2])
                   | (f2[:, 0] == f2[:, 2]))
     info["removed_faces"] = int(degenerate.sum())
+    # WHICH FACES SURVIVED, so a caller carrying a per-triangle provenance
+    # array can bring it along. Without it the labels silently go out of step
+    # with the faces, and the mismatch only shows on the stages where the
+    # repair actually collapsed something.
+    info["kept_faces"] = np.where(~degenerate)[0]
     f2 = f2[~degenerate]
 
     # Compact, keeping the SURVIVING original coordinate for each cluster -

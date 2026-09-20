@@ -2161,13 +2161,23 @@ export default function App() {
       a.download = `Stage_${stage || staging.total}_FINAL.zip`;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(href);
+      // READ THE SERVER'S VERDICT, never infer it from HTTP 200. A 200 means
+      // the bytes arrived; the aggregate manufacturing gate is what decides
+      // whether they may be manufactured, and it is the server that ran it.
+      const ready = res.headers.get("X-Print-Ready") === "true";
       setPrintVerdict({
-        ready: true,
+        ready,
         detail: `Stage ${res.headers.get("X-Stage")}: `
               + `${res.headers.get("X-Open-Edges")} open edges, `
               + `${res.headers.get("X-Nonmanifold-Edges")} non-manifold, `
-              + `${res.headers.get("X-Components")} body. Manufacturing geometry `
-              + `validated against engineering gates - not a clinical claim.`,
+              + `${res.headers.get("X-Components")} body. `
+              + (ready
+                 ? "Every aggregate manufacturing gate passed on the written "
+                 + "file - an engineering statement about geometry, not a "
+                 + "clinical claim, and not verified on any real scan."
+                 : "The written file passed the boolean/topology regression "
+                 + "but NOT the aggregate manufacturing gate; see manifest.json "
+                 + "in the download for which gate failed and what it measured."),
         gates: [],
       });
       setStatus("Final print STL downloaded and validated.");

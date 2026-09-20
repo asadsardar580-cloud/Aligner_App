@@ -257,33 +257,114 @@ def test_a_new_local_interface_exists_at_the_target_position():
         # The interface IS the connector now; there is no cavity solid.
         assert r.ok and r.seat_verts is not None
         rim_k = cg.apply_matrix(v[np.asarray(recs[0]["socket_rim"], np.int64)], M)
-        cont = mfg.interface_continuity(rim_k, r.seat_verts)
+
+        # CONTINUITY IS MEASURED AGAINST THE SOLID, not against its vertices.
+        # `interface_continuity` compares each rim point with the nearest
+        # connector VERTEX at a 1mm tolerance, which was right for a loft whose
+        # top ring hugged the rim and is wrong for a collar that ENCLOSES it:
+        # the rim is now strictly inside the solid and the nearest ring vertex
+        # can legitimately be 2mm away, so the vertex measure reads 11% covered
+        # for a band that covers the rim completely. Inside-ness is the
+        # property that matters, and the exact signed distance answers it.
+        cont = r.diagnostics["continuity"]
         assert cont["covered_fraction"] > 0.75, cont
-        print(f"PASS  interface covers {cont['covered_fraction']:.1%} of the rim, "
-              f"largest gap {cont['largest_angular_gap_deg']}deg")
+        assert cont["continuous"], cont
+        assert cont["max_rim_signed_distance_to_connector_mm"] < 0.0, cont
+        # The crown's own cervical crease must be INSIDE the connector - that
+        # is what stops the connector's surface crossing a crease, which is
+        # where every self-touch in the fused solid was measured to sit.
+        assert r.diagnostics["crease_points_outside_collar"] == 0, r.diagnostics
+        # And the vertex-based measure still exists and still works on the
+        # geometry it was written for.
+        assert mfg.interface_continuity(rim_k, rim_k)["covered_fraction"] == 1.0
+        print(f"PASS  interface encloses {cont['covered_fraction']:.1%} of the "
+              f"rim, largest gap {cont['largest_angular_gap_deg']}deg, "
+              f"deepest rim point {cont['max_rim_signed_distance_to_connector_mm']}mm inside")
     finally:
         api_core.close_session(sid)
 
 
 def test_old_socket_reconstruction_quality():
-    """Case 18. The T0 site must be restored, not replaced by a new defect."""
+    """Case 18. The T0 site must be restored, not replaced by a new defect.
+
+    MEASURED ON THE CAST'S OWN SURFACE, which is why this reads the production
+    manifest rather than calling the metric on a reread STL. The finished model
+    over the old site is often the CROWN - a barely-moved tooth is still
+    standing there - and scoring the crown's occlusal surface as if it were
+    restored gingiva reported a 4.42mm "crater" at a site nothing had touched.
+    The export separates the two with per-triangle provenance; a test parsing
+    an STL cannot, so it asserts the integrated result.
+    """
     sid, tids, recs, v, bv, bf = _cast_and_teeth([dict(d_oa=1.2), dict(d_md=0.6)])
     try:
         bundle = api_core.build_stage_bundle(sid, api_core.StageExportRequest())
-        import stl_io
-        blob = bundle["blobs"][bundle["manifest"]["stage_files"][-1]["file"]]
-        fv, ff = stl_io.parse_stl_bytes(blob)
+        pol = mfg.DEFAULT_POLICY
+        seen = 0
+        for meta in bundle["manifest"]["stage_files"]:
+            for row in meta["interfaces"]:
+                q = row["old_site"]
+                assert q["measured"], q
+                assert "point-to-TRIANGLE" in q.get("measure", "") or                     not q.get("assessable"), q
+                if not q.get("assessable"):
+                    # A DETERMINATE ANSWER, not an unchecked one.
+                    assert 0.0 <= q["obscured_fraction"] <= 1.0, q
+                    assert q["reason"], q
+                    continue
+                seen += 1
+                assert q["crater_depth_mm"] <= pol.max_old_site_defect_mm, q
+                assert q["plateau_height_mm"] <= pol.max_old_site_defect_mm, q
+                assert q["largest_step_change_mm"] <= pol.max_old_site_step_mm, q
+                assert q["patches"] <= 1, q
+        print(f"PASS  old site integrated into the manifest: {seen} assessable "
+              f"record(s) across {len(bundle['manifest']['stage_files'])} stages")
+    finally:
+        api_core.close_session(sid)
+
+
+def test_old_site_quality_actually_detects_a_crater():
+    """And the metric can FAIL, which is the half a passing case cannot show.
+
+    CLAUDE.md section 5: verify a fixture reproduces the bug before trusting a
+    regression test. A crater is dug into the restored site deliberately and
+    the measurement has to name it.
+    """
+    sid, tids, recs, v, bv, bf = _cast_and_teeth([dict(d_oa=1.2)])
+    try:
         rim0 = v[np.asarray(recs[0]["socket_rim"], np.int64)]
-        q = mfg.old_site_quality(bv, bf, fv, ff, rim0)
-        assert q["measured"], q
-        # The restored site must not stray further from the original cast than
-        # the untouched tissue immediately around it, by more than 2mm. The
-        # moved crown itself sits over this region, so some excess is expected;
-        # this catches a crater or a tower, not a tooth. Engineering threshold.
-        assert q["excess_over_surroundings_mm"] < 2.0, q
-        print(f"PASS  old site: inside max={q['inside_max_deviation_mm']}mm vs "
-              f"surroundings {q['surrounding_max_deviation_mm']}mm "
-              f"(excess {q['excess_over_surroundings_mm']}mm)")
+        u = np.asarray(recs[0]["frame"]["u_oa"], float)
+        centre = rim0.mean(axis=0)
+        clean = mfg.old_site_quality(bv, bf, bv, bf, rim0, u_oa=u)
+        assert clean["measured"] and clean.get("assessable"), clean
+        assert clean["crater_depth_mm"] < 1e-6, clean
+
+        # Push every REFERENCED cast vertex over the old site 1.5mm along
+        # -u_oa. Referenced matters: 47 of the cast's vertices sit inside this
+        # site and NONE of them are used by a face - they are the crown the
+        # trim removed, kept because rule 3.1 forbids rebuilding the scan's
+        # array - so digging by 3D proximity moved 47 phantoms and changed no
+        # surface at all. The first version of this control did exactly that
+        # and "passed" by reporting a 0.0mm crater.
+        dug = np.array(bv, copy=True)
+        fb = np.asarray(bf, np.int64)
+        nrm = u / (np.linalg.norm(u) or 1.0)
+        cen = dug[fb].mean(axis=1) - centre
+        in_plane = np.linalg.norm(cen - np.outer(cen @ nrm, nrm), axis=1)
+        over = in_plane < float(
+            np.linalg.norm(rim0 - centre, axis=1).max()) * 0.5
+        inside = np.zeros(len(dug), bool)
+        inside[np.unique(fb[over])] = True
+        assert inside.sum() > 10, f"the control moved {inside.sum()} vertices"
+        dug[inside] -= u * 1.5
+        bad = mfg.old_site_quality(bv, bf, dug, bf, rim0, u_oa=u)
+        assert bad["measured"] and bad.get("assessable"), bad
+        assert bad["crater_depth_mm"] > 1.0, bad
+        assert bad["crater_depth_mm"] > mfg.DEFAULT_POLICY.max_old_site_defect_mm
+        assert bad["largest_step_change_mm"] > mfg.DEFAULT_POLICY.max_old_site_step_mm
+        assert clean["largest_step_change_mm"] < 1e-6, clean
+        print(f"PASS  a deliberate 1.5mm crater is reported as "
+              f"{bad['crater_depth_mm']}mm deep, step change "
+              f"{bad['largest_step_change_mm']}mm, against "
+              f"{clean['crater_depth_mm']}mm / {clean['largest_step_change_mm']}mm clean")
     finally:
         api_core.close_session(sid)
 
@@ -573,7 +654,11 @@ def test_ray_landing_records_how_each_point_was_resolved():
         d = r.diagnostics
         levels = d["ramp_retry_levels"]
         lifted = d["rim_points_lifted"]
-        assert sum(levels.values()) == lifted, (levels, lifted)
+        # EVERY rim point is resolved now, not only the lifted ones: the
+        # connector is one collar whose lower ring lands for the whole rim,
+        # so a seated point has a landing too and has to say how it found it.
+        assert sum(levels.values()) == d["rim_points"], (levels, d["rim_points"])
+        assert lifted <= d["rim_points"]
         # Nothing may be left unresolved: -1 is "never landed", and the
         # interface would have refused rather than reach here.
         assert levels["-1"] == 0, levels
@@ -659,9 +744,17 @@ def test_unused_vertices_cannot_change_the_manufacturing_signed_distance():
             f"unused vertices changed the signed distance: "
             f"max delta {np.abs(a - b).max()}")
 
-        # And the interface built on top of it must be identical too.
-        M1, r1 = _interface(bv, bf, recs[0], v, dict(d_oa=0.5), probe_a)
-        M2, r2 = _interface(padded, bf, recs[0], v, dict(d_oa=0.5), probe_b)
+        # And the interface built on top of it must be identical too - BUILT
+        # THROUGH THE CONSTRUCTOR, not handed a probe. Passing `probe_a` and
+        # `probe_b` explicitly made this half of the test vacuous: the only
+        # uses of `base_verts` inside build_stage_tooth_interface are
+        # `np.asarray(base_verts, float)` and `probe or CastProbe(...)`, so
+        # with a probe supplied the padded array was converted and discarded,
+        # and the comparison would have held even if the defect were fully
+        # reintroduced. CLAUDE.md section 5: verify a fixture reproduces the
+        # bug before trusting a regression test.
+        M1, r1 = _interface(bv, bf, recs[0], v, dict(d_oa=0.5), None)
+        M2, r2 = _interface(padded, bf, recs[0], v, dict(d_oa=0.5), None)
         assert r1.ok and r2.ok
         assert r1.diagnostics["interface_mode"] == r2.diagnostics["interface_mode"]
         assert (r1.diagnostics["connector_volume_mm3"]
