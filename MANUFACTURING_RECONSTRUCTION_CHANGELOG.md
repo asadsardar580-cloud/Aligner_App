@@ -535,6 +535,16 @@ CASE A (penetrating), CASE B (separated) and CASE C (mixed) all use this one
 construction and need no partition, because both rings are solved PER RIM POINT
 against the real surfaces.
 
+**Enclosure is ENFORCED WITHIN A BUDGET, not guaranteed.** After the loft is
+built, `rim_k` is measured against the collar's own signed distance and any
+point not inside by `clearance_mm` has its rings pushed radially outward, up to
+eight times, bounded by the same outward allowance the neighbour clamp
+protects. `crease_points_outside_collar` and `crease_inside_collar_max_mm`
+report what was achieved — on a 0.6 mm extrusion with 3° of tip, one tooth left
+3 of 46 crease points outside by 0.0431 mm and the fused stage still came out
+with zero self-touching contacts. Enclosure is the mechanism; the self-touch
+count is the measurement that decides.
+
 **Six things had to be measured rather than reasoned, and each one was a
 separate wrong answer first:**
 
@@ -715,6 +725,17 @@ overlap / connector-cast overlap / fused · adjacent bridges · clinical
 consistency · per-phase seconds. Per tooth: interface mode, continuity,
 transition quality, old-site quality, rigidity (edge lengths, sampled pairwise
 distances, triangle areas, RᵀR−I, det−1), clearance decision and reason.
+
+### Where the aggregate gate stands, exactly
+
+The 25-case matrix asserts the BOOLEAN/TOPOLOGY gate: every case produces a
+closed, single-bodied, correctly wound STL with zero self-touching contacts.
+The aggregate gate asks the wider question and does not always answer yes.
+Measured on a movement the matrix does not cover - 0.6mm extrusion with 3
+degrees of tip over 3 stages - stages 1 and 2 are PRINT READY and stage 3 is
+refused `no_transition_ledge` at `largest_step_share` 0.9274. That is the gate
+working on an emergence profile still too abrupt for that combination. It is
+recorded as a limitation rather than tuned away.
 
 The unwelded serialisation probe is now GATED. Benchmarked on a 203,522-face
 mesh — the real cast base is 190,036 — the write, parse, weld and two reports

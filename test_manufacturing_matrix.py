@@ -361,6 +361,13 @@ def test_the_aggregate_gate_is_what_decides_print_ready():
         if gate["print_ready"]:
             assert gate["verdict"] == "PRINT READY"
             assert not gate["failed_gates"]
+    # AND IT MUST BE REACHABLE. A gate that never says yes is indistinguishable
+    # from a gate that is broken, and this fixture is one the reconstruction
+    # handles: every stage of it passed when this assertion was written.
+    assert all(s["print_ready"] for s in stages), (
+        "the aggregate gate refused a stage of the fixture it is pinned on: "
+        + "; ".join(f"stage {s['stage']}: {s['manufacturing_gate']['failed_gates']}"
+                    for s in stages if not s["print_ready"]))
     print("PASS  aggregate gate: "
           + ", ".join(f"stage {s['stage']} {s['verdict']}" for s in stages))
 

@@ -33,6 +33,8 @@ python -m compileall .                  # syntax, whole tree
 python check_structure.py               # undefined names without importing (88 files)
 python run_all_tests.py                 # CANONICAL runner — 36 entries
 python -m pytest -q                     # runs alongside; both must pass
+python bench_signed_distance.py         # scores the signed-distance method
+python real_scan_regression.py          # the real scan, end to end — see §23
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 cd frontend && npm run lint && npm run build && npm run smoke
 ```
@@ -1877,6 +1879,17 @@ CASE A (penetrating), CASE B (separated) and CASE C (mixed) all use this one
 construction and need no partition, because both rings are solved PER RIM POINT
 against the real surfaces.
 
+**ENCLOSURE IS ENFORCED WITHIN A BUDGET, NOT GUARANTEED, and the manifest says
+which.** After the loft is built, `rim_k` is measured against the collar's own
+signed distance and any point not inside by `clearance_mm` has its two rings
+pushed radially outward, up to eight times, bounded by the same outward
+allowance the neighbour clamp protects. `crease_points_outside_collar` and
+`crease_inside_collar_max_mm` report what was achieved: measured on a 0.6mm
+extrusion with 3 degrees of tip, one tooth left 3 of 46 crease points outside
+by 0.0431mm and the fused stage still came out with ZERO self-touching
+contacts. So enclosure is the mechanism, and the self-touch count is the
+measurement that actually decides.
+
 **Six things had to be measured, and each was a wrong answer first:**
 
 1. **The upper ring must clear the CAST, not just sit above the rim.** On a
@@ -2003,8 +2016,19 @@ refusing on it would block ordinary crowding: two teeth 2.36 mm apart take
 
 `test_manufacturing_matrix.py` is **25 cases, all passing**, including adjacent,
 crowded, converging and overlapping-cervical-rim pairs.
-`test_manufacturing_interface.py` is **38**. The aggregate gate reaches PRINT
-READY on the synthetic fixtures.
+`test_manufacturing_interface.py` is **38**.
+
+**THE MATRIX ASSERTS THE BOOLEAN/TOPOLOGY GATE, NOT THE AGGREGATE ONE, and the
+difference is real.** Every one of the 25 cases produces a closed, single-bodied,
+correctly wound STL with zero self-touching contacts; the aggregate gate then
+asks the wider question, and it does not always answer yes. Measured on a
+movement the matrix does not cover - 0.6mm extrusion with 3 degrees of tip over
+3 stages - stages 1 and 2 are PRINT READY and stage 3 is refused
+`no_transition_ledge` with `largest_step_share` 0.9274. That is the gate doing
+its job on an emergence profile that is still too abrupt for that combination,
+and it is recorded as a limitation rather than tuned away: the threshold was
+written for the collar bug it caught, and moving it to make a case pass is the
+parameter sweep this work does not do.
 
 **REAL-SCAN MANUFACTURING REGRESSION = EXECUTED THROUGH TOOTH SELECTION ONLY.**
 `real_scan_regression.py` drives `case_lower.stl` through upload, conditioning,

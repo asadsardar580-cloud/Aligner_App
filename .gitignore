@@ -38,6 +38,13 @@ Aligner_App_AI_Export_*.zip
 # --- Misc ---
 *.log
 
+# --- Telemetry spans ---
+# `scratch/` is where telemetry.py's file exporter writes. They are runtime
+# artefacts, they rotate to megabytes across a test run, and the PHI filter is
+# what keeps them clean - but a span file is still a record of what was done
+# on this workstation and does not belong in version history.
+scratch/
+
 # --- Playwright ---
 frontend/test-results/
 frontend/playwright-report/
