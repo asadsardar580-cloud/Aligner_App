@@ -653,13 +653,121 @@ def build_stage_tooth_interface(
     rnorm = np.linalg.norm(radial, axis=1, keepdims=True)
     inset_dir = np.divide(radial, np.where(rnorm < 1e-12, 1.0, rnorm))
 
+    # === CASE A: PENETRATION -> CROWN-DERIVED LOCAL CLEARANCE ============
+    #
+    # THE TOOL IS THE CROWN DILATED, NOT THE CROWN. That distinction is the
+    # whole fix, and the previous pass got it wrong in the opposite direction.
+    # Cutting with the crown ITSELF is `(cast - crown) u crown`, an identity on
+    # geometry and not on topology: the cavity wall IS the crown's surface and
+    # the union lays that same surface back on top of itself, so manifold3d
+    # emits coincident-but-distinct vertices and a weld turns every one into a
+    # non-manifold edge. Measured across a 1.2mm extrusion, 0,11,5,9,5 with the
+    # crown-cut against 0,0,0,1,0 without. Removing the cut was right.
+    #
+    # WHAT REMOVING IT LEFT BEHIND is the defect this now fixes. With no cut,
+    # a barely-moved crown sits almost exactly in its original socket, so its
+    # outer surface and the cast's gingival surface are THE SAME SCAN
+    # TRIANGLES a few microns apart over a long band. manifold3d unions them
+    # into a solid that TOUCHES ITSELF along that band - valid as an indexed
+    # mesh, and inexpressible in any position-based format. Measured on
+    # extrusion 0.25mm stage 2: the boolean output is clean (0 non-manifold
+    # edges), the written STL rereads with 40, and welding leaves 3. A small
+    # movement is WORSE than a large one for exactly this reason - at 1.2mm
+    # the crown is clear of the old socket wall and nothing grazes.
+    #
+    # Dilating the crown by `clearance_mm` before subtracting breaks the
+    # coincidence without reintroducing it: the cavity wall now stands that
+    # distance AWAY from the crown, so no surface in the result is a copy of
+    # any other. The crown itself is untouched and stays exactly a rigid
+    # transform of T0 - the tool is a separate solid built from it, and the
+    # rigidity test still measures the crown alone.
+    #
+    # The clearance is the SMALLEST that removes the coincidence, not a
+    # margin chosen for comfort: it has to exceed the scanner's own resolution
+    # (20-50 microns) so the two surfaces cannot be the same measurement, and
+    # `clearance_mm` is 0.05 for that reason. It is not a socket depth and
+    # cannot become one - the tool's extent is the crown's extent.
     needs_cut = mode in ("penetrating", "mixed")
-    diag["cut_with_crown"] = bool(needs_cut)
-    diag["cavity_volume_mm3"] = None          # no synthetic socket is built
+    diag["cut_with_crown"] = False            # never the crown itself
+    diag["clearance_measured"] = bool(needs_cut)
+    diag["clearance_mm"] = float(pol.clearance_mm) if needs_cut else 0.0
     diag["depth_used_mm"] = round(float(penetration), 4) if needs_cut else 0.0
     diag["depth_wanted_mm"] = round(float(penetration), 4)
     diag["depth_clamped_by"] = None
     cav_v = cav_f = None
+    if needs_cut:
+        # CASE B (pure separation) never reaches here, so no generic socket is
+        # ever cut merely because the rim moved. CASE C (mixed) uses the same
+        # tool and needs no partition: a solid built from the crown removes
+        # material only where the crown actually is, so penetrating sectors get
+        # clearance and separated sectors are untouched by construction.
+        # THE OFFSET IS PER VERTEX, AND IT CHANGES SIGN WITH DEPTH. A uniform
+        # dilation was tried first and is too blunt: it removes the cast
+        # everywhere the crown is, INCLUDING the deep penetration that is the
+        # fusion. Measured, it fixed extrusion 0.25mm and broke five other
+        # cases into two bodies - the tooth and its bridge severed from a cast
+        # they no longer touched, with seat-to-cast overlap still reading 51
+        # to 67 mm3 against the pre-cut cast.
+        #
+        # So the tool is pushed OUT where the two surfaces graze and pulled IN
+        # where the crown is properly buried:
+        #
+        #   at the surface (sd = 0)      +clearance_mm   -> breaks the tangency
+        #   at depth (sd <= -band)       -fusion_overlap -> leaves real
+        #                                                   common volume
+        #
+        # blended linearly between, so there is no step for the boolean to
+        # resolve. Where the offset is negative the cavity wall lies INSIDE
+        # the crown and the union covers it, which is why that half cannot
+        # reintroduce a coincident surface either.
+        band = max(pol.cavity_outset_mm, 1e-6)
+        sd = probe.signed(crown_k)
+        w = np.clip(-sd / band, 0.0, 1.0)          # 0 at the surface, 1 deep
+        offset = pol.clearance_mm * (1.0 - w) - pol.fusion_overlap_mm * w
+        cav_f = np.asarray(crown_faces, np.int64)
+        tool_v = (np.asarray(crown_k, float)
+                  + cg.vertex_normals(crown_k, cav_f) * offset[:, None])
+
+        # MEASURED, NOT CUT - and the measurement is why. `graze` counts crown
+        # vertices whose distance to the cast is inside the band, i.e. whose
+        # surface is near-coincident with the cast's. On this fixture it reads
+        # 113 of 127, and 121 of 132 on the second tooth: the crown sits in
+        # ITS OWN FILLED SOCKET, so the crown's surface IS the cast's surface
+        # over almost its whole area and there is no deeply-buried region to
+        # keep the fusion alive. Subtracting this tool therefore clears the
+        # cast away from nearly the entire crown, and the union falls to TWO
+        # BODIES - measured, 8 of 18 matrix cases, with seat-to-cast overlap
+        # still reading 51-67mm3 against the PRE-cut cast, which is what made
+        # the severance confusing until the graze count was added.
+        #
+        # Both variants were built and measured: a uniform +0.05mm dilation,
+        # and this depth-modulated form that pulls the tool INSIDE the crown
+        # where it is buried. Both fix extrusion 0.25mm and both sever the
+        # tipping, rotation and buccolingual cases, because the modulation has
+        # almost nothing to hold on to.
+        #
+        # The tool is therefore NOT emitted. What is missing before it can be
+        # is a connector that is guaranteed to bite the POST-clearance cast -
+        # today `overlap_seat_cast_mm3` is measured against the original cast
+        # and cannot see the void the clearance creates. That is the next
+        # change, and inventing a bigger seat to paper over it would be the
+        # parameter sweep this work is explicitly not doing.
+        diag["clearance_tool_emitted"] = False
+        diag["clearance_band_mm"] = round(float(band), 4)
+        diag["crown_min_signed_distance_mm"] = round(float(sd.min()), 4)
+        diag["crown_max_signed_distance_mm"] = round(float(sd.max()), 4)
+        diag["near_coincident_fraction"] = round(
+            float((np.abs(sd) < band).mean()), 4)
+        diag["clearance_offset_min_mm"] = round(float(offset.min()), 4)
+        diag["clearance_offset_max_mm"] = round(float(offset.max()), 4)
+        diag["crown_points_in_graze_band"] = int((w < 1.0).sum())
+        diag["crown_points_deeply_buried"] = int((w >= 1.0).sum())
+        diag["clearance_tool_volume_mm3"] = round(
+            float(abs(cg.signed_volume(tool_v, cav_f))), 4)
+        diag["crown_volume_mm3"] = round(
+            float(abs(cg.signed_volume(crown_k, cav_f))), 4)
+        cav_v = cav_f = None          # measured above; deliberately not cut
+    diag["cavity_volume_mm3"] = diag.get("clearance_tool_volume_mm3")
 
     # === ONE INTEGRATED TRANSITION VOLUME =================================
     #
@@ -1392,6 +1500,17 @@ def validate_printable_stl(blob, expect_components=1):
     report["reread_vertices"] = int(len(pv))
     report["reread_faces"] = int(len(pf))
 
+    # THE RAW REREAD, BEFORE ANY WELD. Without this the chain jumps straight
+    # from the in-memory boolean to the reread-AND-welded result, and those
+    # two differ for two quite separate reasons: what float32 serialisation
+    # did, and what the reader's weld did. Distinguishing them is the whole
+    # point of measuring the chain at all.
+    raw = cg.manifold_report(pf)
+    report["edges_post_read_before_weld"] = {
+        "open": int(raw["open_edges"]),
+        "nonmanifold": int(raw["nonmanifold_edges"]),
+        "total": int(raw["total_edges"])}
+
     wv, wf, merged = cg.weld_vertices(pv, pf)
     report["reader_weld_merged_vertices"] = int(merged)
     report["welded_vertices"] = int(len(wv))
@@ -1433,8 +1552,29 @@ def validate_printable_stl(blob, expect_components=1):
     report["gates"] = gates
     report["failed_gates"] = [g["gate"] for g in gates if not g["passed"]]
     report["print_ready"] = len(report["failed_gates"]) == 0
-    report["verdict"] = "PRINT READY" if report["print_ready"] else "NOT PRINT READY"
+    # THE WORDING IS DELIBERATE AND IT IS NARROWER THAN IT WAS. This function
+    # checks the BOOLEAN/TOPOLOGY properties of the written bytes and nothing
+    # else, so calling its result "PRINT READY" claims a great deal it has not
+    # measured. The aggregate manufacturing verdict additionally requires
+    # transition quality, interface continuity, old-site quality, two-sided
+    # unaffected-cast fidelity, ROI compliance, seat/ramp exposure and
+    # prescription consistency - none of which are evaluated here.
+    report["verdict"] = ("PASSES BOOLEAN/TOPOLOGY REGRESSION"
+                         if report["print_ready"] else
+                         "FAILS BOOLEAN/TOPOLOGY REGRESSION")
+    report["gate_scope"] = {
+        "covers": ["finite_coordinates", "zero_open_edges",
+                   "zero_nonmanifold_edges", "positive_volume",
+                   "single_component", "consistent_winding",
+                   "stl_round_trip_and_reader_weld"],
+        "does_not_cover": ["transition_quality", "interface_continuity",
+                           "old_site_quality", "two_sided_cast_fidelity",
+                           "roi_compliance", "seat_ramp_exposure",
+                           "crown_rigidity", "prescription_consistency"],
+        "note": ("this is NOT the aggregate PRINT READY verdict. It is the "
+                 "boolean/topology half of it, measured on the actual written "
+                 "STL after a downstream reader's weld.")}
     report["wording_note"] = (
         "manufacturing geometry validated against engineering gates. NOT a "
-        "claim of clinical validation.")
+        "claim of clinical validation, and NOT the full manufacturing gate.")
     return report

@@ -403,9 +403,21 @@ def test_a_failed_gate_makes_print_ready_impossible():
     blob = cg.write_binary_stl_bytes(verts, faces)
     rep = mfg.validate_printable_stl(blob)
     assert rep["print_ready"] is False
-    assert rep["verdict"] == "NOT PRINT READY"
+    # THE VERDICT IS DELIBERATELY NARROWER THAN "PRINT READY". This function
+    # measures boolean/topology properties of the written bytes and nothing
+    # else, so it must not claim the aggregate manufacturing verdict - which
+    # also needs transition quality, old-site quality, two-sided cast
+    # fidelity, ROI compliance and seat/ramp exposure.
+    assert rep["verdict"] == "FAILS BOOLEAN/TOPOLOGY REGRESSION"
+    assert "PRINT READY" not in rep["verdict"], (
+        "this gate must not claim the aggregate manufacturing verdict")
+    scope = rep["gate_scope"]
+    assert "zero_nonmanifold_edges" in scope["covers"]
+    for unmeasured in ("transition_quality", "old_site_quality",
+                       "two_sided_cast_fidelity", "roi_compliance"):
+        assert unmeasured in scope["does_not_cover"], unmeasured
     assert "zero_open_edges" in rep["failed_gates"]
-    print(f"PASS  an open shell is NOT PRINT READY: {rep['failed_gates']}")
+    print(f"PASS  an open shell FAILS the topology gate: {rep['failed_gates']}")
 
 
 # ===========================================================================
@@ -604,6 +616,59 @@ def test_the_probe_drops_unreferenced_vertices_and_uses_an_exact_method():
         assert frac > 0.98, f"only {frac:.1%} of points 0.05mm inside read as inside"
         print(f"PASS  probe dropped {probe.dropped_unreferenced} phantom vertices; "
               f"method={probe.method}; {frac:.1%} correct 0.05mm inside")
+    finally:
+        api_core.close_session(sid)
+
+
+def test_unused_vertices_cannot_change_the_manufacturing_signed_distance():
+    """Padding the array with arbitrary unreferenced vertices must change nothing.
+
+    THE INVARIANT THIS PROTECTS is rule 3.1: the scan's vertex array is never
+    rebuilt, so the cast legitimately carries vertices no face references -
+    measured, 4497 of 8372, every crown that was trimmed away. The defect that
+    caused was not that they exist, it is that a geometric query READ them:
+    `cg.vertex_normals` leaves an unreferenced vertex's normal at ZERO, so the
+    nearest-vertex sign test computed `outward = 0.0`, `0 < 0` is False, and an
+    interior point was reported OUTSIDE at the distance to a phantom.
+
+    So the contract is not "there are no unused vertices". It is "every
+    geometric query uses the active triangles only", and this test states it
+    the way it can actually fail: by inventing new unused vertices in wild
+    positions and requiring the answers to be bit-identical.
+    """
+    sid, tids, recs, v, bv, bf = _cast_and_teeth([dict(d_oa=0.5)])
+    try:
+        rng = np.random.default_rng(11)
+        probe_a = mfg.CastProbe(bv, bf)
+
+        # 5000 unreferenced vertices scattered far outside the cast, plus some
+        # placed INSIDE it, which is the case that would actually flip a sign.
+        far = rng.uniform(-500, 500, size=(4000, 3))
+        inside = bv[np.unique(bf)].mean(axis=0) + rng.normal(scale=1.0, size=(1000, 3))
+        padded = np.vstack([bv, far, inside])
+        probe_b = mfg.CastProbe(padded, bf)     # same faces, same indices
+
+        assert probe_b.dropped_unreferenced == probe_a.dropped_unreferenced + 5000
+        assert np.array_equal(probe_a.verts, probe_b.verts)
+        assert np.array_equal(probe_a.faces, probe_b.faces)
+
+        pts = bv[np.unique(bf)][rng.choice(len(np.unique(bf)), 300, replace=False)]
+        pts = pts + rng.normal(scale=0.3, size=pts.shape)
+        a, b = probe_a.signed(pts), probe_b.signed(pts)
+        assert np.array_equal(a, b), (
+            f"unused vertices changed the signed distance: "
+            f"max delta {np.abs(a - b).max()}")
+
+        # And the interface built on top of it must be identical too.
+        M1, r1 = _interface(bv, bf, recs[0], v, dict(d_oa=0.5), probe_a)
+        M2, r2 = _interface(padded, bf, recs[0], v, dict(d_oa=0.5), probe_b)
+        assert r1.ok and r2.ok
+        assert r1.diagnostics["interface_mode"] == r2.diagnostics["interface_mode"]
+        assert (r1.diagnostics["connector_volume_mm3"]
+                == r2.diagnostics["connector_volume_mm3"])
+        print(f"PASS  5000 arbitrary unused vertices changed nothing: "
+              f"{len(pts)} probes bit-identical, connector "
+              f"{r1.diagnostics['connector_volume_mm3']:.4f}mm3 both ways")
     finally:
         api_core.close_session(sid)
 

@@ -1550,10 +1550,13 @@ the ROI mean **0.0046mm**, p95 **0.0000mm**, p99 **0.041mm**, with 23 of 2910
 points reaching 1.15mm on the trim boundary where the boolean retessellates the
 base outline.
 
-**RESOLVED 2026-09-20 — the body fragmentation was a SIGNED-DISTANCE bug, and
-the interface geometry was only the second half of it.** Extrusion measured
-`1, 1, 2, 2, 3` bodies with only 1 of 5 stages passing; it now measures
-`1, 1, 1, 1, 1` with **5 of 5 print-ready**, and `test_staging_export.py` and
+**RESOLVED 2026-09-20 — the stage fragmentation was caused by an UPSTREAM
+GEOMETRIC SIGNED-DISTANCE CLASSIFICATION DEFECT.** It is a geometry-processing
+bug, in the part of the pipeline that decides where the cast surface is.
+Extrusion measured `1, 1, 2, 2, 3` bodies with only 1 of 5 stages passing; it
+now measures `1, 1, 1, 1, 1` and **5 of 5 stages pass the current
+boolean/topology regression** — NOT "print ready", which is a wider claim the
+aggregate gate does not yet make. `test_staging_export.py` and
 `test_failsafes.py` pass on merit, untouched.
 
 `CastProbe.signed` was nearest-VERTEX distance signed against that vertex's
@@ -1593,8 +1596,55 @@ and load-bearing (§19). `trimesh.proximity.signed_distance` needs `rtree`,
 which is absent here; `closest_point_naive` gives the same accuracy without an
 index and was benchmarked instead.
 
+**WHERE THE TOPOLOGY ACTUALLY BREAKS — PROVEN, not inferred.** The chain is
+now measured at four points instead of two, and the earlier welding hypothesis
+was wrong in an instructive way. On extrusion 0.25mm stage 2:
+
+| point | open | non-manifold |
+|---|---|---|
+| after the boolean, in memory | 0 | **0** |
+| after OUR export weld | 0 | **3** (merged 20) |
+| after STL write + reread | 0 | 3 |
+| after the reader's weld | 0 | 3 (**merged 0**) |
+
+So: **STL serialisation does not change the topology, and the downstream weld
+does not either** — it finds nothing left to merge. manifold3d's output is
+clean, and welding the coincident-but-distinct vertices it deliberately keeps
+is what creates the non-manifold edges. `parse_stl_bytes` already dedups by
+position, so the raw reread of an UNWELDED write reads 40 non-manifold edges
+where our weld leaves 3; the difference is the degenerate faces `weld_vertices`
+drops and a plain reader keeps. Either way the mesh carries coincident vertices
+at the crown/cast interface, and that is a property of the GEOMETRY.
+
+**THE GEOMETRIC CAUSE, and why the prescribed fix does not yet work.** A
+barely-moved crown sits almost exactly in its own filled socket, so its outer
+surface and the cast's are the same scan triangles microns apart over a long
+band, and the union produces a solid that TOUCHES ITSELF along it — valid as an
+indexed mesh, inexpressible in any position-based format. A small movement is
+therefore worse than a large one: 1.2mm is clean across all five stages, 0.25mm
+is not.
+
+Penetration-aware crown-derived local clearance was implemented and measured in
+two forms — a uniform +0.05mm dilation of the transformed crown, and a
+depth-modulated version pulling the tool INSIDE the crown where it is buried
+(+clearance at the surface, −fusion_overlap past a 0.15mm band). **Both fix
+extrusion 0.25mm and both break the tipping, rotation and buccolingual cases
+into two bodies**, 8 of 18 matrix cases against 5 without. The measurement that
+explains it: `crown_points_in_graze_band / deeply_buried` reads **113 / 14** and
+**121 / 11**. The crown is in its own socket, so nearly every vertex grazes and
+there is no buried region for the modulation to hold on to — clearing the graze
+band clears essentially the whole interface, and only the seat is left to fuse.
+`overlap_seat_cast_mm3` still read 51–67 mm³ throughout, because it is measured
+against the PRE-clearance cast and cannot see the void.
+
+The tool is therefore **measured and deliberately not emitted**
+(`clearance_tool_emitted: false`), with the graze fraction, band, offsets and
+tool volume recorded per tooth per stage. What is missing before it can be
+emitted is a connector guaranteed to bite the POST-clearance cast; enlarging
+the seat to cover it would be the parameter sweep this work explicitly avoids.
+
 **WHAT IS STILL NOT FIXED, measured and reproducible.** `pytest` is
-**293 passed, 5 failed**, and all five are in the new
+**294 passed, 5 failed**, and all five are in the new
 `test_manufacturing_matrix.py`, left failing deliberately as the only
 automated signal:
 

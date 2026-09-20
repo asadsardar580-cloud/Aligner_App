@@ -341,3 +341,114 @@ that trade is recorded in the code beside the constant.
 
 `core_geometry.py` (kinematics, C_res, staging, scanner frame),
 `stl_io.py`, `arch_frame.py`, `toothGizmo.js`.
+
+---
+
+## U. 2026-09-20 — SIGNED-DISTANCE CORRECTION, SERIALISATION FORENSICS, CLEARANCE EXPERIMENT
+
+### Files changed
+
+| file | status | what changed | why | behavioural impact | tests |
+|---|---|---|---|---|---|
+| `bench_signed_distance.py` | **added** | independent signed-distance benchmark | the manufacturing gate relied on a method nobody had scored | chose the method on measurement, not habit | run directly |
+| `manufacturing.py` | modified | `CastProbe` compacts + signs exactly; `manifold_status`; `collapse_short_nonmanifold_edges`; clearance measurement; `edges_post_read_before_weld`; narrowed verdict | see below | stage fragmentation fixed | `test_manufacturing_interface.py` |
+| `api_core.py` | modified | clearance wiring, float32 weld, unwelded serialisation probe, single-body Manifold gate, recorded repair rung, narrowed verdict, clearance-before-bridge order | see below | per-stage gating and forensics | `test_manufacturing_matrix.py` |
+| `test_manufacturing_matrix.py` | **added** | 18-case end-to-end matrix | interface-level tests cannot see whether a stage fuses | 13 pass / 5 fail | itself |
+| `test_manufacturing_interface.py` | modified | +4 tests: ray-miss hygiene (AST-guarded), retry levels, probe compaction, unused-vertex invariance | brief | 37 pass | itself |
+| `frontend/src/shadowRig.js` | modified | ortho box derived from perpendicular reach; `CATCHER_SPAN`, `FRUSTUM_SLACK` | catcher corners sat outside the shadow map | corners outside 3 → 0 | `verify-shadowrig.mjs` |
+| `frontend/src/App.jsx` | modified | shadows gate + labelled toggle + `__viewportDiagnostics()` | viewport blanking on the third click | cast stays lit | `e2e/occlusal-darkening.spec.js` |
+| `frontend/src/shadowHarness.js` | **added** | real-WebGL reproduction of the rig with a per-pixel cast mask | arithmetic checks cannot tell you the viewport is lit | A–F isolation | `e2e-shadow` |
+| `frontend/shadow-harness.html` | **added** | dev-only page for the harness | never reaches `dist/` | — | — |
+| `frontend/playwright.shadow.config.js` | **added** | dev-server config for the harness | keeps the diagnostic out of the shipped bundle | — | — |
+| `frontend/e2e-shadow/shadow-darkening.spec.js` | **added** | component isolation, measured pixels | — | 1 pass | itself |
+| `frontend/e2e/occlusal-darkening.spec.js` | **added** | real-workflow luminance regression on the real scan | the actual reported bug | 2 pass | itself |
+| `frontend/verify-shadowrig.mjs` | modified | corner/off-axis containment replaces the side-length test | the old test passed while 3 of 4 corners were outside | catches it now | itself |
+| `frontend/eslint.config.js` | modified | node globals for the new configs and specs | lint | clean | `npm run lint` |
+
+**No dependency was added, removed or upgraded.** `manifold3d`, Open3D,
+`trimesh` and SciPy remain the geometry stack. `trimesh.proximity.signed_distance`
+imports `rtree`, which is not installed here; `closest_point_naive` needs no
+spatial index, gives trimesh's real accuracy, and was benchmarked instead.
+
+### The signed-distance benchmark, in full
+
+* **Reference construction** — independent of all three candidates.
+  *Magnitude:* exact closest-point-on-triangle (Ericson 5.1.5, written out in
+  full rather than clamp-and-rescale, because a clamp-and-rescale version of
+  exactly this was wrong earlier in this project) against EVERY triangle — no
+  index, no candidate pruning. *Sign:* ray parity — a closed surface is crossed
+  an odd number of times from any interior point — with three independent
+  random directions voting, and any point where a ray grazes a barycentric
+  boundary within 1e-6 reported AMBIGUOUS and excluded rather than guessed.
+* **Points** — 870 surviving of 900, across **15 classes**: exactly on a
+  triangle; 0.01 / 0.05 / 0.10 / 0.50 mm inside; 0.10 / 1.00 mm outside; steep
+  cervical wall (|n·u_occ| < 0.25) at 0.05 and 0.30 mm in; cast underside;
+  concavity (top decile of local curl); within 2% of an edge; within 2% of a
+  vertex; over the arch opening; interproximal.
+* **Old accuracy** — 77.7% sign-correct overall as shipped; **13.3%** on a
+  steep cervical wall; 25.0% in a concavity; max magnitude error **6.66 mm**.
+  With compaction alone: 91.4% / 90.0% / 76.7%, max error unchanged.
+* **New accuracy** — **100%** sign-correct on every class; max magnitude error
+  **0.0014 mm**. trimesh agrees at 100% / 0.0000 mm.
+* **Open3D `nsamples`** — the docs ask for an odd value > 1 so a sign vote
+  always has a majority. The cast is watertight by construction, so n=1 is
+  already 100% on every class here; n=11 is used anyway because it costs
+  0.17 ms on a rim and removes the dependence on that assertion holding for a
+  cast some future change builds differently.
+* **Performance**, warm-up excluded, 7,824-face cast: 44 points (a rim) —
+  CastProbe-old 4.857 ms, Open3D n=1 0.362 ms, n=11 **0.529 ms**; 500 points —
+  4.958 / 2.514 / 4.062 ms; 5,000 points — 5.916 / 5.895 / 13.501 ms. Scene
+  build 0.52 ms, once.
+
+**This is evidence, not proof for all possible geometry.** One synthetic cast,
+one point sampler, one arch frame. Randomised and surface-near property
+coverage is still to be added.
+
+### Serialisation forensics
+
+Measured at four points instead of two. On extrusion 0.25 mm stage 2:
+
+| point | open | non-manifold |
+|---|---|---|
+| after the boolean, in memory | 0 | **0** |
+| after our export weld | 0 | **3** (merged 20) |
+| after STL write + reread | 0 | 3 |
+| after the reader's weld | 0 | 3 (**merged 0**) |
+
+**STL serialisation does not change the topology, and the downstream weld does
+not either.** manifold3d's output is clean; welding the coincident-but-distinct
+vertices it deliberately keeps is what creates the edges. `parse_stl_bytes`
+already dedups by position, so an UNWELDED write rereads with 40 non-manifold
+edges where our weld leaves 3 — the difference is the degenerate faces
+`weld_vertices` drops and a plain reader keeps.
+
+### Clearance experiment — implemented, measured, deliberately not emitted
+
+Two forms were built: a uniform +0.05 mm dilation of the transformed crown, and
+a depth-modulated version (+`clearance_mm` at the surface, −`fusion_overlap_mm`
+past a 0.15 mm band). **Both fix extrusion 0.25 mm; both sever the tipping,
+rotation and buccolingual cases into two bodies** — 8 of 18 matrix cases
+failing against 5 without.
+
+The deciding measurement is the graze fraction: `crown_points_in_graze_band /
+deeply_buried` reads **113 / 14** and **121 / 11**. The crown sits in its own
+filled socket, so nearly every crown vertex is near-coincident with the cast
+and there is no buried region for the modulation to hold on to; clearing the
+graze band clears essentially the whole interface and leaves only the seat to
+fuse. `overlap_seat_cast_mm3` still read 51–67 mm³ throughout, because it is
+measured against the PRE-clearance cast and cannot see the void — which is what
+made the severance confusing until the graze count was added.
+
+Recorded per tooth per stage as `clearance_tool_emitted: false`, with the band,
+offset range, graze/deep counts and tool volume. What is missing before it can
+be emitted is a connector guaranteed to bite the POST-clearance cast; enlarging
+the seat to cover it would be the parameter sweep this work explicitly avoids.
+
+### Verdict wording
+
+`validate_printable_stl` no longer returns "PRINT READY". It returns
+**PASSES / FAILS BOOLEAN/TOPOLOGY REGRESSION** plus a `gate_scope` naming what
+it covers and, explicitly, what it does not: transition quality, interface
+continuity, old-site quality, two-sided cast fidelity, ROI compliance,
+seat/ramp exposure, crown rigidity, prescription consistency. The final-export
+endpoint carries the same narrowed verdict and a `verdict_scope`.

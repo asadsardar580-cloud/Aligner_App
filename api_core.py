@@ -2562,6 +2562,14 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             # exactly where the 0.15mm clearance in carve_socket still lives.
             # The classification above is still what shapes the connector and
             # what the manifest reports; it simply no longer drives a cut.
+            # CASE A / CASE C: the crown-derived local clearance is MEASURED
+            # in build_stage_tooth_interface and deliberately not emitted -
+            # see the long note there for the graze counts that decided it.
+            # The wiring stays so the manifest can state that nothing was
+            # removed, rather than being silent about it.
+            if iface.cavity_verts is not None:
+                cavity_tools.append(
+                    _to_manifold(iface.cavity_verts, iface.cavity_faces))
             if iface.ramp_verts is not None:
                 ramp_tools.append(_to_manifold(iface.ramp_verts, iface.ramp_faces))
             if iface.seat_verts is not None:
@@ -2607,13 +2615,30 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # fused model went from 1 body to 4 as the extrusion progressed. This
         # is also the physically sensible order: gingiva follows the tooth up,
         # and the socket is then formed through the built-up tissue.
+        # CLEARANCE FIRST, THEN THE BRIDGE. The order matters twice over and
+        # both were measured, not reasoned:
+        #
+        #   * Subtracting a full-depth generic SOCKET before building the ramp
+        #     removes the cast material the ramp has to land on and orphans
+        #     it - the fused model went from 1 body to 4 across an extrusion.
+        #     That is why the old order added first.
+        #   * But the crown-derived CLEARANCE is a different tool. Applied
+        #     after the ramp it cuts straight THROUGH the emergence bridge,
+        #     because the dilated crown passes exactly where the bridge rises
+        #     to meet the rim: measured on tipping and rotation, bodies went
+        #     to 2 with components 2 - the tooth and its bridge severed from
+        #     the cast.
+        #
+        # So the clearance acts on the CAST ALONE, before any reconstruction
+        # exists to be damaged, and it removes only 0.05mm around the crown -
+        # far too little to take away the surface the ramp lands on.
         prepared = base_solid
-        if ramp_tools:
-            prepared = m3.Manifold.batch_boolean([prepared] + ramp_tools,
-                                                 m3.OpType.Add)
         if cavity_tools:
             prepared = m3.Manifold.batch_boolean([prepared] + cavity_tools,
                                                  m3.OpType.Subtract)
+        if ramp_tools:
+            prepared = m3.Manifold.batch_boolean([prepared] + ramp_tools,
+                                                 m3.OpType.Add)
         # `cavity_tools` is empty by design - see the note above. It is kept so
         # a future interface that genuinely needs to remove material has a
         # wired path to do it, and so the manifest can say it removed nothing.
@@ -2740,6 +2765,27 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # file does anyway - this only moves that rounding to BEFORE the weld
         # instead of after it.
         sv = sv.astype(np.float32).astype(np.float64)
+
+        # WHAT WOULD A READER DO IF WE DID NOT WELD? This is the control for
+        # the whole serialisation argument, and without it the chain cannot
+        # tell "our weld created this" from "any reader would have".
+        # Measured: manifold3d's output is clean (NM 0), our weld merges the
+        # coincident vertices it deliberately kept distinct and that is what
+        # produces the non-manifold edges. So the question is whether a reader
+        # welding the UNWELDED bytes lands in the same place.
+        _probe_blob = cg.write_binary_stl_bytes(sv, sf)
+        _ppv, _ppf = stl_io.parse_stl_bytes(_probe_blob)
+        _praw = cg.manifold_report(_ppf)
+        _pwv, _pwf, _pmerged = cg.weld_vertices(_ppv, _ppf)
+        _pw = cg.manifold_report(_pwf)
+        unwelded_probe = {
+            "written_unwelded_faces": int(len(sf)),
+            "reread_open": int(_praw["open_edges"]),
+            "reread_nonmanifold": int(_praw["nonmanifold_edges"]),
+            "reader_weld_merged": int(_pmerged),
+            "after_reader_weld_open": int(_pw["open_edges"]),
+            "after_reader_weld_nonmanifold": int(_pw["nonmanifold_edges"])}
+
         sv, sf, export_welded = cg.weld_vertices(sv, sf)
         post_weld = cg.manifold_report(sf)
 
@@ -2878,6 +2924,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                 "nonmanifold": int(post_weld["nonmanifold_edges"])},
             "export_weld_merged_vertices": int(export_welded),
             "nonmanifold_edge_repair": nm_repair,
+            "unwelded_serialisation_probe": unwelded_probe,
             "edges_post_read_and_reader_weld": {
                 "open": int(validation["open_edges"]),
                 "nonmanifold": int(validation["nonmanifold_edges"])},
@@ -3135,13 +3182,22 @@ def export_final(sid: str, req: FinalExportRequest):
         "of_stages": manifest.get("stages"),
         "file": name,
         "print_ready": True,
-        "verdict": "PRINT READY",
+        # NOT "PRINT READY". This endpoint enforces the boolean/topology gate
+        # on the written bytes plus the single-body Manifold check; the
+        # aggregate manufacturing verdict also requires transition quality,
+        # interface continuity, old-site quality, two-sided cast fidelity, ROI
+        # compliance and seat/ramp exposure, which are not yet evaluated here.
+        # Claiming the stronger verdict on the weaker evidence is exactly the
+        # kind of over-statement this codebase refuses elsewhere.
+        "verdict": "PASSES BOOLEAN/TOPOLOGY REGRESSION",
+        "verdict_scope": chosen["stl_validation"].get("gate_scope"),
         # The exact wording matters. This is an engineering statement about
         # geometry, not a clinical one about a patient.
         "verdict_meaning": (
-            "Manufacturing geometry validated against engineering gates, "
-            "measured on the actual written STL after a downstream reader's "
-            "weld. This is NOT a claim of clinical validation."),
+            "Boolean and topology gates passed on the actual written STL "
+            "after a downstream reader's weld, plus one positive-volume "
+            "manifold body. This is NOT a claim of clinical validation and "
+            "NOT the aggregate manufacturing verdict - see verdict_scope."),
         "validation": chosen["stl_validation"],
         "interfaces": chosen.get("interfaces"),
         "volume_mm3": chosen.get("volume_mm3"),
