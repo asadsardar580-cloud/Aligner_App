@@ -54,8 +54,17 @@ function quatFromZTo(u) {
 /** How far past the geometry the near and far planes reach, as a multiple of
  *  the bounding radius. Section 3.1 of the brief asks for 1.5x. */
 export const FRUSTUM_MARGIN = 1.5;
-/** Half-width of the shadow camera's orthographic box, as a multiple of it. */
+/** MINIMUM half-width of the shadow camera's orthographic box, as a multiple
+ *  of the bounding radius. No longer the value itself — the box is sized from
+ *  what actually has to be inside it. See the derivation below. */
 export const FRUSTUM_HALF = 1.6;
+/** Edge of the catcher plane, as a multiple of the bounding radius. It has to
+ *  cover the cast's shadow, which is displaced about 0.43 * radius by the
+ *  sun's 23.3 degree offset, over a cast spanning 2 * radius. */
+export const CATCHER_SPAN = 3.2;
+/** Slack on the derived half-extent: float error in a chain of dot products,
+ *  not room for a mis-sized plane. */
+export const FRUSTUM_SLACK = 1.02;
 /** How far below the cast the catcher plane sits, beyond the bounding radius. */
 export const CATCHER_DROP_MM = 2;
 
@@ -137,7 +146,53 @@ export function computeShadowRig({ box, u_occ, u_sag, u_tra }) {
   // only about depth precision, not about clipping the near geometry away.
   const near = Math.max(0.1, dMin - margin);
   const far = dMax + margin;
-  const s = radius * FRUSTUM_HALF;
+
+  // THE ORTHO BOX IS DERIVED FROM WHAT MUST BE INSIDE IT, not from a constant.
+  //
+  // It used to be `radius * FRUSTUM_HALF` with the catcher sized to `2 * s` —
+  // edge to edge — and `verify-shadowrig.mjs` asserted exactly that equality,
+  // so it passed. Measured in a real WebGL context
+  // (e2e-shadow/shadow-darkening.spec.js), THREE OF THE CATCHER'S FOUR CORNERS
+  // were outside the shadow map, at NDC 1.13 and 1.23. Two things the
+  // edge-to-edge check cannot see:
+  //
+  //   * A SQUARE'S CORNERS REACH sqrt(2) FURTHER THAN ITS EDGES. Matching the
+  //     side length to the box width leaves the diagonal 41% over.
+  //   * THE CATCHER IS NOT ON THE LIGHT'S AXIS. It is dropped along -u_occ
+  //     while the sun is 23.3 degrees off u_occ, so its centre alone sits
+  //     about 0.4 * radius off-axis in shadow-camera XY before any corner is
+  //     considered.
+  //
+  // A fragment outside the map samples the depth texture with clamped UVs and
+  // comes back SHADOWED whatever is really there — a dark wedge by
+  // construction. So the half-extent is now the largest PERPENDICULAR DISTANCE
+  // FROM THE LIGHT AXIS of anything that has to be in the map. Perpendicular
+  // distance is rotation-invariant, which matters because three.js orients the
+  // shadow camera with the light's own `up` and this module does not model
+  // that — an inscribed-circle bound is correct for every orientation it might
+  // choose, where an axis-aligned bound would only be correct for one.
+  const perp = (p) => {
+    const d = sub(p, sunPosition);
+    const r = sub(d, mul(view, dot(d, view)));
+    return Math.hypot(r[0], r[1], r[2]);
+  };
+  const catcherSize = radius * CATCHER_SPAN;
+  let need = 0;
+  for (let i = 0; i < 8; i++) {
+    const corner = [i & 1 ? box.max[0] : box.min[0],
+                    i & 2 ? box.max[1] : box.min[1],
+                    i & 4 ? box.max[2] : box.min[2]];
+    need = Math.max(need, perp(corner));
+  }
+  // Every point of the catcher lies within its half-DIAGONAL of its centre,
+  // whichever way the plane is rolled about its own normal.
+  need = Math.max(need, perp(catcherPosition) + catcherSize * Math.SQRT1_2);
+
+  // FRUSTUM_HALF stays the FLOOR, not the value: a box smaller than the cast
+  // it is lighting would be a different bug, and the old constant is a
+  // reasonable minimum. FRUSTUM_SLACK covers the float error in a chain of
+  // dot products rather than hiding a mis-sized plane.
+  const s = Math.max(radius * FRUSTUM_HALF, need * FRUSTUM_SLACK);
 
   const rig = {
     sunPosition, targetPosition, catcherPosition,
@@ -145,15 +200,16 @@ export function computeShadowRig({ box, u_occ, u_sag, u_tra }) {
     intensity: 1.2,
     radius,
     frustum: { left: -s, right: s, top: s, bottom: -s, near, far },
-    // THE CATCHER MUST NOT BE BIGGER THAN THE SHADOW MAP COVERS. It was a
-    // fixed 400 x 400 mm plane while this box is 151.7 mm across on a real
-    // arch, so 85.6% of it sampled the depth texture outside [0,1] UV — where
-    // the clamped edge texel reads as SHADOWED. The plane also fills the frame
-    // from the default camera (400 mm of plane against 143 mm of visible
-    // height), so that misread is a full-screen 0.22-alpha black wash over
-    // everything behind the cast. Sized to the frustum, every texel the
-    // catcher samples is one the shadow map actually rendered.
-    catcherSize: 2 * s,
+    // THE CATCHER MUST NOT OVERHANG THE SHADOW MAP. It was a fixed
+    // 400 x 400 mm plane while the box was 151.7 mm across on a real arch, so
+    // 85.6% of it sampled the depth texture outside [0,1] UV — where the
+    // clamped edge texel reads as SHADOWED — and the plane is big enough to
+    // fill the frame on its own, making that misread a full-screen
+    // 0.22-alpha black wash. That was fixed by setting it to `2 * s`, which
+    // was still wrong for the two reasons given above: corners, and an
+    // off-axis centre. The containment now runs the other way — the catcher
+    // is sized for its JOB and the box is sized to contain it.
+    catcherSize,
   };
 
   const ok = finite3(rig.sunPosition) && finite3(rig.targetPosition)

@@ -103,9 +103,34 @@ for (const j of JAWS) {
   // this 151.7 mm box left 85.6% of the catcher sampling the depth texture
   // with clamped UVs, which reads as SHADOWED — a full-frame black wash, since
   // the plane is also large enough to fill the viewport by itself.
-  check(`${j.name}: catcher fits inside the shadow frustum`,
-        rig.catcherSize <= (right - left) + 1e-9,
-        `catcher ${rig.catcherSize.toFixed(1)} mm vs box ${(right - left).toFixed(1)} mm`);
+  //
+  // COMPARING SIDE LENGTHS IS NOT ENOUGH, and this check passed for two
+  // sections while it was wrong. Measured in a real WebGL context
+  // (frontend/e2e-shadow/shadow-darkening.spec.js), with `catcherSize` set to
+  // exactly `right - left`, THREE OF FOUR CORNERS were outside the map at NDC
+  // 1.13 and 1.23. Two reasons a side-length test cannot see:
+  //   * a square's corners reach sqrt(2) further than its edges;
+  //   * the catcher is dropped along -u_occ while the light is 23.3 degrees
+  //     off u_occ, so its CENTRE is already ~0.4 x radius off the light axis.
+  // So the test is the real one: the furthest point of the catcher from the
+  // light axis, which is its centre's offset plus its half-diagonal.
+  const vraw = sub(rig.targetPosition, rig.sunPosition);
+  const vlen = len(vraw);
+  const vdir = vraw.map((x) => x / vlen);
+  const axisOffset = (p) => {
+    const d = sub(p, rig.sunPosition);
+    const along = dot(d, vdir);
+    const r = [d[0] - vdir[0] * along, d[1] - vdir[1] * along, d[2] - vdir[2] * along];
+    return Math.hypot(r[0], r[1], r[2]);
+  };
+  const reach = axisOffset(rig.catcherPosition) + rig.catcherSize * Math.SQRT1_2;
+  check(`${j.name}: every catcher CORNER is inside the shadow map`,
+        reach <= right + 1e-9,
+        `furthest corner ${reach.toFixed(1)} mm vs half-box ${right.toFixed(1)} mm`);
+  const castReach = Math.max(...corners(ARCH).map(axisOffset));
+  check(`${j.name}: the cast is inside the shadow map`,
+        castReach <= right + 1e-9,
+        `cast reach ${castReach.toFixed(1)} mm vs half-box ${right.toFixed(1)} mm`);
   check(`${j.name}: catcher still covers the cast`,
         rig.catcherSize >= 2 * rig.radius,
         `${rig.catcherSize.toFixed(1)} mm vs a ${(2 * rig.radius).toFixed(1)} mm cast`);

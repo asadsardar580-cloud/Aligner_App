@@ -2503,6 +2503,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         #        + emergence ramps     add tissue where the rim lifted clear
         #        u rigid crowns        the crown, and nothing but the crown
         interfaces, cavity_tools, ramp_tools, seat_tools = [], [], [], []
+        crown_solids = {}
         stage_matrices = {}
         for t in teeth:
             rec, clinical = t["rec"], _stage_clinical(t["clinical"], k, total)
@@ -2538,14 +2539,47 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             row["continuity"] = mfg.interface_continuity(
                 cg.apply_matrix(rim_t0, M), iface.cavity_verts)
 
-            interfaces.append(row)
-            cavity_tools.append(_to_manifold(iface.cavity_verts, iface.cavity_faces))
+            crown_solid = t["solid"].transform(np.asarray(M[:3, :4], float))
+            crown_solids[t["tid"]] = crown_solid
+
+            # NO SUBTRACTION. This is the last structural correction, and it
+            # is counter-intuitive enough to be worth stating plainly.
+            #
+            # `(cast - crown) u crown` is an identity on GEOMETRY and not on
+            # TOPOLOGY: the subtract carves a cavity whose walls ARE the
+            # crown's surface, and the union then lays that same surface back
+            # on top of itself. manifold3d answers those coincident surfaces
+            # with topologically distinct vertices at identical positions, and
+            # a downstream reader's weld turns every one of them into a
+            # non-manifold edge. Measured across a 1.2mm extrusion:
+            #
+            #     with the crown-cut : 0, 11, 5, 9, 5   non-manifold edges
+            #     without it         : 0,  0, 0, 1, 0
+            #
+            # A stage model is a POSITIVE the lab draws a sheet over, so a
+            # penetrating tooth does not need material removed at all - the
+            # union absorbs it. Cavities belong to nested inserts, which is
+            # exactly where the 0.15mm clearance in carve_socket still lives.
+            # The classification above is still what shapes the connector and
+            # what the manifest reports; it simply no longer drives a cut.
             if iface.ramp_verts is not None:
                 ramp_tools.append(_to_manifold(iface.ramp_verts, iface.ramp_faces))
             if iface.seat_verts is not None:
                 # Unioned WITH the crown, not into it: the crown solid stays a
                 # rigid transform of T0 and the rigidity tests measure it alone.
-                seat_tools.append(_to_manifold(iface.seat_verts, iface.seat_faces))
+                seat_solid = _to_manifold(iface.seat_verts, iface.seat_faces)
+                seat_tools.append(seat_solid)
+                # REAL INTERSECTION VOLUMES. A nominal 0.25mm overlap is not
+                # evidence that anything fuses; the measured common volume is.
+                # A connector with nominal dimensions and zero actual
+                # intersection is a failed interface, and only this catches it.
+                row["overlap_seat_crown_mm3"] = mfg.overlap_volume(
+                    m3, seat_solid, crown_solid)
+                row["overlap_seat_cast_mm3"] = mfg.overlap_volume(
+                    m3, seat_solid, base_solid)
+            row["overlap_crown_cast_mm3"] = mfg.overlap_volume(
+                m3, crown_solid, base_solid)
+            interfaces.append(row)
 
         # Adjacent reconstructions must not merge into one trench.
         for i in range(len(teeth)):
@@ -2580,14 +2614,21 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         if cavity_tools:
             prepared = m3.Manifold.batch_boolean([prepared] + cavity_tools,
                                                  m3.OpType.Subtract)
+        # `cavity_tools` is empty by design - see the note above. It is kept so
+        # a future interface that genuinely needs to remove material has a
+        # wired path to do it, and so the manifest can say it removed nothing.
+        diag_cavity_tools = len(cavity_tools)
 
-        parts = [prepared] + seat_tools
+        # THE CROWN, AND NOTHING BUT THE CROWN. No plug, no skirt. The same
+        # Manifold objects that were used as cutters, so the cut and the fill
+        # are the identical solid and cannot disagree numerically.
+        parts = [prepared] + seat_tools + [crown_solids[t["tid"]] for t in teeth]
+
+        # Per-tooth measurements that do not affect the geometry: interproximal
+        # closure and the antagonist check. Both are reported, never blocking.
         for t in teeth:
             rec = t["rec"]
             M = stage_matrices[t["tid"]]
-            clinical = _stage_clinical(t["clinical"], k, total)
-            # THE CROWN, AND NOTHING BUT THE CROWN. No plug, no skirt.
-            parts.append(t["solid"].transform(np.asarray(M[:3, :4], float)))
 
             # How far this tooth has closed its embrasures BY THIS STAGE.
             # Measured against the tooth's own T0 crown, so it is a closure, not
@@ -2681,8 +2722,53 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # correct solid being corrupted on the way out. Both were needed, and
         # the five-point measurement is what separated them.
         pre_weld = cg.manifold_report(sf)
+        # WELD AT THE PRECISION THE FILE WILL HAVE, not at float64.
+        #
+        # `weld_vertices` merges on EXACT position equality (np.unique over
+        # float64 rows) while binary STL stores float32. So two vertices that
+        # differ in the ninth decimal survive our weld, are written to the same
+        # float32 triple, and the READER's weld then merges them - turning an
+        # edge shared by two faces into one shared by three. Measured: bodies
+        # 1, components 1, zero open edges, and exactly 1-2 non-manifold edges
+        # on intrusion, buccolingual, mesiodistal, rotation and combined
+        # movements, with winding reported inconsistent as a consequence.
+        #
+        # Quantising first makes our weld see precisely what the reader will
+        # see, so the round trip can no longer discover a coincidence we did
+        # not already resolve. It is NOT a tolerance being loosened: float32 is
+        # the format's own precision, and rounding to it is what writing the
+        # file does anyway - this only moves that rounding to BEFORE the weld
+        # instead of after it.
+        sv = sv.astype(np.float32).astype(np.float64)
         sv, sf, export_welded = cg.weld_vertices(sv, sf)
         post_weld = cg.manifold_report(sf)
+
+        # A RECORDED REPAIR RUNG, not a silent one. A grazing CSG contact at
+        # the cervical margin leaves one or two very short edges carrying four
+        # faces; see collapse_short_nonmanifold_edges for the measurement. It
+        # is attempted only when the weld left something non-manifold, it is
+        # capped at scanner resolution, and it is KEPT ONLY IF IT WORKED -
+        # otherwise the original mesh goes to the gates and is refused there.
+        nm_repair = {"attempted": False}
+        if post_weld["nonmanifold_edges"] > 0:
+            cv2, cf2, rinfo = mfg.collapse_short_nonmanifold_edges(sv, sf)
+            after = cg.manifold_report(cf2)
+            # ALL OR NOTHING. A partial improvement is not worth keeping: the
+            # gates refuse the stage either way, and shipping a mesh that has
+            # been altered but is still invalid makes the refusal harder to
+            # diagnose, not easier. Only a complete fix - zero non-manifold,
+            # zero open, consistent winding - is kept.
+            better = (after["nonmanifold_edges"] == 0
+                      and after["open_edges"] == 0
+                      and cg._winding_is_consistent(cf2))
+            nm_repair = {"attempted": True, "kept": bool(better), **rinfo,
+                         "nonmanifold_before": int(post_weld["nonmanifold_edges"]),
+                         "nonmanifold_after": int(after["nonmanifold_edges"]),
+                         "open_after": int(after["open_edges"])}
+            if better:
+                sv, sf = cv2, cf2
+                post_weld = after
+
         blob = cg.write_binary_stl_bytes(sv, sf)
 
         # WHAT IS ASSERTED, AND WHAT IS ONLY REPORTED — the distinction matters
@@ -2727,6 +2813,16 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                   "watertight": validation["open_edges"] == 0
                                 and validation["nonmanifold_edges"] == 0}
         n_comp = validation["connected_components"]
+
+        mstat = mfg.manifold_status(solid, m3)
+        if require_print_ready and not mstat.get("single_positive_body"):
+            raise HTTPException(422, _jsonable({
+                "error": f"Stage {k} is not ONE positive-volume manifold body.",
+                "manifold_status": mstat,
+                "detail": "manifold3d's decompose() is the physical body count; "
+                          "the STL component count is a separate check and both "
+                          "must pass.",
+                "stage": k}))
 
         if require_print_ready and not validation["print_ready"]:
             raise HTTPException(422, _jsonable({
@@ -2781,6 +2877,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                 "open": int(post_weld["open_edges"]),
                 "nonmanifold": int(post_weld["nonmanifold_edges"])},
             "export_weld_merged_vertices": int(export_welded),
+            "nonmanifold_edge_repair": nm_repair,
             "edges_post_read_and_reader_weld": {
                 "open": int(validation["open_edges"]),
                 "nonmanifold": int(validation["nonmanifold_edges"])},
@@ -2789,7 +2886,14 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
 
             # --- the verdict, from the written bytes -----------------------
             "stl_validation": validation,
-            "print_ready": bool(validation["print_ready"]),
+            # manifold3d's own account of the solid, recorded after the last
+            # boolean. It answers a DIFFERENT question from the STL gates -
+            # physical bodies rather than index-buffer components - and the
+            # verdict below requires both.
+            "manifold_status": mstat,
+            "manifold_bodies": int(n_bodies),
+            "print_ready": bool(validation["print_ready"]
+                                and mstat.get("single_positive_body")),
             "occlusal_interference": interference,
             "occlusal_warning": ANTAGONIST_WARNING if interference else None,
             # YELLOW, not red, and deliberately: closing an embrasure is often

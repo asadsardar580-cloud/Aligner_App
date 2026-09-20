@@ -445,6 +445,25 @@ export default function App() {
   const placeAttachmentRef = useRef(null);
 
   const [archFrame, setArchFrame] = useState(null);
+  // Presentation only. See setShadowsEnabled: this never reaches geometry,
+  // staging or export, and it is declared up here with the other state so
+  // nothing below can reference it from a deps array in its dead zone.
+  //
+  // DEFAULT OFF, and that is a measurement rather than a taste. Driving the
+  // real workflow in a real browser on the real scan
+  // (e2e/occlusal-darkening.spec.js): with the rig skipped, establishing the
+  // occlusal plane leaves the cast at 93,503 lit pixels and mean luminance
+  // 200.5 - 1.035x its pre-plane brightness. Arming the rig takes the cast to
+  // ZERO lit pixels: it does not dim, it disappears, and orbiting does not
+  // bring it back. A viewport with no shadow is a cosmetic loss; one with no
+  // model is a dead tool, which is the same rule section 20.2 settled when
+  // the catcher washed the frame black.
+  //
+  // The rig is NOT deleted and the toggle re-arms it, because the remaining
+  // question - why enabling the shadow map stops the cast rasterising when it
+  // neither receives shadows nor changes any material flag - is still open,
+  // and deleting the subsystem would delete the evidence with it.
+  const [shadowsOn, setShadowsOn] = useState(false);
   const [tool, setTool] = useState("wand"); 
   const [tolerance, setTolerance] = useState(1.2);
   const [radius, setRadius] = useState(1.5);
@@ -575,7 +594,7 @@ export default function App() {
     // expensive thing in this scene and nothing in it moves during an orbit —
     // the geometry only changes on a cut or a committed transform, which is
     // when three.current.shadowsDirty is set and one update is taken.
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = false;   // see the shadowsOn default
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.shadowMap.autoUpdate = false;
 
@@ -597,7 +616,10 @@ export default function App() {
     // shadow rig silently never armed: no throw, no warning, just no shadow.
     // That is the same class of failure as the record-vs-Object3D mistake below
     // — the silent half of a bug is the half that survives a fix.
+    // Read by aimShadows before it arms anything. It has to exist from the
+    // first frame: `undefined` is not `false`, and the gate tests for false.
     three.current = { scene, camera, renderer, controls, sun, catcher,
+                      shadowsUserEnabled: false,
                       // firstHitOnly is not a micro-optimisation: without it
                       // three-mesh-bvh collects and sorts EVERY intersection
                       // along the ray, and all five call sites take [0]. This
@@ -1441,6 +1463,12 @@ export default function App() {
       // Now the patient's own "down" is known, so the shadow can be aimed and
       // the catcher laid under the cast. Before this the caster is dark, because
       // a shadow thrown along an arbitrary scanner axis is worse than none.
+      //
+      // GATED BY THE SHADOWS CONTROL, which ships OFF - see `shadowsOn`. Arming
+      // the rig on this path takes the cast from 92,589 lit pixels to ZERO.
+      // Deferring the call by two animation frames was tried and does NOT fix
+      // it, so it is not a stale-matrix race and the deferral was removed
+      // rather than left in as cargo.
       aimShadows(data);
       setStatus(data.midline_warning ? `Warning: ${data.midline_warning}`
                 : corrected ? "Occlusal Plane Established - the view was inverted and has been corrected."
@@ -1773,6 +1801,22 @@ export default function App() {
   const aimShadows = useCallback((frame) => {
     const { sun, catcher } = three.current;
     if (!sun || !catcher || !frame?.u_occ) return;
+    // The Shadows control gates the rig BEFORE it is ever armed, not only
+    // afterwards. Turning it off after the fact cannot answer "was the cast
+    // ever darkened by arming this?", because some of what aimShadows does -
+    // setting castShadow on the arch, resizing the shadow camera - is not
+    // undone by dropping the intensity back to zero.
+    // Remembered even when the rig is switched off, so turning it back on
+    // later can arm it without asking the clinician to re-click three
+    // landmarks. Stored BEFORE the gate for exactly that reason.
+    three.current.rigFrame = frame;
+    if (three.current.shadowsUserEnabled === false) {
+      sun.intensity = 0;
+      catcher.visible = false;
+      three.current.shadowsDirty = true;
+      console.info("[Shadow Rig] skipped - shadows are switched off in the UI.");
+      return;
+    }
 
     const box = new THREE.Box3();
     // rec is a plain record ({mesh, geometry, view, brushIndex, ...}), NOT an
@@ -1843,7 +1887,196 @@ export default function App() {
       + `sized ${rig.catcherSize.toFixed(0)}mm | `
       + `ortho +/-${f.right.toFixed(1)} near ${f.near.toFixed(1)} far ${f.far.toFixed(1)} | `
       + `intensity ${rig.intensity}`);
+    three.current.rigIntensity = rig.intensity;
+    three.current.rigArmed = true;
   }, []);
+
+  /**
+   * Turn the world-fixed shadow rig on and off. PRESENTATION ONLY.
+   *
+   * This exists because "the cast went dark when I set the occlusal plane" and
+   * "the cast is dark" are different reports, and until the shadow rig can be
+   * taken out of the picture WITHOUT reloading and re-cutting, nobody can tell
+   * which one they are looking at. That includes the automated check: the
+   * occlusal-plane click also runs the wand, which repaints ~21,800 vertices,
+   * so a luminance comparison taken across those three clicks is measuring the
+   * selection as much as the lighting. Toggling here holds everything else
+   * fixed.
+   *
+   * It touches `sun`, `catcher` and `renderer.shadowMap` and NOTHING else. The
+   * scan, the occlusal frame, every cut, every committed transform and every
+   * exported STL are unaffected — the camera-parented three-point rig still
+   * lights the scene with this off, exactly as it does before the plane is
+   * ever established.
+   */
+  const setShadowsEnabled = useCallback((on) => {
+    const { sun, catcher, renderer } = three.current;
+    if (!sun || !catcher || !renderer) return;
+    three.current.shadowsUserEnabled = Boolean(on);
+    renderer.shadowMap.enabled = Boolean(on);
+    setShadowsOn(Boolean(on));
+
+    // Turning it ON after the occlusal plane is already set has to ARM the
+    // rig, not merely raise an intensity: aimShadows is what positions the
+    // sun, places and sizes the catcher and sets the shadow camera, and until
+    // it has run there is nothing to turn up. Without this, switching the
+    // control on did nothing at all and looked like the control was broken.
+    if (on && three.current.rigFrame) { aimShadows(three.current.rigFrame); return; }
+
+    const armed = Boolean(three.current.rigArmed);
+    sun.intensity = on && armed ? (three.current.rigIntensity ?? 0) : 0;
+    catcher.visible = Boolean(on && armed);
+    three.current.shadowsDirty = true;
+  }, [aimShadows]);
+
+  /**
+   * A read-only snapshot of everything that decides how the viewport looks.
+   *
+   * WHY THIS IS HERE AND NOT IN A TEST. "The cast went dark" is a claim about
+   * a rendered image, and this app has now twice diagnosed such a claim from
+   * the arithmetic and been wrong (CLAUDE.md 20.2). Neither `verify-shadowrig`
+   * nor a screenshot can say WHICH of the light intensities, the material, the
+   * colour buffer or the camera changed - only the live objects can, and they
+   * live inside a closure no test can reach.
+   *
+   * It READS. It sets nothing, and it is the only thing published on `window`.
+   */
+  useEffect(() => {
+    window.__viewportDiagnostics = () => {
+      const { scene, camera, renderer, sun, catcher } = three.current;
+      if (!scene || !camera) return null;
+      const rec = arches.current[active];
+      const g = rec?.geometry;
+      const col = g?.attributes?.color?.array;
+      let cMin = 1, cMax = 0, cSum = 0;
+      if (col) {
+        for (let i = 0; i < col.length; i++) {
+          cSum += col[i];
+          if (col[i] < cMin) cMin = col[i];
+          if (col[i] > cMax) cMax = col[i];
+        }
+      }
+      const lights = [];
+      scene.traverse((o) => { if (o.isLight) lights.push(o); });
+      camera.traverse((o) => { if (o.isLight && !lights.includes(o)) lights.push(o); });
+      const m = rec?.mesh?.material;
+      // IS THE CAST EVEN IN FRONT OF THE CAMERA? A mesh that is `visible` and
+      // correctly lit still renders nothing if the view has been pointed away
+      // from it, and that looks identical to "the cast went dark" in a
+      // screenshot. Projecting its bounding sphere is what separates the two.
+      let framing = null;
+      if (g) {
+        if (!g.boundingSphere) g.computeBoundingSphere();
+        const bs = g.boundingSphere;
+        const centre = bs.center.clone().applyMatrix4(rec.mesh.matrixWorld);
+        camera.updateMatrixWorld(true);
+        camera.updateProjectionMatrix();
+        const ndc = centre.clone().project(camera);
+        const toCentre = centre.clone().sub(camera.position);
+        const fwd = new THREE.Vector3();
+        camera.getWorldDirection(fwd);
+        const depth = toCentre.dot(fwd);
+        framing = {
+          centre: centre.toArray(), radius: bs.radius,
+          controlsTarget: three.current.controls?.target?.toArray() ?? null,
+          ndc: ndc.toArray(),
+          depthAlongView: depth,
+          distance: toCentre.length(),
+          behindCamera: depth + bs.radius < 0,
+          nearerThanNear: depth + bs.radius < camera.near,
+          fartherThanFar: depth - bs.radius > camera.far,
+          onScreen: Math.abs(ndc.x) <= 1 && Math.abs(ndc.y) <= 1
+                    && ndc.z >= -1 && ndc.z <= 1,
+        };
+      }
+      return {
+        framing,
+        // WORLD position and WORLD direction, not the local ones. A
+        // DirectionalLight parented to the camera still aims at its `target`,
+        // which defaults to an Object3D at the world origin and is parented to
+        // nothing - so "camera-parented" moves where the light IS without
+        // moving where it POINTS. Reading `l.position` alone would hide that.
+        lights: lights.map((l) => {
+          l.updateWorldMatrix(true, false);
+          const wp = new THREE.Vector3().setFromMatrixPosition(l.matrixWorld);
+          let dir = null, tgt = null;
+          if (l.target) {
+            l.target.updateWorldMatrix(true, false);
+            const wt = new THREE.Vector3().setFromMatrixPosition(l.target.matrixWorld);
+            tgt = wt.toArray();
+            dir = wt.clone().sub(wp).normalize().toArray();
+          }
+          return { type: l.type, intensity: l.intensity,
+                   colour: l.color ? l.color.getHexString() : null,
+                   visible: l.visible, castShadow: Boolean(l.castShadow),
+                   parentIsCamera: l.parent === camera,
+                   worldPosition: wp.toArray(), worldTarget: tgt,
+                   worldDirection: dir };
+        }),
+        environmentIntensity: scene.environmentIntensity,
+        hasEnvironment: Boolean(scene.environment),
+        // THE DRAW COUNTERS SETTLE "not drawn" versus "drawn black", which no
+        // screenshot and no material flag can. They are the renderer's own
+        // tally for the last frame.
+        render: renderer ? { calls: renderer.info.render.calls,
+                             triangles: renderer.info.render.triangles,
+                             frame: renderer.info.render.frame } : null,
+        toneMapping: renderer?.toneMapping,
+        toneMappingExposure: renderer?.toneMappingExposure,
+        shadowMapEnabled: Boolean(renderer?.shadowMap?.enabled),
+        sun: sun ? { intensity: sun.intensity, castShadow: sun.castShadow,
+                     position: sun.position.toArray() } : null,
+        catcher: catcher ? { visible: catcher.visible,
+                             position: catcher.position.toArray(),
+                             scale: catcher.scale.x } : null,
+        camera: { position: camera.position.toArray(), up: camera.up.toArray(),
+                  near: camera.near, far: camera.far },
+        arch: rec?.mesh ? {
+          visible: rec.mesh.visible, castShadow: rec.mesh.castShadow,
+          receiveShadow: rec.mesh.receiveShadow,
+          // A mesh can cast a shadow and draw NOTHING: the shadow pass uses a
+          // depth material and ignores most of these, so when the silhouette
+          // is on the catcher but the cast is not on screen, the answer is one
+          // of the flags below rather than the lights or the camera.
+          frustumCulled: rec.mesh.frustumCulled,
+          renderOrder: rec.mesh.renderOrder,
+          meshLayers: rec.mesh.layers.mask,
+          cameraLayers: camera.layers.mask,
+          materialVisible: m?.visible,
+          colorWrite: m?.colorWrite,
+          depthTest: m?.depthTest, depthWrite: m?.depthWrite,
+          blending: m?.blending, alphaTest: m?.alphaTest,
+          materialType: m?.type, side: m?.side,
+          vertexColors: Boolean(m?.vertexColors),
+          materialColour: m?.color ? m.color.getHexString() : null,
+          opacity: m?.opacity, transparent: Boolean(m?.transparent),
+          emissive: m?.emissive ? m.emissive.getHexString() : null,
+          colourBuffer: col ? { min: cMin, max: cMax, mean: cSum / col.length,
+                                length: col.length } : null,
+          // THE LAST BUFFER. Every triangle is submitted and every flag is
+          // unchanged, so if the surface still shades black the remaining
+          // input to the lighting is the normal. A NaN normal blacks a mesh
+          // out and changes no flag anywhere - the same "every comparison
+          // against NaN is False" trap this codebase has hit twice.
+          normalBuffer: (() => {
+            const nb = g?.attributes?.normal?.array;
+            if (!nb) return null;
+            let bad = 0, lenSum = 0, n = nb.length / 3;
+            for (let i = 0; i < n; i++) {
+              const x = nb[i * 3], y = nb[i * 3 + 1], z = nb[i * 3 + 2];
+              const L = Math.hypot(x, y, z);
+              if (!Number.isFinite(L) || L < 0.5) bad++;
+              else lenSum += L;
+            }
+            return { count: n, degenerateOrNaN: bad, meanLength: lenSum / Math.max(n - bad, 1) };
+          })(),
+          drawRange: g ? { ...g.drawRange } : null,
+          indexCount: g?.index ? g.index.count : null,
+        } : null,
+      };
+    };
+    return () => { delete window.__viewportDiagnostics; };
+  }, [active]);
 
   const exportStages = async () => {
     const sid = sessions[active]?.session_id;
@@ -2185,6 +2418,16 @@ export default function App() {
           <button onClick={runSegmentation} disabled={busy || segmenting || !sessions[active]} style={{...S.primary, marginTop: 10}}>
             {segmenting ? "Segmenting…" : "Segment Teeth"}
           </button>
+          {/* DIAGNOSTIC. Separates a lighting problem from a geometry problem
+              without reloading the case. Presentation only - it cannot change
+              an exported STL. */}
+          <label style={{display: "flex", alignItems: "center", gap: 6,
+                         marginTop: 10, fontSize: 11, color: "#8b949e",
+                         cursor: "pointer"}}>
+            <input type="checkbox" checked={shadowsOn}
+                   onChange={(e) => setShadowsEnabled(e.target.checked)} />
+            Shadows (display only — never affects export)
+          </label>
         </Panel>
 
         <Panel id="prep" step="2" title="Crown Prep — Selection">

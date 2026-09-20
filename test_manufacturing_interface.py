@@ -77,11 +77,22 @@ def test_every_movement_type_builds_a_local_interface(name, clinical):
         M, r = _interface(bv, bf, recs[0], v, clinical, probe)
         assert r.ok, f"{name} was refused: {r.refusal_reason} / {r.diagnostics}"
         d = r.diagnostics
-        assert d["cavity_volume_mm3"] > 0
-        assert d["depth_used_mm"] <= mfg.DEFAULT_POLICY.max_reconstruction_depth_mm
-        print(f"PASS  {name:20s} pen={d['crown_penetration_mm']:.3f} "
-              f"sep={d['rim_separation_max_mm']:.3f} depth={d['depth_used_mm']:.2f} "
-              f"cav={d['cavity_volume_mm3']:.1f} ramp={d.get('ramp_volume_mm3')}")
+        # THE NEW CONTRACT. There is no separate cavity solid any more: a stage
+        # model is a POSITIVE, so a penetrating tooth is absorbed by the union
+        # and nothing has to be removed. What every movement must produce is
+        # ONE integrated transition volume - a bridge where the rim lifted, a
+        # seat where it stayed down, and a continuous blend across a tipped
+        # tooth that is both at once.
+        assert d["interface_mode"] in ("seated", "penetrating", "separated", "mixed")
+        assert d["connector_built"] is True, d
+        assert d["connector_volume_mm3"] > 0, d
+        assert d["rim_points_lifted"] + d["rim_points_seated"] == d["rim_points"]
+        # Bounded: the connector may not reach anything like a root length.
+        assert d["seat_depth_mm"] <= mfg.DEFAULT_POLICY.seat_depth_mm + 1e-9
+        print(f"PASS  {name:20s} mode={d['interface_mode']:11s} "
+              f"pen={d['crown_penetration_mm']:.3f} sep={d['rim_separation_max_mm']:.3f} "
+              f"lift/seat={d['rim_points_lifted']}/{d['rim_points_seated']} "
+              f"connector={d['connector_volume_mm3']:.1f}mm3")
     finally:
         api_core.close_session(sid)
 
@@ -243,9 +254,10 @@ def test_a_new_local_interface_exists_at_the_target_position():
     try:
         probe = mfg.CastProbe(bv, bf)
         M, r = _interface(bv, bf, recs[0], v, dict(d_oa=1.2), probe)
-        assert r.ok and r.cavity_verts is not None
+        # The interface IS the connector now; there is no cavity solid.
+        assert r.ok and r.seat_verts is not None
         rim_k = cg.apply_matrix(v[np.asarray(recs[0]["socket_rim"], np.int64)], M)
-        cont = mfg.interface_continuity(rim_k, r.cavity_verts)
+        cont = mfg.interface_continuity(rim_k, r.seat_verts)
         assert cont["covered_fraction"] > 0.75, cont
         print(f"PASS  interface covers {cont['covered_fraction']:.1%} of the rim, "
               f"largest gap {cont['largest_angular_gap_deg']}deg")
@@ -303,17 +315,17 @@ def test_manufacturing_interface_is_independent_of_root_length_with_M_FROZEN():
                 bv, bf, frozen["cv"], frozen["cf"], rim0,
                 frozen["frame"]["u_oa"], M, probe=probe)
             assert r.ok, r.refusal_reason
-            out.append((root, r.diagnostics["cavity_volume_mm3"],
+            out.append((root, r.diagnostics["connector_volume_mm3"],
                         r.diagnostics.get("seat_volume_mm3"),
                         r.diagnostics["depth_used_mm"]))
 
         cavs = {o[1] for o in out}
         seats = {o[2] for o in out}
         depths = {o[3] for o in out}
-        assert len(cavs) == 1, f"cavity volume varied with root length: {out}"
+        assert len(cavs) == 1, f"connector volume varied with root length: {out}"
         assert len(seats) == 1, f"seat volume varied with root length: {out}"
         assert len(depths) == 1, f"cavity depth varied with root length: {out}"
-        print(f"PASS  root 9->13mm: cavity {cavs.pop()}mm3, seat {seats.pop()}mm3, "
+        print(f"PASS  root 9->13mm: connector {cavs.pop()}mm3, seat {seats.pop()}mm3, "
               f"depth {depths.pop()}mm - all identical")
     finally:
         api_core.close_session(sid)
@@ -447,6 +459,153 @@ def test_the_boolean_is_real_and_not_mocked():
     u = m3.Manifold.batch_boolean([a, b], m3.OpType.Add)
     assert abs(u.volume() - 1.875) < 1e-6, u.volume()
     print(f"PASS  manifold3d executed a real union: {u.volume():.4f}mm3")
+
+
+# ===========================================================================
+# Ray hygiene: a miss must stay a miss
+# ===========================================================================
+
+def test_a_genuine_ray_miss_cannot_become_a_success():
+    """A lifted rim point with NO cast beneath it must refuse, not invent one.
+
+    THIS IS A REGRESSION TEST FOR DEAD CODE, and that is worth stating. The
+    landing loop used to end with
+
+        landing[~hit] = rim_k[~hit]
+        hit[:] = True
+
+    which made the `if not hit.all():` refusal underneath it unreachable. The
+    code still READ as though it refused, the diagnostics still reported a
+    miss count, and every miss was silently converted into "landed exactly on
+    the rim" - a bridge to nowhere, built at full height, that the boolean
+    then had to resolve against nothing.
+
+    The fixture removes the cast entirely from under the tooth by asking for a
+    lift far past `max_rim_separation_mm`, so there is genuinely nothing to
+    land on, and asserts the REFUSAL rather than the count.
+    """
+    import inspect
+    # 1. THE PRIMITIVE REPORTS MISSES. Everything above rests on this.
+    sid, tids, recs, v, bv, bf = _cast_and_teeth([dict(d_oa=0.5)])
+    try:
+        probe = mfg.CastProbe(bv, bf)
+        u = np.asarray(recs[0]["frame"]["u_oa"], float)
+        # A point 500mm to the side of the cast has nothing under it whichever
+        # way the ray is pointed.
+        away = probe.verts.mean(axis=0) + np.array([500.0, 500.0, 0.0])
+        landed, hit = probe.drop_to_surface(np.atleast_2d(away), u, 4.0)
+        assert not hit.any(), "drop_to_surface claimed a hit over empty space"
+        assert np.allclose(landed[0], away), "a miss must not move the point"
+
+        # 2. AND THE WHOLE INTERFACE REFUSES rather than inventing tissue. A
+        #    40mm lift is caught by the envelope gate before the landing loop
+        #    is even reached, which is itself correct - what matters is that
+        #    NO path returns ok=True.
+        M, r = _interface(bv, bf, recs[0], v, dict(d_oa=40.0), probe)
+        assert not r.ok, (
+            "a rim lifted 40mm clear of the cast was ACCEPTED; "
+            f"diagnostics={r.diagnostics}")
+        print(f"PASS  miss reported by the primitive; 40mm lift refused: "
+              f"{r.refusal_reason}")
+    finally:
+        api_core.close_session(sid)
+
+    # 3. A STATIC CHECK STANDS BEHIND THE RUNTIME ONE. The dead-code form was
+    #    reachable only on geometry this suite cannot easily construct - a rim
+    #    inside the envelope with genuinely no cast under part of it - so a
+    #    runtime test alone could pass forever while the overwrite came back.
+    #    Same reasoning as test_no_audit_call_site_uses_a_forbidden_key
+    #    (CLAUDE.md 20.6): a guard that cannot fail a build needs a static
+    #    check behind it.
+    #
+    #    IT READS THE AST, NOT THE TEXT, and the first version of this
+    #    assertion did not - it matched the string inside the comment that
+    #    EXPLAINS the old bug and failed on a correct implementation. That is
+    #    the identical mistake telemetry.py's check made (CLAUDE.md 18), and a
+    #    check that cannot tell an explanation from an implementation will
+    #    either be deleted or will force the explanation out. The explanation
+    #    is the more valuable of the two.
+    import ast, textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(mfg.build_stage_tooth_interface)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if (isinstance(tgt, ast.Subscript)
+                    and isinstance(tgt.value, ast.Name) and tgt.value.id == "hit"
+                    and isinstance(tgt.slice, ast.Slice)
+                    and isinstance(node.value, ast.Constant)
+                    and node.value.value is True):
+                raise AssertionError(
+                    "the landing loop force-sets every ray to a hit again; "
+                    "that makes the no_cast_beneath_target_rim refusal "
+                    "unreachable")
+    src = inspect.getsource(mfg.build_stage_tooth_interface)
+    assert "no_cast_beneath_target_rim" in src, (
+        "the refusal for a lifted point with no cast beneath it is gone")
+
+
+def test_ray_landing_records_how_each_point_was_resolved():
+    """Every lifted rim point says WHICH attempt answered for it.
+
+    A success count alone cannot distinguish an apron that landed where it was
+    aimed from one that collapsed onto the rim to find tissue - the same
+    number of points land either way, and only one of them is the geometry
+    that was asked for.
+    """
+    sid, tids, recs, v, bv, bf = _cast_and_teeth([dict(d_oa=1.2)])
+    try:
+        probe = mfg.CastProbe(bv, bf)
+        M, r = _interface(bv, bf, recs[0], v, dict(d_oa=1.2), probe)
+        assert r.ok, r.refusal_reason
+        d = r.diagnostics
+        levels = d["ramp_retry_levels"]
+        lifted = d["rim_points_lifted"]
+        assert sum(levels.values()) == lifted, (levels, lifted)
+        # Nothing may be left unresolved: -1 is "never landed", and the
+        # interface would have refused rather than reach here.
+        assert levels["-1"] == 0, levels
+        assert d["ramp_landing_misses"] == 0, d
+        assert d["ramp_landing_distance_max_mm"] >= 0.0
+        print(f"PASS  {lifted} lifted points resolved: levels={levels} "
+              f"collapsed_inward={d['ramp_collapsed_inward_points']} "
+              f"drop max {d['ramp_landing_distance_max_mm']:.3f}mm")
+    finally:
+        api_core.close_session(sid)
+
+
+def test_the_probe_drops_unreferenced_vertices_and_uses_an_exact_method():
+    """The cast's vertex array carries points no face references.
+
+    `build_cast_base` returns a face subset over the SCAN's array and rule 3.1
+    forbids rebuilding it, so the array keeps every trimmed-away crown.
+    `cg.vertex_normals` leaves those at ZERO, which made `outward` 0.0, which
+    is not < 0, which reported an interior point as OUTSIDE at the distance to
+    a phantom. Measured: 4497 of 8372 vertices unreferenced, and 6.66mm of
+    error. See bench_signed_distance.py for the full scoring.
+    """
+    sid, tids, recs, v, bv, bf = _cast_and_teeth([dict(d_oa=0.5)])
+    try:
+        probe = mfg.CastProbe(bv, bf)
+        assert probe.dropped_unreferenced == len(bv) - len(np.unique(bf))
+        assert len(probe.verts) == len(np.unique(bf))
+        # Every vertex the probe kept must carry a real normal.
+        assert np.all(np.linalg.norm(probe.normals, axis=1) > 0.5)
+        # Points pushed just inside the surface must read NEGATIVE. The old
+        # nearest-vertex method scored 13.3% here on a steep cervical wall.
+        tri = probe.verts[probe.faces]
+        n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        ln = np.linalg.norm(n, axis=1)
+        keep = ln > 1e-12
+        cen = tri[keep].mean(axis=1)
+        nn = n[keep] / ln[keep][:, None]
+        inside = probe.signed(cen - nn * 0.05)
+        frac = float((inside < 0).mean())
+        assert frac > 0.98, f"only {frac:.1%} of points 0.05mm inside read as inside"
+        print(f"PASS  probe dropped {probe.dropped_unreferenced} phantom vertices; "
+              f"method={probe.method}; {frac:.1%} correct 0.05mm inside")
+    finally:
+        api_core.close_session(sid)
 
 
 def _box(corner, s=1.0):

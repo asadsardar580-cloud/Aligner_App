@@ -17,7 +17,17 @@ synthetic root material up out of the gingiva as visible positive geometry.
 
 That path is gone. A tooth now gets a **bounded local interface** built at its
 target position from the actual transformed rim, the actual transformed crown
-and the actual local cast, and the boolean order is **subtract → add → union**.
+and the actual local cast, and the boolean order is
+**add tissue → (subtract cavity) → union crown + connector**.
+
+> **CORRECTION, 2026-09-20.** This line used to read "subtract -> add ->
+> union", which contradicted section I and the code. The order is ADD FIRST:
+> subtracting before the ramp is built removes the cast material the ramp has
+> to land on and orphans it, and the fused model went from 1 body to 4 across
+> an extrusion. The cavity stage is also currently EMPTY - a stage model is a
+> POSITIVE, so a penetrating tooth is absorbed by the union and nothing has to
+> be removed. The wiring is kept so the manifest can state that it removed
+> nothing, rather than being silent about it.
 The final STL is validated from **the bytes that were written**, not from the
 in-memory boolean.
 
@@ -25,7 +35,7 @@ in-memory boolean.
 |---|---|---|
 | Fusion connector | 9 mm root plug, depth = `root_length_mm` | bounded seat, 1.2 mm, independent of root length |
 | Cast at target position | never reconstructed | cavity + emergence ramp, adaptive |
-| Boolean | union only | subtract cavity → add ramp → union crown + seat |
+| Boolean | union only | add ramp → (subtract cavity, currently empty) → union crown + connector |
 | Volume growth over a 1.2 mm extrusion | **+28.84 mm³** of emerged root | +62.8 mm³, all attributable to the measured ramp/interface |
 | Final gate | in-memory index buffer | **the written STL**, after a reader's weld |
 | Welded non-manifold edges (extrusion, 5 stages) | 75, 77, 73, 70, 68 | **0, 1, 0, 1, 0** |
@@ -300,7 +310,7 @@ that trade is recorded in the code beside the constant.
 * **added** `import manufacturing as mfg`.
 * **changed** `_manufacturing_tooth` — plug removed; returns the crown.
 * **changed** `build_stage_bundle` — per-stage interfaces, adjacency check,
-  subtract→add→union, export weld before write, hard gate on the reread,
+  add→(subtract)→union, export weld before write, hard gate on the reread,
   `require_print_ready` flag, full diagnostics, returns `blobs` + `base_mesh`.
 * **added** `cast_probe` / `original_cast` above the stage loop.
 * **added** `FinalExportRequest`, `POST /api/session/{sid}/export/final`.

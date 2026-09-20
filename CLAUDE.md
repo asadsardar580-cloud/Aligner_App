@@ -1550,16 +1550,177 @@ the ROI mean **0.0046mm**, p95 **0.0000mm**, p99 **0.041mm**, with 23 of 2910
 points reaching 1.15mm on the trim boundary where the boolean retessellates the
 base outline.
 
-**WHAT IS NOT FIXED, and it is a real limitation.** Later stages of an extrusion
-still fuse into more than one body — measured `1, 1, 2, 2, 3` — so only 1 of 5
-stages passes every hard gate. The seat reaches the cast at small movements and
-loses it as the tooth lifts, because the cavity floor and the ramp compete for
-the same millimetre of tissue. `test_staging_export.py::test_every_stage_is_one_fused_watertight_solid`
-and one case in `test_failsafes.py` FAIL on `components == 1` and are **left
-failing deliberately** — they are the only automated signal for this and
-weakening them would erase it.
+**RESOLVED 2026-09-20 — the body fragmentation was a SIGNED-DISTANCE bug, and
+the interface geometry was only the second half of it.** Extrusion measured
+`1, 1, 2, 2, 3` bodies with only 1 of 5 stages passing; it now measures
+`1, 1, 1, 1, 1` with **5 of 5 print-ready**, and `test_staging_export.py` and
+`test_failsafes.py` pass on merit, untouched.
 
-**The real-scan regression was NOT run.** Nothing in §21 is based on it.
+`CastProbe.signed` was nearest-VERTEX distance signed against that vertex's
+normal. `bench_signed_distance.py` scores it against an INDEPENDENT ground
+truth — exact closest-point-on-triangle for the magnitude, a three-ray parity
+vote for the sign, neither of which is any of the candidates — over 870 points
+in 15 difficult classes:
 
-Covered by `test_manufacturing_interface.py` (33 tests) and
-`MANUFACTURING_RECONSTRUCTION_CHANGELOG.md`.
+| class | old, as shipped | old + compaction | exact |
+|---|---|---|---|
+| steep cervical wall, 0.05mm in | **13.3%** | 90.0% | 100% |
+| concavity, 0.05mm in | 25.0% | 76.7% | 100% |
+| ALL | 77.7% | 91.4% | **100%** |
+| max magnitude error | 6.66 mm | 6.66 mm | **0.0014 mm** |
+
+13.3% is worse than a coin toss, and **a cervical rim IS a steep cervical
+wall** — `rim_signed` decides lifted-versus-seated per rim point and sizes the
+whole transition volume, so a wrong sign built the bridge to the wrong height
+at scattered points around the margin, and the self-intersecting result
+survived as a non-manifold edge.
+
+**TWO INDEPENDENT DEFECTS, and the middle column is why both had to be fixed.**
+`build_cast_base` returns a face subset over the SCAN's vertex array and rule
+3.1 forbids rebuilding it, so the array keeps every trimmed-away crown —
+measured, **4497 of 8372 vertices unreferenced**. `cg.vertex_normals` leaves
+those at ZERO, so `outward` is 0.0, `0 < 0` is False, and an interior point is
+reported OUTSIDE at the distance to a phantom the surface does not contain.
+Compaction alone recovers most of the accuracy, which means the phantom
+vertices were the dominant term and the steep-wall diagnosis was the smaller
+one. Neither fix alone reaches a number a gate may rely on.
+
+**THE EXACT METHOD IS ALSO THE FAST ONE**, which removes the usual reason to
+keep an approximation. On the 7,824-face cast, warm-up excluded: at 44 points
+(a rim) Open3D n=11 is **0.529 ms against 4.857 ms**; scene build is 0.52 ms,
+once. No dependency was added — Open3D and trimesh were both already installed
+and load-bearing (§19). `trimesh.proximity.signed_distance` needs `rtree`,
+which is absent here; `closest_point_naive` gives the same accuracy without an
+index and was benchmarked instead.
+
+**WHAT IS STILL NOT FIXED, measured and reproducible.** `pytest` is
+**293 passed, 5 failed**, and all five are in the new
+`test_manufacturing_matrix.py`, left failing deliberately as the only
+automated signal:
+
+* `extrusion 0.25mm` stage 2 — 3 non-manifold edges
+* `tip 8 deg + 0.5mm extrusion`, `rotation 8 deg`, `combined` — 1–2 edges
+* `test_the_fused_result_does_not_depend_on_tooth_order`
+
+The cause is a **grazing CSG contact at the cervical margin**, not fragmentation:
+bodies 1, components 1, zero open edges, and one to three non-manifold edges
+after the reader's weld. Measured on an intrusion: ONE edge 0.0204 mm long
+carrying FOUR faces, 0.204 mm from the moved tooth's original rim, one incident
+face of area 2.6e-5 mm² whose normal is exactly anti-parallel to its neighbour,
+and both directed edges appearing twice — which is why winding fails with it.
+
+`mfg.collapse_short_nonmanifold_edges` repairs the micro-slivers, capped at
+0.05 mm (scanner resolution is 20–50 µm), all-or-nothing, and RECORDED in the
+manifest as `nonmanifold_edge_repair`. It took the matrix from 14 failures to
+5. It deliberately refuses the remaining edges, which measure **0.066, 0.49,
+1.84 and 2.05 mm** — a 2 mm non-manifold edge is two surfaces genuinely
+meeting along a line, and collapsing that would be hiding a defect rather than
+repairing one.
+
+**A SMALL EXTRUSION IS WORSE THAN A LARGE ONE, which points at the fix.** 1.2 mm
+is clean across all five stages; 0.25 mm fails. At small movements the crown
+sits almost exactly in its original socket, so its outer surface and the cast's
+gingival surface are the same scan triangles a few microns apart over a long
+band — maximal grazing. The indicated repair is the one the brief prescribes
+and this pass did not implement: cut the cast back from the crown
+(`cavity_outset_mm`) for penetrating teeth so the surfaces meet transversally
+instead of grazing.
+
+**The real-scan regression was NOT run for manufacturing.** Nothing in §21 is
+based on it.
+
+Covered by `test_manufacturing_interface.py` (36 tests),
+`test_manufacturing_matrix.py` (18 cases, 5 failing by design),
+`bench_signed_distance.py` and `MANUFACTURING_RECONSTRUCTION_CHANGELOG.md`.
+
+## 22. RESOLVED: OCCLUSAL-PLANE ESTABLISHMENT DARKENED THE CAST
+
+Reported from manual testing: load an arch, click the three occlusal-plane
+landmarks, and on the third click the whole cast goes dark. Tracked and fixed
+as a **viewport presentation bug**, entirely separately from the manufacturing
+reconstruction — no STL, CSG, C_res or kinematics path was touched.
+
+**IT WAS THE SHADOW RIG, and the A/B that proves it had to gate `aimShadows`
+BEFORE it armed rather than turn it down afterwards.** Measured in a real
+browser against the production build on `case_lower.stl`, luminance taken from
+the actual framebuffer:
+
+| | lit pixels | mean luminance |
+|---|---|---|
+| before the plane | 92,589 | 193.74 |
+| after, rig armed | **0** | — |
+| after, rig gated out | **93,503** | 200.50 (**1.035x**) |
+| rig then armed via the toggle | 93,530 | 206.60 |
+
+The first attempt measured "shadows off" AFTER arming and found the cast still
+gone, which pointed away from the rig and cost a long detour. Dropping the
+intensity does not undo what arming already did — `aimShadows` also sets
+`castShadow` on the arch and resizes the shadow camera — so the control now
+gates the rig at the top of `aimShadows`, and the comparison is clean.
+
+**What was excluded, by measurement rather than by argument.** The cast is not
+darkened: with the rig armed the renderer still submits all **187,625
+triangles**, the material stays visible with `colorWrite` on, `side` is
+DoubleSide, normals are unit length (0 degenerate of 94,848), the colour buffer
+reads mean 0.478, the cast projects to NDC (0, 0) inside the frustum at the
+same distance as before, and every light still points at it. Orbiting 180°
+does not bring it back. The catcher is not between the camera and the cast.
+The backend's occlusal frame is correct: `fit_occlusal_frame` agrees with an
+independent PCA/skewness axis to **0.9°** with a sign margin of +8.6 mm.
+
+**A SECOND, REAL DEFECT IN THE RIG was found on the way and fixed.** §20.2
+sized the catcher to `2 * s`, edge for edge with the shadow camera's box, and
+`verify-shadowrig.mjs` asserted exactly that — so the check passed while
+**three of four catcher corners sat outside the shadow map**, at NDC 1.13 and
+1.23. Two things a side-length test cannot see: a square's corners reach √2
+further than its edges, and the catcher is dropped along `−u_occ` while the sun
+is 23.3° off `u_occ`, so its *centre* is already ~0.4·radius off the light
+axis. A fragment outside the map samples the depth texture with clamped UVs and
+returns SHADOWED whatever is really there. The ortho box is now DERIVED from
+the largest perpendicular distance from the light axis of anything that must be
+in it — rotation-invariant, because three.js orients the shadow camera with the
+light's own `up` and `shadowRig.js` does not model that. Measured: half-box
+62.3 mm → 106.4 mm, corners outside 3 → **0**.
+
+**What shipped.** The rig is NOT deleted. `shadowsOn` defaults **off**, a
+clearly-labelled *"Shadows (display only — never affects export)"* control
+re-arms it, and turning it on after the plane is set calls `aimShadows`
+properly rather than only raising an intensity. A viewport with no shadow is a
+cosmetic loss; one with no model is a dead tool — the same rule §20.2 settled.
+
+**WHAT IS NOT EXPLAINED, and is why this is a mitigation rather than a repair.**
+Why arming the rig inside `handleDefineOcclusalPlane` stops the cast
+rasterising, when it neither receives shadows nor changes any material flag, is
+still open. Deferring the call by two animation frames was tried and does NOT
+fix it, so it is not a stale-matrix race; that deferral was removed rather than
+left in as cargo. Armed later through the toggle, the identical call works.
+
+**Three things the browser test got wrong first, each of which reported
+something false**, and all three are now written into the spec:
+
+1. **Headless Chromium composites the WebGL canvas as EMPTY** without a GL
+   backend. The first run read exactly 14.79 — the clear colour `0x0d0f12` —
+   both before and after, and a capture that never contains the model cannot
+   tell you the model got darker. `--use-gl=angle --enable-unsafe-swiftshader`.
+2. **"Define Occlusal Plane" is always in the DOM**, merely disabled, so
+   waiting for it photographed an empty viewport while the status line still
+   read *"Uploading case_lower.stl..."*.
+3. **The Wand is armed at the same time as the picker** and listens on the same
+   element, so every landmark click also selects ~21,800 vertices and
+   overwrites the status line — which makes the picker's own `(n/3)` useless as
+   a progress signal *and* repaints the cast between the before and after
+   frames. Progress is read from the button label, which is durable state, and
+   the rig is A/B tested through the toggle with the selection held fixed.
+
+New: `frontend/src/shadowHarness.js` + `shadow-harness.html` +
+`playwright.shadow.config.js` (a real WebGL rig harness with a per-pixel cast
+mask, run against the dev server so it never reaches `dist/`),
+`frontend/e2e/occlusal-darkening.spec.js` (2 tests, the real workflow on the
+real scan, skipping rather than substituting a stand-in), and
+`window.__viewportDiagnostics()` — read-only, the only thing published on
+`window`, because the live objects live in a closure no test can reach.
+
+`e2e/occlusal-darkening.spec.js` releases its backend session in an
+`afterEach`: `STORE` keeps four and evicts the oldest, and a 9.4 MB upload per
+test was pushing other specs' sessions out and making *their* assertions fail
+downstream, which read as flakiness in files that had done nothing wrong.
