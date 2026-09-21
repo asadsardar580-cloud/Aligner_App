@@ -31,7 +31,7 @@ that used to shadow the real `tooth_segmentation/` modules.
 
 ```
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names without importing (98 files)
+python check_structure.py               # undefined names without importing (99 files)
 python run_all_tests.py                 # CANONICAL runner — 40 entries
 python -m pytest -q                     # runs alongside; both must pass
 python bench_signed_distance.py         # scores the signed-distance method
@@ -2638,7 +2638,7 @@ already refused all four on the same ground: a checkpoint is not source, and a
 `ToothGroupNetwork/` in `check_structure.py`'s skip list — its `compete/`
 folder carries 12 more research checkouts, three of which have undefined names
 that are not ours to fix. **`crosstooth_bridge.py` is ours and stays in the
-walk** (98/98).
+walk** (99/99).
 
 ### 25.9 What was NOT done
 
