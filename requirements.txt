@@ -38,6 +38,34 @@ scikit-learn
 trimesh
 open3d
 
+# --- AI segmentation, CrossTooth (the second provider, ?provider=crosstooth) ---
+# einops is the ONLY package CrossTooth adds, and it is genuinely load-bearing:
+# `models/PTv1/point_transformer_seg.py` uses einops.reduce and einops.rearrange
+# inside PointTransformerLayer.forward, and that file is vendored third-party
+# code this project does not edit. It is pure Python with no dependencies.
+#
+# THREE THINGS CrossTooth's OWN requirements.txt ASKS FOR AND DOES NOT GET HERE,
+# each for a reason rather than an oversight:
+#   pointops  - a CUDA extension. It does not build on Windows without a
+#               toolchain, AND the import path the vendored model uses
+#               (models.PointTransformer.libs.pointops.functions) does not
+#               exist in the shipped repository on any platform. crosstooth_
+#               bridge.py registers that name against this project's existing
+#               pointops_cpu.py shim instead.
+#   vedo      - only `dataset/data.py` uses it, to load a mesh from disk. This
+#               app already holds vertices and faces, and the feature
+#               preparation is replicated in crosstooth_bridge.CrossToothAdapter
+#               .prepare. Installing a VTK stack to re-read a mesh we have in
+#               memory would be a 100MB dependency for nothing.
+#   spconv / flash-attn / torch-scatter / torch-sparse / torch-cluster /
+#   torch-points3d / pykeops
+#             - none is imported by the PTv1 inference path. They belong to the
+#               training code and to the 12 competing methods in `compete/`.
+#               Verified by following the import chain, not by reading the
+#               requirements file (CLAUDE.md s.19 records getting that wrong
+#               the other way round for trimesh and open3d).
+einops
+
 # --- Encrypted local case files (opt-in treatment-state persistence) ---
 # Never hand-rolled: Fernet gives AES-128-CBC plus an HMAC-SHA256 tag, so a
 # tampered or truncated case file is REJECTED rather than silently decrypted
@@ -48,3 +76,4 @@ cryptography
 #   numpy 2.5.2 · scipy 1.18.1 · fastapi 0.141.1 · uvicorn 0.52.4
 #   python-multipart 0.0.32 · manifold3d 3.5.2 · torch 2.13.0+cpu
 #   scikit-learn 1.9.0 · trimesh 5.1.0 · open3d 0.19.0 · Python 3.12.7
+#   einops 0.8.2 (added 2026-09-22 with the CrossTooth provider)

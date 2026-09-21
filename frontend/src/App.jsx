@@ -367,6 +367,21 @@ export default function App() {
   const [legend, setLegend] = useState(null);
   const [segDiagnostics, setSegDiagnostics] = useState(null);
 
+  // WHICH MODEL SEGMENTED THIS ARCH. Two are installed — ToothGroupNetwork
+  // (the shipped default) and CrossTooth — and the point of having two is
+  // running both over ONE scan and comparing, so the choice is per run
+  // rather than a server mode. Empty string means "whatever the backend's
+  // default is", so this control cannot silently override an operator who
+  // set ALIGNER_SEGMENTATION_PROVIDER.
+  //
+  // DECLARED HERE, ABOVE runSegmentation, DELIBERATELY. It enters that
+  // callback's dependency array, and a deps array is evaluated during
+  // render — a `const` declared below its user is still in its temporal
+  // dead zone. That has white-screened this app five times.
+  const [segProvider, setSegProvider] = useState("");
+  const [segProviders, setSegProviders] = useState(null);
+  const [lastSegProvider, setLastSegProvider] = useState(null);
+
   /**
    * The per-tooth spatial diagnostic: bounding box, counts and disconnected
    * components per label. It answers a question no accuracy metric can - are
@@ -375,6 +390,19 @@ export default function App() {
    * legend simply renders without review badges rather than blocking on a
    * diagnostic.
    */
+  // The registry is static for the life of the backend, so it is fetched
+  // once. A failure leaves the picker hidden and the default in force — a
+  // model chooser is a convenience, and it must never be able to stop the
+  // shipped model running.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API}/api/segmentation/providers`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled) setSegProviders(d); })
+      .catch(() => { if (!cancelled) setSegProviders(null); });
+    return () => { cancelled = true; };
+  }, []);
+
   const loadSegDiagnostics = useCallback(async (sid) => {
     try {
       const r = await fetch(
@@ -1397,7 +1425,9 @@ export default function App() {
     segmentStartedAt.current = Date.now();
     setStatus("AI segmenting teeth — 0s elapsed. A full arch takes a few minutes.");
     try {
-      const res = await fetch(`${API}/api/session/${sid}/segment`, { method: "POST" });
+      const url = `${API}/api/session/${sid}/segment`
+        + (segProvider ? `?provider=${encodeURIComponent(segProvider)}` : "");
+      const res = await fetch(url, { method: "POST" });
       const bodyText = await res.text();
       if (res.status === 409) {
         // Another run is already in flight on this backend. Not a failure.
@@ -1416,6 +1446,11 @@ export default function App() {
       arches.current[active].geometry.setAttribute("color", new THREE.BufferAttribute(c, 3));
       arches.current[active].geometry.userData.baseColors = Float32Array.from(c);
       labels.current[active] = data.labels;
+      // THE ONE THAT RAN, from the response — not the one that was asked
+      // for. They are the same today, and reading the request back would
+      // make any future fallback invisible in exactly the place a clinician
+      // would look to find out what produced these teeth.
+      setLastSegProvider(data.provider || null);
       setLegend(summariseLabels(data.labels));
       loadSegDiagnostics(sid);
       const took = segmentStartedAt.current
@@ -1458,7 +1493,7 @@ export default function App() {
       setSegmenting(false);
       setBusy(false);
     }
-  }, [sessions, active, segmenting, loadSegDiagnostics]);
+  }, [sessions, active, segmenting, loadSegDiagnostics, segProvider]);
 
   const handleDefineOcclusalPlane = async () => {
     const sid = sessions[active]?.session_id;
@@ -2467,9 +2502,37 @@ export default function App() {
           <button onClick={handleDefineOcclusalPlane} disabled={!sessions[active] || busy} style={{...S.chip, marginTop: 8, borderColor: archFrame ? "#3cb44b" : "#2c313a"}}>
             {archFrame ? "✓ Occlusal Plane Set" : "Define Occlusal Plane (3 Clicks)"}
           </button>
+          {segProviders && Object.keys(segProviders.providers || {}).length > 1 && (
+            <label style={{display: "block", marginTop: 10, fontSize: 11,
+                           color: "#8b939f"}}>
+              Segmentation model
+              <select
+                value={segProvider}
+                disabled={busy || segmenting}
+                onChange={(e) => setSegProvider(e.target.value)}
+                style={{...S.chip, width: "100%", marginTop: 4,
+                        padding: "6px 8px"}}>
+                <option value="">
+                  Default ({segProviders.default})
+                </option>
+                {Object.entries(segProviders.providers).map(([name, p]) => (
+                  <option key={name} value={name} disabled={!p.available}>
+                    {name}{p.available ? "" : " — unavailable"}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <button onClick={runSegmentation} disabled={busy || segmenting || !sessions[active]} style={{...S.primary, marginTop: 10}}>
             {segmenting ? "Segmenting…" : "Segment Teeth"}
           </button>
+          {lastSegProvider && (
+            <div style={{fontSize: 11, color: "#8b939f", marginTop: 6}}>
+              Labelled by <strong>{lastSegProvider}</strong>. No segmentation
+              model in this app has been validated against an independent
+              annotation.
+            </div>
+          )}
           {/* WHICH COLOUR IS WHICH TOOTH. Thirty-two colours on a cast are
               only useful if they can be turned back into an FDI number, and
               until now there was nowhere to look one up. It also makes the

@@ -27,7 +27,9 @@ api_core.py                   THE live FastAPI app — 14 routes
         +-- stl_io.py             Binary STL reader with exact vertex welding
         +-- jaw_naming.py         FDI/jaw verification
         +-- cut_guard.py          Pre-cut heuristics
-        +-- tgn_bridge.py ------> ToothGroupNetwork/   (vendored, PyTorch, CPU)
+        +-- segmentation_providers.py   The model registry; /segment?provider=
+        +-- tgn_bridge.py --------> ToothGroupNetwork/  (vendored, PyTorch, CPU)
+        +-- crosstooth_bridge.py -> CrossTooth/         (vendored, PyTorch, CPU)
         +-- tooth_segmentation/   Classical segmentation package
 ```
 
@@ -95,7 +97,10 @@ sidebar's connection badge, or poll `/api/ai/status`.
 2. **Occlusal reference** — click left molar cusp, right molar cusp, anterior midline. Required:
    `/cut` refuses with 409 without it, because C_res would otherwise be extrapolated along a
    guessed axis.
-3. **Segment** — AI (ToothGroupNetwork, ~4 minutes on a full arch) or manual wand selection.
+3. **Segment** — AI or manual wand selection. Two models are installed and the
+   picker beside the button chooses per run: **ToothGroupNetwork** (the default,
+   255 s on the real arch) and **CrossTooth** (13 s). Neither is validated — see
+   *Current limitations*.
 4. **Select** a tooth with the wand or brush, set mesial/distal points.
 5. **Cut** — extraction is an index-buffer rewrite; the arch mesh itself is never rebuilt.
 6. **Move** — 3D gizmo or the numeric sidebar. Values are absolute from T0, not nudges.
@@ -106,9 +111,10 @@ sidebar's connection badge, or poll `/api/ai/status`.
 
 ```powershell
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names, without importing (96 files)
-python run_all_tests.py                 # canonical runner — 39 entries
-python -m pytest -q                     # runs alongside; both must pass — 334 passed
+python check_structure.py               # undefined names, without importing (98 files)
+python run_all_tests.py                 # canonical runner — 40 entries
+python -m pytest -q                     # runs alongside; both must pass
+python benchmark_providers.py           # every segmentation model over one scan
 python bench_signed_distance.py         # scores the signed-distance method
 python real_scan_regression.py          # the real scan, end to end
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
@@ -142,6 +148,15 @@ every entry can fail.
   and disconnected components, because a label array read against the wrong vertex ordering scores
   perfectly on every accuracy metric including IoU. On the real scan that check moved the median
   per-tooth box from 50.71 mm to 13.97 mm (CLAUDE.md §24.3).
+- **Two models are installed and NEITHER is validated.** `benchmark_providers.py` measures
+  geometry (a tooth is one connected lump of a plausible size) and inter-model agreement, and it
+  deliberately reports no accuracy figure, because that needs an independent annotation this
+  repository does not have. On the real lower arch CrossTooth is 19x faster and produces more
+  plausible per-tooth geometry — 16 teeth against 11, worst largest-component fraction 0.988
+  against 0.523, largest tooth box 17.8 mm against 51.0 mm — and **the default was not changed on
+  that basis**, because "better geometry" is not "correct teeth". The two models agree on the
+  quadrant convention (0.4884 as mapped against 0.0559 mirrored) and disagree by one tooth along
+  the 3x quadrant; which of them is the shifted one is not established (CLAUDE.md §25).
 - **Real-scan manufacturing is NOT VERIFIED end to end.** Seven real teeth now cut successfully,
   one of seven builds a complete local interface, and staging refuses by name with measured
   numbers. No manufacturing gate result anywhere is based on the real scan (CLAUDE.md §24.7).

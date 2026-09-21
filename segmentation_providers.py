@@ -41,6 +41,7 @@ later.
 from __future__ import annotations
 
 import abc
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -186,12 +187,33 @@ class ToothGroupNetworkProvider(SegmentationProvider):
     }
 
     def available(self) -> dict:
+        """CAN it run, not HAS it run.
+
+        This used to report `loaded`, which is False for the first seconds of
+        every process while the background warm-up imports torch (s.12), so a
+        caller that gated on it refused a model that was simply starting. It
+        now reports whether the checkpoints are on disk and the load has not
+        FAILED; `loaded` is still carried in `status` for anything that wants
+        the finer state. `/segment` skips this check for this provider
+        entirely and waits on the load lock, which is the shipped behaviour
+        and the right one when a clinician is watching.
+        """
         try:
+            import api_core
             import tgn_bridge
             st = tgn_bridge.status()
-            return {"available": bool(st.get("loaded")),
-                    "reason": st.get("error") or ("loaded" if st.get("loaded")
-                                                  else "not loaded yet"),
+            if st.get("error"):
+                return {"available": False, "reason": st["error"],
+                        "warming": bool(st.get("warming")), "status": st}
+            missing = [p for p in (api_core.CKPT_FPS, api_core.CKPT_BDL)
+                       if p and not os.path.isfile(p)]
+            if missing:
+                return {"available": False,
+                        "reason": f"checkpoint not found: {missing[0]}",
+                        "status": st}
+            return {"available": True,
+                    "reason": "loaded" if st.get("loaded")
+                    else "present, not loaded yet",
                     "warming": bool(st.get("warming")), "status": st}
         except Exception as e:                            # noqa: BLE001
             return {"available": False, "reason": f"{type(e).__name__}: {e}"}
@@ -199,6 +221,16 @@ class ToothGroupNetworkProvider(SegmentationProvider):
     def segment(self, verts, faces, jaw) -> ProviderResult:
         import api_core
         import jaw_naming
+        import tgn_bridge
+
+        # Idempotent and lock-guarded. The endpoint loads the pipeline before
+        # calling in, but a provider that only works when someone else warmed
+        # it is not a provider - `benchmark_providers.py` drives this directly.
+        st = tgn_bridge.load(api_core.CKPT_FPS, api_core.CKPT_BDL,
+                             model_name="tgnet")
+        if not st.get("loaded"):
+            raise RuntimeError(st.get("error") or
+                               "ToothGroupNetwork failed to load.")
 
         v = np.asarray(verts, float)
         result_json, used_verts = api_core.run_segmentation(
@@ -273,9 +305,139 @@ class MeshSegNetProvider(SegmentationProvider):
             "and what is NOT_VERIFIED_HERE.")
 
 
+class CrossToothProvider(SegmentationProvider):
+    """CrossTooth (CVPR 2025), installed and wired to its shipped weights.
+
+    SECONDARY, NOT DEFAULT. It is here to be benchmarked against
+    ToothGroupNetwork, and until that benchmark exists against an independent
+    annotation neither model is the "better" one — see `benchmark_providers.py`
+    and CLAUDE.md s.17 on why scoring a model against another model's output
+    is not accuracy.
+
+    IT HAS NO VERTEX-ORDER DEPENDENCY AT ALL, which is worth stating because
+    it is the defect this whole module exists around. CrossTooth classifies
+    FACES, and the researchers' own mapping back to a mesh is a 3-neighbour
+    KNN in millimetre COORDINATES (`prepare_data/upsample_points.py`). Nothing
+    is ever indexed by vertex position in an array, so there is no loader that
+    could reorder anything. `transfer_labels_by_position` is therefore not run
+    here: it would compare the caller's array with itself and report the
+    identity it was handed, which is a check that cannot fail and so is worth
+    nothing. The transfer record says exactly that instead.
+    """
+
+    name = "crosstooth"
+    audit = {
+        "family": "CrossTooth (CVPR 2025), 3D Dental Model Segmentation with "
+                  "Geometrical Boundary Preserving; Point Transformer v1 "
+                  "backbone (PointTransformerSeg38)",
+        "weights_in_repo": True,
+        "weights_file": "CrossTooth/models/PTv1/point_best_model.pth "
+                        "(27,020,998 bytes, loads with strict=True)",
+        "device": "cpu",
+        "input_primitive": "FACES - 6 channels per triangle, the centroid "
+                           "and the unit face normal",
+        "windows_bypass": "pointops is a CUDA extension that does not build "
+                          "here, and the import path the vendored model uses "
+                          "(models.PointTransformer.libs.pointops.functions) "
+                          "does not exist in the shipped repository at all. "
+                          "crosstooth_bridge registers that dotted name "
+                          "against this project's pointops_cpu shim for the "
+                          "duration of the import and restores sys.modules "
+                          "afterwards; torch.cuda.IntTensor is patched to a "
+                          "CPU constructor for the duration of one inference "
+                          "call. The vendored files are not modified.",
+        "resampling": "the shipped loader truncates to the first 16,000 "
+                      "faces IN FILE ORDER on any larger mesh, which on a "
+                      "187,625-face arch is one contiguous scan region. A "
+                      "deterministic voxel-uniform subset is used instead; "
+                      "this is NOT the researchers' curvature-aware "
+                      "selective_downsample.exe, which is not in the "
+                      "repository",
+        "vertex_mapping": "the researchers' own - KNeighborsClassifier("
+                          "n_neighbors=3) fitted on predicted cell centroids "
+                          "in original millimetre coordinates",
+        "label_convention": "class 1-8 and 9-16 are the two quadrants of the "
+                            "jaw, mapped to FDI through CrossTooth/utils.py",
+        "quadrant_naming_verified": False,
+        "quadrant_naming_evidence": "measured against ToothGroupNetwork on "
+                                    "case_lower.stl: 56.45% exact-FDI "
+                                    "agreement as mapped against 3.47% if "
+                                    "the quadrants were mirrored, so the two "
+                                    "models agree on WHICH SIDE is 3x and "
+                                    "which is 4x. That is agreement between "
+                                    "two unvalidated models, not accuracy",
+        "measured_runtime": "12.9 s on 94,848 verts / 187,625 faces, CPU "
+                            "(prepare 1.8 s, inference 9.0 s, upsample 2.1 s)",
+        "measured_geometry": "16 teeth, median per-tooth box diagonal "
+                             "13.239 mm, 12 of 16 a single connected "
+                             "component and the other 4 at 0.988 or better",
+    }
+
+    def available(self) -> dict:
+        try:
+            import crosstooth_bridge
+            st = crosstooth_bridge.status()
+            if st["loaded"]:
+                return {"available": True, "reason": "loaded", "status": st}
+            if not st["checkpoint_present"]:
+                return {"available": False,
+                        "reason": f"checkpoint not found: {st['checkpoint']}",
+                        "status": st}
+            return {"available": True,
+                    "reason": st["error"] or "present, not loaded yet",
+                    "status": st}
+        except Exception as e:                            # noqa: BLE001
+            return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+
+    def segment(self, verts, faces, jaw) -> ProviderResult:
+        import crosstooth_bridge
+
+        st = crosstooth_bridge.load()
+        if not st["loaded"]:
+            raise RuntimeError(st.get("error") or
+                               "CrossTooth failed to load.")
+        out = crosstooth_bridge.adapter().segment(verts, faces, jaw)
+        meta = {k: out[k] for k in
+                ("teeth_found", "fdi_present", "quadrant_coherence",
+                 "preparation", "timing_seconds", "labels_are_fdi_verified")}
+        meta["mean_cell_confidence"] = float(out["cell_confidence"].mean())
+        return ProviderResult(
+            labels=np.asarray(out["labels"], np.int64), provider=self.name,
+            jaw=jaw,
+            transfer={
+                "identity": True,
+                "reordered_vertices": 0,
+                "not_applicable": True,
+                "reason": "CrossTooth labels faces and maps them onto this "
+                          "array by COORDINATE (KNN on cell centroids), so "
+                          "no vertex ordering is involved and there is "
+                          "nothing for a position transfer to catch.",
+            },
+            meta=meta)
+
+
 _REGISTRY = {p.name: p for p in (ToothGroupNetworkProvider(),
+                                 CrossToothProvider(),
                                  MeshSegNetProvider())}
-DEFAULT_PROVIDER = ToothGroupNetworkProvider.name
+#: ToothGroupNetwork unless ALIGNER_SEGMENTATION_PROVIDER says otherwise.
+#: THE SHIPPED MODEL STAYS THE DEFAULT until a benchmark against an
+#: independent annotation says a different one is better, and this repository
+#: has no such annotation (CLAUDE.md s.17). An unrecognised value is ignored
+#: rather than obeyed: a typo in an environment variable must not silently
+#: change which model segments a patient's arch.
+def _default_from_environment():
+    import os
+    want = (os.environ.get("ALIGNER_SEGMENTATION_PROVIDER") or "").strip().lower()
+    if want and want in _REGISTRY:
+        return want
+    if want:
+        print(f"[segmentation] ALIGNER_SEGMENTATION_PROVIDER={want!r} is not "
+              f"a known provider {sorted(_REGISTRY)}; using "
+              f"{ToothGroupNetworkProvider.name}.")
+    return ToothGroupNetworkProvider.name
+
+
+DEFAULT_PROVIDER = _default_from_environment()
 
 
 def get(name=None) -> SegmentationProvider:

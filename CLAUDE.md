@@ -19,6 +19,7 @@ Teeth must move biologically. Meshes must be mathematically watertight for 3D pr
 | API | **`api_core.py`** — `uvicorn api_core:app`, 33 paths. Launched by `start_backend.bat`. |
 | Client | **`frontend/src/App.jsx`** — `npm run dev`, launched by `start_frontend.bat`. |
 | Geometry | **`core_geometry.py`** — pure NumPy/SciPy, headless, the engine. |
+| Segmentation | **`segmentation_providers.py`** — the registry. `tgn_bridge.py` and `crosstooth_bridge.py` are the two model bridges; `/segment?provider=` picks one (§25). |
 | Docs | **`CLAUDE.md`** (this file) and **`README.md`**. No other document is authoritative. |
 
 `app_ui.py` is a legacy PyQt6 desktop shell over the same engine — it runs, but it is not the
@@ -30,11 +31,12 @@ that used to shadow the real `tooth_segmentation/` modules.
 
 ```
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names without importing (96 files)
-python run_all_tests.py                 # CANONICAL runner — 39 entries
+python check_structure.py               # undefined names without importing (98 files)
+python run_all_tests.py                 # CANONICAL runner — 40 entries
 python -m pytest -q                     # runs alongside; both must pass
 python bench_signed_distance.py         # scores the signed-distance method
 python real_scan_regression.py          # the real scan, end to end — see §23, §24.7
+python benchmark_providers.py           # every segmentation model, one scan — §25
 python -m pytest test_segmentation_mapping.py   # labels belong to the mesh — §24.3
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 node frontend/verify-palette.mjs        # 32 distinct FDI colours — §24.5
@@ -2384,3 +2386,280 @@ Covered by `test_segmentation_mapping.py` (12), the four transition controls
 and the unmeasurable-transition test in `test_manufacturing_interface.py`, the
 evidence and export-format tests in `test_manufacturing_matrix.py`,
 `frontend/verify-palette.mjs` and `real_scan_regression.py`.
+
+## 25. RESOLVED: CROSSTOOTH AS A SECOND SEGMENTATION PROVIDER
+
+CrossTooth (CVPR 2025, *3D Dental Model Segmentation with Geometrical
+Boundary Preserving*) is installed, wired to its shipped weights, and
+selectable per request. ToothGroupNetwork is untouched and remains the
+default. **No accuracy claim is made for either model, and §25.6 is about
+why that is not a hedge.**
+
+### 25.1 The repository could not import its own model, on any platform
+
+`models/PTv1/point_transformer_seg.py` opens with
+
+```python
+from models.PointTransformer.libs.pointops.functions import pointops
+```
+
+and **`CrossTooth/models/` contains only `PTv1/`.** That path does not exist
+in the shipped checkout, so the file cannot import on Linux with CUDA either;
+the missing piece is the Point Transformer CUDA extension, which the README
+tells you to install from a different repository. Three more blockers sat
+behind it, each read out of the vendored source rather than guessed:
+
+| blocker | what was done |
+|---|---|
+| the dotted path above does not exist | registered in `sys.modules` against this project's `pointops_cpu.py`, **for the duration of the import only** |
+| CrossTooth's `queryandgroup` returns `(grouped, idx)`; TGN's returns `grouped` | `_CrossToothPointops` adapts the return value. `pointops_cpu.py` is **not** edited — TGN depends on its single-value contract |
+| `TransitionDown.forward` calls `torch.cuda.IntTensor(n_o)` on a list of ints | patched to a CPU int32 constructor across one inference call, then restored |
+| `dataset/data.py` loads meshes with `vedo`, which is not installed | not needed — this app holds the mesh already; the feature preparation is replicated from that file |
+
+**THE SHIM IS SCOPED TO THE IMPORT, AND THAT IS THE LOAD-BEARING PART.**
+`models` is a top-level name **ToothGroupNetwork also claims** — tgn_bridge's
+design rule 3 exists for it — and this backend warms TGN on a background
+thread. A synthetic `models` package left installed for the life of the
+process is exactly how one model silently captures the other's imports. A
+chain name that is **already** in `sys.modules` is left alone and never
+restored, because it is not ours; measured, `sys.modules` comes back
+identical, and a test asserts it with a foreign `models` planted in the way.
+
+`torch.cuda.IntTensor` is process-global while patched, so it is held only
+across one inference call, and a test asserts it is restored **even when the
+body raises**. Nothing else in this repository constructs a CUDA tensor.
+
+### 25.2 The shipped loader shows the model a quarter of one arch
+
+`dataset/data.py` does:
+
+```python
+permute = np.random.permutation(self.args.num_points)   # 0..15999
+pointcloud = pointcloud[permute]
+```
+
+On a mesh with **more** faces than `num_points` that index array cannot reach
+past 15,999, so the model is handed the **first 16,000 triangles in file
+order**, shuffled. This project's real scan has 187,625. The researchers
+avoid it by decimating offline with a curvature-aware
+`selective_downsample.exe` — a Windows binary that is **not in the
+repository**.
+
+`spatially_uniform_subset` replaces it with a voxel grid bisected onto the
+target count, one representative per voxel, deterministic and independent of
+input order. **THIS IS NOT THE RESEARCHERS' DECIMATION AND THE DIFFERENCE IS
+REAL**: theirs puts more cells near tooth boundaries, which is where a
+boundary-preserving model most wants them. Uniform is the honest substitute,
+not an equivalent one, and the audit says so.
+
+FPS was rejected on a measurement, not on taste: `pointops_cpu`'s
+`furthestsampling` is a Python loop, so 16,000 passes over 187,625 points is
+minutes of overhead for a *selection*. Random was rejected because at 8.5%
+coverage it leaves clumps and bald patches.
+
+**The voxel encoding was 10.5 s of a 24 s run.** `np.unique(keys, axis=0)`
+lexsorts three columns; encoding each voxel as one int64 (the strides are the
+per-axis voxel counts, so it cannot collide) took **prepare from 10.5 s to
+1.79 s and the whole segmentation from 24.2 s to 12.9 s**, with
+**bit-identical labels**.
+
+### 25.3 The order of pad → permute → normalise is preserved deliberately
+
+`PointcloudNormalize(radius=1)` touches **columns 0:3 only** — normalising all
+six would rescale the unit face normals by the arch's radius in millimetres.
+And the zero-padding rows go in **before** normalisation, so on a sparse mesh
+they pull the centroid toward the origin. That is part of the input
+distribution the checkpoint was trained on; "tidying" it by normalising first
+would feed the model something it has never seen.
+
+**Rule 3.1 is not at risk.** The normalisation is an input transform on a
+copy, no scan coordinate is written back, and the centroid and radius are
+returned so the transform is inspectable rather than implicit.
+
+**A padding row carries `source_face = -1`, and that is not cosmetic.** Index
+`-1` in NumPy selects the LAST element, so a padding row's prediction would
+land silently on the final triangle of the mesh.
+
+### 25.4 It classifies FACES, and the mapping home is the researchers' own
+
+The 6 channels are the face centroid and the unit face normal, so a
+prediction is one class per triangle. `prepare_data/upsample_points.py` maps
+them back with `KNeighborsClassifier(n_neighbors=3)` fitted on the predicted
+cell centroids in original millimetre coordinates, and that is what is used
+here rather than a majority-of-incident-faces vote — it is theirs, and it is
+defined for a vertex whose every incident face was dropped by the subset.
+
+**SO THIS PROVIDER HAS NO VERTEX-ORDER DEPENDENCY AT ALL**, which is worth
+stating because it is the defect §24.3 exists around. Nothing is indexed by
+position in an array; the mapping is a coordinate query. `transfer_labels_by_
+position` is therefore **not run** for it: it would compare the caller's array
+with itself and report the identity it was handed, which is a check that
+cannot fail and so is worth nothing. The transfer record says exactly that,
+and a test shuffles the vertex array and asserts the labels move with it.
+
+### 25.5 The quadrant naming, which the source cannot settle and a measurement can
+
+`CrossTooth/utils.py` gives classes 1-8 the "L" quadrant and 9-16 the "R"
+quadrant. **Which physical side of the patient that is depends on the
+orientation convention of the training data**, and this repository has no
+annotated ground truth (§17). Two things are checkable without one, and
+`quadrant_coherence` measures both: are the two groups separated by a plane,
+and does the class index run anterior to posterior.
+
+**THE REFERENCE POINT FOR THE SECOND ONE WAS WRONG FIRST, and it would have
+condemned a correct arch.** An arch is a horseshoe — incisors and molars both
+sit on its PERIPHERY — so distance from the arch centre is not monotone in
+the tooth index. Distance from the quadrant's own central incisor runs along
+the curve and is. Measured on the real scan, the same labels:
+
+| reference | 31-38 | 41-48 |
+|---|---|---|
+| arch centre | 1.000 | **0.929** |
+| the quadrant's own central incisor | 1.000 | **1.000** |
+
+**The naming itself was settled by measurement against the other model.**
+Both were run over `case_lower.stl` and compared on the 56,707 vertices both
+call a tooth:
+
+| | agreement |
+|---|---|
+| exact FDI, as mapped | **0.4884** |
+| exact FDI if CrossTooth's quadrants were mirrored | **0.0559** |
+
+So the two independently trained models **agree on which side is 3x and which
+is 4x**. That is the one thing inter-model agreement can settle, and it is
+not accuracy: `labels_are_fdi_verified` is False, always, and a test asserts
+it can never read True.
+
+### 25.6 The benchmark reports geometry and agreement, and refuses to report accuracy
+
+`benchmark_providers.py` runs every installed provider over one scan.
+**It is not an accuracy benchmark and must never be quoted as one** —
+`benchmark_segmentation.py` already implements IoU, FDI accuracy, Chamfer and
+Hausdorff correctly and then **refuses to run** without an independently
+attributed annotation, for the reason §17 records. Scoring model A against
+model B is that same error wearing a second hat: it says which two models
+agree, not which one is right.
+
+What it does report is **geometry**, which needs no annotation — a tooth is
+one connected lump of a plausible size — and **agreement**, which is symmetric
+and attributes nothing but can settle a convention. Measured,
+`case_lower.stl`, 94,848 vertices / 187,625 faces, CPU:
+
+| | ToothGroupNetwork | CrossTooth |
+|---|---|---|
+| seconds | 255.04 | **13.30** |
+| teeth labelled | 11 | 16 |
+| median per-tooth box diagonal | 14.738 mm | 13.239 mm |
+| **max** per-tooth box diagonal | **51.007 mm** | 17.805 mm |
+| teeth in ONE connected piece | 4 of 11 | **12 of 16** |
+| worst largest-component fraction | **0.5230** | 0.9879 |
+
+CrossTooth's own breakdown: prepare 1.8 s, inference 9.0 s, upsample 2.1 s;
+mean per-cell softmax confidence 0.975; quadrant groups separated by 34.53 mm
+with **zero overlap**.
+
+**THE 51.007 mm ROW IS THE ONE TO READ, and §24.3 is why it is not a mapping
+bug this time.** One TGN label spans half a mandible while the MEDIAN stays at
+a plausible 14.738 mm — a mis-indexed array scatters EVERY tooth, so the
+median is what separates the two failures, and here it says the labels do
+belong to this mesh and one region is genuinely wrong.
+
+**What this does NOT establish.** That CrossTooth's FDI numbers are correct.
+The two models' exact-FDI agreement is 0.4884, and the confusion is a
+one-tooth shift along the 3x quadrant: TGN's own label set is missing 33 and
+35 and carries a two-component 37, which is *consistent with* TGN
+under-segmenting there and CrossTooth being right — and consistency is not
+proof. Either model could be the shifted one. **Nothing here licenses
+switching the default**, and it has not been switched.
+
+### 25.7 The toggle
+
+`POST /api/session/{sid}/segment?provider=crosstooth`. Per request, not a
+server mode, because the point of two models is running both over ONE scan —
+a server-wide switch makes that a restart apiece. `ALIGNER_SEGMENTATION_
+PROVIDER` sets the process default, and **an unrecognised value is ignored
+rather than obeyed**: a typo in an environment variable must not silently
+change which model segments a patient's arch.
+
+**EVERY PROVIDER LANDS IN THE SAME DOWNSTREAM PATH** — the FDI/jaw check, the
+hybrid geodesic fallback, the spatial diagnostic, the audit entry, the
+telemetry span and the response shape are shared. A second model does not get
+a softer gate than the first.
+
+Three smaller things this exposed:
+
+* **The gate skips ToothGroupNetwork deliberately.** Its `available()`
+  reported `loaded`, which is False for the first seconds of every process
+  while the background warm-up imports torch (§12) — and the shipped
+  behaviour for a request landing in that window is to WAIT on the load lock,
+  not to be refused. Gating on it would have turned a 10-second wait into a
+  409 in the one path with a clinician in front of it. `available()` now
+  reports whether the model CAN run rather than whether it HAS run.
+* **`ToothGroupNetworkProvider.segment` now loads its own pipeline.** It
+  relied on the endpoint having warmed it, and a provider that only works
+  when someone else warmed it is not a provider — `benchmark_providers.py`
+  drives it directly.
+* **`diag["provider"]` recorded `DEFAULT_PROVIDER`.** Those were the same
+  value for as long as there was one provider; it would now mislabel every
+  A/B run. It records the backend that actually ran.
+
+The client's picker is a plain `<select>` — no framework, no new dependency,
+**+0.31 KB gzip** (272.44 → 272.75 KB). It reads the registry once and hides
+itself if that fetch fails, because a model chooser is a convenience and must
+never be able to stop the shipped model running. It reports the provider from
+the RESPONSE, not the one that was requested: they are the same today, and
+reading the request back would make any future fallback invisible in exactly
+the place someone would look to find out what produced these teeth.
+
+**The deps-array trap was checked, not assumed, for the SEVENTH time.**
+`segProvider` enters `runSegmentation`'s dependency array at `App.jsx:1496`
+and is declared at `:381`.
+
+### 25.8 einops is the only package added, and the three that were not
+
+`einops` is genuinely load-bearing — `PointTransformerLayer.forward` uses
+`einops.reduce` and `einops.rearrange`, and that file is vendored code this
+project does not edit. Verified by following the import chain rather than by
+reading `CrossTooth/requirements.txt`, which §19 records getting wrong the
+other way round for trimesh and open3d: `point_transformer_seg.py` imports
+exactly `os`, `torch`, `torch.nn`, `einops` and `pointops`.
+
+Not installed, each for a reason: **pointops** (shimmed, §25.1); **vedo**
+(only `dataset/data.py` uses it, to load a mesh we already hold — a VTK stack
+to re-read a mesh in memory); **spconv, flash-attn, torch-scatter,
+torch-sparse, torch-cluster, torch-points3d, pykeops** (none on the PTv1
+inference path; they belong to the training code and to the 12 competing
+methods in `compete/`).
+
+`*.pth`, `*.pt` and `*.ckpt` join `*.h5` in `.gitignore`. `build_ai_export.py`
+already refused all four on the same ground: a checkpoint is not source, and a
+27MB binary in history is paid for on every clone forever. `CrossTooth/` joins
+`ToothGroupNetwork/` in `check_structure.py`'s skip list — its `compete/`
+folder carries 12 more research checkouts, three of which have undefined names
+that are not ours to fix. **`crosstooth_bridge.py` is ours and stays in the
+walk** (98/98).
+
+### 25.9 What was NOT done
+
+* **No accuracy benchmark exists**, for either model, and none can be run
+  here. See §25.6.
+* **The default was not changed.** CrossTooth wins every geometric measure
+  taken and is 19× faster, and that is still not grounds to make it the model
+  that decides where a clinician cuts.
+* **Only the lower jaw was exercised on real anatomy.** There is no maxillary
+  scan in this repository (§19), so the upper class→FDI branch is covered by
+  a synthetic fixture and by the table test, not by a real arch.
+* **The edge-segmentation head is discarded.** `point_seg_result,
+  edge_seg_result = model(...)` — the second output is the boundary head the
+  paper's title is about, and `predict.py` ignores it too. It is where a
+  cervical-margin refinement would come from, and it is unexplored.
+* **`num_points` is fixed at the trained 16,000.** `nsample` is a fixed k, so
+  changing the point count changes the neighbourhood scale it represents. It
+  is a parameter with a warning attached rather than a knob.
+* **No multi-subset voting.** One voxel subset is drawn per scan; aggregating
+  votes over several would cover the faces the subset misses, at a multiple
+  of the runtime. Unmeasured.
+
+Covered by `test_crosstooth_adapter.py` (32), `benchmark_providers.py` and
+`crosstooth_bridge.py`.

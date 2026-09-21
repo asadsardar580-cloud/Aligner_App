@@ -137,6 +137,11 @@ _SEGMENTATION_STATE = {
     # unavailable" about a model that is simply still importing torch.
     "warming": False,
     "warm_seconds": None,
+    # Which backend the run in progress belongs to. `warming` only ever
+    # described ToothGroupNetwork's startup load, and conflating the two
+    # would make a CrossTooth run report that it was waiting for a model it
+    # does not use.
+    "provider": None,
 }
 
 
@@ -216,6 +221,13 @@ def ai_status():
         "segmentation_in_progress": _SEGMENTATION_STATE["in_progress"],
         "segmentation_started_at": _SEGMENTATION_STATE["started_at"],
         "segmentation_message": _SEGMENTATION_STATE["message"],
+        "segmentation_provider": _SEGMENTATION_STATE["provider"],
+        # `loaded` above is ToothGroupNetwork's, which is what the health chip
+        # has always meant. The registry is what a provider picker reads.
+        "default_provider": segmentation_providers.DEFAULT_PROVIDER,
+        "providers": {n: {"available": bool(p.get("available")),
+                          "reason": p.get("reason")}
+                      for n, p in segmentation_providers.registry().items()},
     }
 
 
@@ -434,11 +446,43 @@ def set_occlusal_plane(sid: str, req: OcclusalPlaneRequest):
     return arch_frame.to_json(frame)
 
 @app.post("/api/session/{sid}/segment")
-async def segment(sid: str):
+async def segment(sid: str, provider: str = None):
+    """Segment this arch. `?provider=` picks the backend; see
+    GET /api/segmentation/providers for what is installed.
+
+    THE TOGGLE IS PER REQUEST, not a server mode, because the point of having
+    two models is running both over ONE scan and comparing. A server-wide
+    switch would make that a restart apiece. The process-wide default comes
+    from ALIGNER_SEGMENTATION_PROVIDER and is `toothgroupnetwork` unless it
+    is set.
+
+    EVERY PROVIDER LANDS IN THE SAME DOWNSTREAM PATH - the FDI/jaw check, the
+    hybrid geodesic fallback, the spatial diagnostic, the audit entry and the
+    response shape are shared. A second model must not come with a second set
+    of guards, or the guards are not guards.
+    """
     try:
         v, f, arch = (STORE.require(sid, "verts"), STORE.require(sid, "faces"), STORE.arch(sid))
     except SessionExpired as e:
         raise HTTPException(404, str(e))
+
+    try:
+        backend = segmentation_providers.get(provider)
+    except KeyError as e:
+        raise HTTPException(400, str(e))
+    # THE GATE DELIBERATELY SKIPS ToothGroupNetwork, and that is not an
+    # oversight. Its `available()` reports `loaded`, which is False for the
+    # first several seconds of every process while the background warm-up
+    # runs (s.12) - and the shipped behaviour for a request landing in that
+    # window is to WAIT on the same lock and get the same pipeline, not to be
+    # refused. Gating on it here would turn a 10-second wait into a 409 and
+    # would be a regression in the one path that has a user in front of it.
+    if backend.name != "toothgroupnetwork":
+        ready = backend.available()
+        if not ready.get("available"):
+            raise HTTPException(
+                409, f"Segmentation provider {backend.name!r} is not "
+                     f"available: {ready.get('reason')}")
 
     if _SEGMENTATION_STATE["in_progress"]:
         raise HTTPException(409, "AI segmentation is already running. Please wait for it to finish.")
@@ -446,30 +490,55 @@ async def segment(sid: str):
     _SEGMENTATION_STATE.update({
         "in_progress": True,
         "started_at": time.time(),
+        "provider": backend.name,
         "message": ("Waiting for the AI model to finish loading..."
                     if _SEGMENTATION_STATE["warming"]
-                    else "Running ToothGroupNetwork on this arch..."),
+                    and backend.name == "toothgroupnetwork"
+                    else f"Running {backend.name} on this arch..."),
     })
 
     try:
-        # Idempotent. If the background warm-up is still running this blocks on
-        # the same lock and returns the same pipeline; if the warm-up failed it
-        # returns that error rather than a second attempt's.
-        model_status = await asyncio.to_thread(
-            tgn_bridge.load, CKPT_FPS, CKPT_BDL, "tgnet")
-        if not model_status["loaded"]:
-            raise RuntimeError(model_status.get("error") or "AI segmentation model did not initialize.")
-        _SEGMENTATION_STATE["message"] = "Running ToothGroupNetwork on this arch..."
+        provider_meta = {}
+        if backend.name == "toothgroupnetwork":
+            # Idempotent. If the background warm-up is still running this blocks on
+            # the same lock and returns the same pipeline; if the warm-up failed it
+            # returns that error rather than a second attempt's.
+            model_status = await asyncio.to_thread(
+                tgn_bridge.load, CKPT_FPS, CKPT_BDL, "tgnet")
+            if not model_status["loaded"]:
+                raise RuntimeError(model_status.get("error") or "AI segmentation model did not initialize.")
+            _SEGMENTATION_STATE["message"] = "Running ToothGroupNetwork on this arch..."
 
-        result_json, used_verts = await asyncio.to_thread(
-            run_segmentation, v, f, arch, True)
-        check = jaw_naming.verify_fdi_matches_jaw(result_json, arch)
-        if not check["ok"]:
-            raise HTTPException(500, check["diagnosis"])
+            result_json, used_verts = await asyncio.to_thread(
+                run_segmentation, v, f, arch, True)
+            check = jaw_naming.verify_fdi_matches_jaw(result_json, arch)
+            if not check["ok"]:
+                raise HTTPException(500, check["diagnosis"])
 
-        labels, _ = jaw_naming.extract_labels(result_json, expect_jaw=arch)
-        if len(labels) != len(v):
-            raise HTTPException(500, "Label array does not match mesh.")
+            labels, _ = jaw_naming.extract_labels(result_json, expect_jaw=arch)
+            if len(labels) != len(v):
+                raise HTTPException(500, "Label array does not match mesh.")
+        else:
+            # ANY OTHER PROVIDER GOES THROUGH THE REGISTRY, and it is
+            # responsible for returning labels already on THIS array - which
+            # for CrossTooth means a coordinate KNN rather than an index, so
+            # there is no ordering to get wrong. The identical FDI/jaw check
+            # runs on the result either way: a second model does not get a
+            # softer gate than the first.
+            try:
+                result = await asyncio.to_thread(backend.segment, v, f, arch)
+            except NotImplementedError as e:
+                raise HTTPException(501, str(e))
+            labels = [int(x) for x in np.asarray(result.labels).reshape(-1)]
+            if len(labels) != len(v):
+                raise HTTPException(
+                    500, f"{backend.name} returned {len(labels)} labels for "
+                         f"{len(v)} vertices.")
+            check = jaw_naming.verify_fdi_matches_jaw(labels, arch)
+            if not check["ok"]:
+                raise HTTPException(500, check["diagnosis"])
+            provider_meta = _jsonable(result.meta)
+            transfer = result.transfer
 
         # THE LABELS ARE MOVED ONTO OUR ARRAY BY POSITION, NEVER BY INDEX.
         # The length check above is the one that used to stand alone, and it
@@ -480,12 +549,13 @@ async def segment(sid: str):
         # median per-tooth bounding box is 50.71mm - most of a mandible - and
         # 13.97mm once transferred by position. That was reported as a model
         # failure for a model that had segmented the arch correctly.
-        try:
-            labels, transfer = segmentation_providers.\
-                transfer_labels_by_position(used_verts, labels, v)
-        except segmentation_providers.LabelTransferError as e:
-            raise HTTPException(500, f"Segmentation labels do not belong to "
-                                     f"this mesh: {e}")
+        if backend.name == "toothgroupnetwork":
+            try:
+                labels, transfer = segmentation_providers.\
+                    transfer_labels_by_position(used_verts, labels, v)
+            except segmentation_providers.LabelTransferError as e:
+                raise HTTPException(500, f"Segmentation labels do not belong "
+                                         f"to this mesh: {e}")
 
         # HYBRID FALLBACK. Tier 1 is the model; any tooth whose region is
         # geometrically impossible - split across two places, or implausibly
@@ -514,12 +584,16 @@ async def segment(sid: str):
         except Exception as e:                            # noqa: BLE001
             diag = {"error": f"{type(e).__name__}: {e}"}
         diag["label_transfer"] = transfer
-        diag["provider"] = segmentation_providers.DEFAULT_PROVIDER
+        # THE PROVIDER THAT ACTUALLY RAN, not the configured default. Those
+        # were the same value for as long as there was one provider, and
+        # recording the default would now mislabel every A/B run.
+        diag["provider"] = backend.name
+        diag["provider_meta"] = provider_meta
         STORE.put(sid, "segmentation_diagnostics", diag)
         _n_teeth = int(len(set(int(x) for x in labels)) - (1 if 0 in set(
             int(x) for x in labels) else 0))
         _record(sid, audit.SEGMENTED, arch=arch,
-                detail=f"{_n_teeth} region(s) labelled",
+                detail=f"{_n_teeth} region(s) labelled by {backend.name}",
                 values={"teeth": _n_teeth,
                         "repaired": int(sum(1 for t in hybrid["teeth"]
                                             if t.get("tier") != "model"))})
@@ -527,11 +601,12 @@ async def segment(sid: str):
             "segment",
             (time.time() - _SEGMENTATION_STATE["started_at"]) * 1000,
             arch=arch, vertices=int(len(v)), arch_faces=int(len(f)),
-            teeth=_n_teeth,
+            teeth=_n_teeth, provider=backend.name,
             repaired=int(sum(1 for t in hybrid["teeth"]
                              if t.get("tier") != "model")))
         return {
             "labels": [int(x) for x in labels], "jaw": arch, "report": check,
+            "provider": backend.name, "provider_meta": provider_meta,
             # Intrinsic geometric plausibility. NOT measured accuracy - no IoU is
             # computable without annotated ground truth, and the payload says so
             # in `is_measured_accuracy` and `meaning`.
@@ -546,6 +621,7 @@ async def segment(sid: str):
         _SEGMENTATION_STATE.update({
             "in_progress": False,
             "started_at": None,
+            "provider": None,
             "message": "idle",
         })
 

@@ -30,6 +30,9 @@ SKIP_DIRS = {
     "_archive",               # dead code, kept for reference only
     "Aligner_App_AI_Export",  # generated duplicate of the whole tree
     "ToothGroupNetwork",      # vendored third party — never edited, never linted
+    "CrossTooth",             # ditto; its own `compete/` folder carries
+                              # 12 more research checkouts. crosstooth_bridge.py
+                              # is OURS and stays in the walk.
     "exports", "segmented",
 }
 

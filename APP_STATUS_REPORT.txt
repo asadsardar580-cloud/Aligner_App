@@ -248,7 +248,9 @@ Architecture
     api_core.py           (FastAPI — 14 routes, sessions, orchestration, ZIP export)
             |
             +--> core_geometry.py     5,638 lines. Pure NumPy/SciPy. ALL geometry + kinematics.
+            +--> segmentation_providers.py  The model registry; /segment?provider=
             +--> tgn_bridge.py  -->   ToothGroupNetwork/  (vendored, PyTorch, never edited)
+            +--> crosstooth_bridge.py -> CrossTooth/      (vendored, PyTorch, never edited)
             +--> session_store.py     In-memory, TTL, PHI-conscious
             +--> arch_frame.py        Occlusal reference basis
 
@@ -270,7 +272,8 @@ Backend                    FastAPI 0.141.1, uvicorn 0.52.4, python-multipart 0.0
                            SciPy 1.18.1
 Geometry booleans          manifold3d 3.5.2 - load-bearing; listed in requirements.txt since
                            2026-09-15
-AI segmentation            PyTorch 2.13.0+cpu, open3d 0.19.0, ToothGroupNetwork (vendored)
+AI segmentation            PyTorch 2.13.0+cpu, open3d 0.19.0, einops 0.8.2,
+                           ToothGroupNetwork and CrossTooth (both vendored)
 Collision / proximity      scipy.spatial.cKDTree - see §6, the brief's "python-fcl" is not present
 Frontend                   React 19.2.8, three 0.185.1, Vite 8.2.2, @radix-ui accordion + slider,
                            lucide-react
@@ -316,9 +319,25 @@ reflect. There is no MatCap material anywhere (§6).
 
 Module 2 - Segmentation & Crown Isolation [DONE]
 ------------------------------------------------
-Two paths. AI: ToothGroupNetwork via tgn_bridge.py - 236 s on a real 187k-face arch,
-11 teeth. Manual: 3-click landmarks (mesial, distal, FA point) + curvature-weighted geodesic
-flood-fill (/wand, api_core.py:285).
+Two paths, and the AI path now has two models behind one registry
+(segmentation_providers.py). `/segment?provider=` picks per request;
+ALIGNER_SEGMENTATION_PROVIDER sets the process default. Measured on the same
+real 187k-face arch, same conditioning, CPU:
+
+                        seconds   teeth   median box   max box   1-piece
+  toothgroupnetwork      255.04      11     14.738mm   51.007mm    4/11
+  crosstooth              13.30      16     13.239mm   17.805mm   12/16
+
+NEITHER IS VALIDATED, and the default was NOT changed on those numbers.
+There is no independently annotated ground truth in this repository, so the
+table is geometric plausibility, not accuracy - benchmark_segmentation.py
+refuses to compute an mIoU for exactly this reason and benchmark_providers.py
+says so in its own output. The two models agree on the quadrant convention
+(0.4884 as mapped vs 0.0559 mirrored) and disagree by one tooth along the 3x
+quadrant; which of them is shifted is not established. See CLAUDE.md s.25.
+
+Manual: 3-click landmarks (mesial, distal, FA point) + curvature-weighted
+geodesic flood-fill (/wand, api_core.py:285).
 
 Crown capping is cap_and_close (core_geometry.py:539): **Delaunay first, centroid fan as
 fallback**, and the fan wins whenever Delaunay's output would break manifoldness - the gate is

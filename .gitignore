@@ -27,8 +27,15 @@ storage/
 *.scan_key
 *.case_key
 
-# --- AI model checkpoints (64MB each, 12 of them) ---
+# --- AI model checkpoints ---
+# ToothGroupNetwork ships 12 .h5 files at ~64MB each; CrossTooth ships one
+# 27MB .pth. build_ai_export.py already refuses all four extensions on the
+# same ground - a model checkpoint is not source, and a binary that large
+# in history is paid for on every clone forever.
 *.h5
+*.pth
+*.pt
+*.ckpt
 
 # --- Generated handover archive ---
 Aligner_App_AI_Export/
