@@ -775,6 +775,193 @@ def _box(corner, s=1.0):
     return v, f
 
 
+# ===========================================================================
+# 39-42  THE TRANSITION PROFILE IS MEASURED ON THE SURFACE, NOT ON VERTICES
+#
+# `transition_quality` decides `no_transition_ledge`, which is the only gate
+# that has ever refused an otherwise-printable stage. It used to read the
+# profile off the NEAREST VERTEX to each radial probe - the fourth appearance
+# in this codebase of the mistake `CastProbe.signed`, `surface_deviation` and
+# `old_site_quality` were each corrected for - and it was wrong in BOTH
+# directions, which is why both controls are here:
+#
+#   * it MISSED a textbook cylindrical collar, reporting share 0.0000,
+#     because the nearest vertex to every probe sat on the flat plate;
+#   * it REJECTED a provably linear ramp at share 1.0000 when the band was
+#     spanned by single large triangles, because the same vertex answers
+#     several consecutive rings and then the query jumps.
+#
+# Each fixture is a solid of revolution whose profile is known exactly before
+# the measurement runs, so the expected answer is not an opinion. Tests 41 and
+# 42 assert the OLD method's answer as well, so the fixture is proved to
+# reproduce the defect rather than merely to pass afterwards - CLAUDE.md
+# section 5: verify a fixture reproduces the bug before trusting it.
+# ===========================================================================
+
+_NTHETA = 96
+
+
+def _revolution_ring(r, z, n=_NTHETA):
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return np.column_stack([r * np.cos(a), r * np.sin(a), np.full(n, float(z))])
+
+
+def _revolution_solid(profile_radii, profile_heights, outer_r=9.0, floor=-3.0):
+    """A closed solid of revolution: a top disc, the given radial profile, a
+    flat outer plate, a skirt and a bottom disc."""
+    verts, faces = [], []
+
+    def add_ring(r, z):
+        i = len(verts)
+        verts.extend(_revolution_ring(r, z))
+        return i
+
+    def bridge(i0, i1, flip=False):
+        out = []
+        for k in range(_NTHETA):
+            k2 = (k + 1) % _NTHETA
+            a, b, c, d = i0 + k, i0 + k2, i1 + k2, i1 + k
+            out += ([[a, b, c], [a, c, d]] if not flip
+                    else [[a, c, b], [a, d, c]])
+        return out
+
+    def cap(i0, c, flip=False):
+        return [([c, i0 + (k + 1) % _NTHETA, i0 + k] if not flip
+                 else [c, i0 + k, i0 + (k + 1) % _NTHETA])
+                for k in range(_NTHETA)]
+
+    rings = [add_ring(r, z) for r, z in zip(profile_radii, profile_heights)]
+    plate = add_ring(outer_r, profile_heights[-1])
+    bot_out = add_ring(outer_r, floor)
+    bot_in = add_ring(0.001, floor)
+    top_c = len(verts)
+    verts.append([0.0, 0.0, float(profile_heights[0])])
+    bot_c = len(verts)
+    verts.append([0.0, 0.0, floor])
+
+    faces += cap(rings[0], top_c)
+    for a, b in zip(rings, rings[1:]):
+        faces += bridge(a, b)
+    faces += bridge(rings[-1], plate)
+    faces += bridge(plate, bot_out)
+    faces += bridge(bot_out, bot_in)
+    faces += cap(bot_in, bot_c, flip=True)
+    return np.asarray(verts, float), np.asarray(faces, np.int64)
+
+
+def _nearest_vertex_share(verts, rim, u, band_mm=1.5, step_mm=0.25):
+    """The profile EXACTLY as it was shipped, for the reproduction proof."""
+    from scipy.spatial import cKDTree
+    centre = rim.mean(axis=0)
+    radial = rim - centre
+    rn = np.linalg.norm(radial, axis=1, keepdims=True)
+    rdir = np.divide(radial, np.where(rn < 1e-12, 1.0, rn))
+    tree = cKDTree(verts)
+    h = []
+    for off in np.arange(0.0, band_mm + 1e-9, step_mm):
+        _, idx = tree.query(rim + rdir * off, workers=-1)
+        h.append(float(np.median((verts[idx] - centre) @ u)))
+    h = np.asarray(h)
+    total = float(abs(h[0] - h[-1]))
+    worst = float(np.abs(np.diff(h)).max())
+    return h, (worst / total if total > 1e-6 else 0.0)
+
+
+_UP = np.array([0.0, 0.0, 1.0])
+_COLLAR_FALL = 0.946    # the historical collar's own fall, CLAUDE.md s.23
+
+
+def test_a_cylindrical_collar_is_still_called_a_ledge():
+    """THE CONTROL THAT MATTERS. A vertical wall at the cervical radius with
+    a flat plate beyond it is the exact artefact the check exists to catch."""
+    v, f = _revolution_solid([4.0, 4.0], [_COLLAR_FALL, 0.0])
+    rim = _revolution_ring(4.0, _COLLAR_FALL)
+    r = mfg.transition_quality(v, f, rim, _UP)
+    assert r["measured"] is True
+    assert r["looks_like_a_ledge"] is True, r
+    assert r["largest_step_share"] > 0.99, r
+    assert abs(r["total_fall_mm"] - _COLLAR_FALL) < 1e-3, r
+    print(f"PASS  a cylindrical collar is a ledge: share "
+          f"{r['largest_step_share']}, fall {r['total_fall_mm']}mm")
+
+
+def test_the_old_nearest_vertex_profile_MISSED_that_collar():
+    """The defect, in the direction nobody looked for. On the same solid the
+    shipped measurement reported NO fall at all, because the nearest vertex
+    to every probe outside the wall sits on the flat plate."""
+    v, f = _revolution_solid([4.0, 4.0], [_COLLAR_FALL, 0.0])
+    rim = _revolution_ring(4.0, _COLLAR_FALL)
+    h, share = _nearest_vertex_share(v, rim, _UP)
+    assert share < 0.75, (
+        "the fixture no longer reproduces the false negative", h, share)
+    assert float(np.abs(np.diff(h)).max()) < 1e-6, h
+    print(f"PASS  the old profile MISSED the collar: share {share:.4f}, "
+          f"a completely flat {np.round(h, 4).tolist()}")
+
+
+@pytest.mark.parametrize("rings,fall", [(13, 0.946), (13, 3.5), (2, 0.946)])
+def test_a_smooth_cone_is_called_a_blend_at_any_mesh_density(rings, fall):
+    """A linear ramp is a blend whether it is meshed with twelve strips or
+    one. `rings=2` is the same surface spanned by single large triangles -
+    the case the nearest-vertex profile called a ledge."""
+    rr = list(np.linspace(4.0, 5.5, rings))
+    hh = list(np.linspace(fall, 0.0, rings))
+    v, f = _revolution_solid(rr, hh)
+    rim = _revolution_ring(4.0, fall)
+    r = mfg.transition_quality(v, f, rim, _UP)
+    assert r["measured"] is True
+    assert r["looks_like_a_ledge"] is False, r
+    # six equal steps down a linear ramp
+    assert abs(r["largest_step_share"] - 1.0 / 6.0) < 0.02, r
+    assert r["monotonic"] is True, r
+    assert abs(r["total_fall_mm"] - fall) < 1e-2, r
+    print(f"PASS  a {fall}mm cone in {rings} rings is a blend: share "
+          f"{r['largest_step_share']}")
+
+
+def test_the_old_nearest_vertex_profile_REJECTED_that_same_cone():
+    """The other direction, on geometry that is provably a straight line. The
+    surface is identical to the 13-ring cone above; only the mesh is coarser.
+    The old method reports a 1.0 share - a total false positive - and this is
+    what refused 0.6mm extrusion + 3 degrees of tip at stage 3."""
+    v, f = _revolution_solid([4.0, 5.5], [_COLLAR_FALL, 0.0])
+    rim = _revolution_ring(4.0, _COLLAR_FALL)
+    h, share = _nearest_vertex_share(v, rim, _UP)
+    assert share > 0.75, (
+        "the fixture no longer reproduces the false positive", h, share)
+    r = mfg.transition_quality(v, f, rim, _UP)
+    assert r["looks_like_a_ledge"] is False, r
+    print(f"PASS  the old profile REJECTED a linear ramp at share "
+          f"{share:.4f}; the corrected one reads "
+          f"{r['largest_step_share']} and accepts it")
+
+
+def test_an_unmeasurable_transition_fails_the_gate_rather_than_passing_it():
+    """A missing measurement is not a pass. `looks_like_a_ledge` must be None,
+    never False, so `aggregate_print_gate` refuses exactly as for a real
+    ledge - the same doctrine as NOT_CHECKED is not CLEAR."""
+    v, f = _revolution_solid([4.0, 5.5], [_COLLAR_FALL, 0.0])
+    rim = _revolution_ring(4.0, _COLLAR_FALL)
+    real = mfg._raycast_scene
+
+    def refuse(*a, **k):
+        return None
+
+    mfg._raycast_scene = refuse
+    try:
+        r = mfg.transition_quality(v, f, rim, _UP)
+    finally:
+        mfg._raycast_scene = real
+    assert r["measured"] is False
+    assert r["looks_like_a_ledge"] is None, r
+    assert r["looks_like_a_ledge"] is not False
+    stage = {"interfaces": [{"ok": True, "transition": r}]}
+    gate = next(g for g in mfg.aggregate_print_gate(stage)["gates"]
+                if g["gate"] == "no_transition_ledge")
+    assert gate["passed"] is False, gate
+    print("PASS  an unmeasurable transition fails no_transition_ledge")
+
+
 if __name__ == "__main__":
     import sys
     failures = []

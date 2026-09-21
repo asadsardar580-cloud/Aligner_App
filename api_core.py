@@ -27,6 +27,8 @@ import case_store
 import space_analysis
 import segmentation_review
 import segmentation_fallback
+import segmentation_providers
+import segmentation_diagnostics
 import benchmark_segmentation
 import scan_cache_manager
 import clinical_safety
@@ -217,7 +219,32 @@ def ai_status():
     }
 
 
-def run_segmentation(v, f, jaw):
+def _vertices_as_the_pipeline_loaded_them(obj_path, fallback):
+    """The vertex array ToothGroupNetwork ACTUALLY read, in ITS order.
+
+    WHY THIS IS NOT JUST `v`. The pipeline reads the OBJ through
+    `gen_utils.read_txt_obj_ls(use_tri_mesh=True)`, i.e.
+    `trimesh.load_mesh(path, process=False)`, and the comment directly above
+    that function in the vendored source reads "In some cases, trimesh can
+    change vertex order". Measured on this project's real scan the order IS
+    preserved - 0 of 94,848 rows differ - but the same OBJ read by Open3D
+    comes back in a DIFFERENT order with the same count, so the property is
+    a fact about one loader and one version, not about the file. Loading it
+    back the way the pipeline does turns the assumption into a measurement,
+    and `transfer_labels_by_position` then makes the ordering irrelevant.
+    """
+    try:
+        import trimesh
+        m = trimesh.load_mesh(obj_path, process=False)
+        used = np.asarray(m.vertices, float)
+        if used.ndim == 2 and used.shape[1] == 3 and len(used):
+            return used
+    except Exception:                                     # noqa: BLE001
+        pass
+    return np.asarray(fallback, float)
+
+
+def run_segmentation(v, f, jaw, return_input_vertices=False):
     safe_dir = CURRENT_DIR.replace("\\", "/")
     safe_filename = jaw_naming.scan_filename(jaw, patient_id="conditioned", suffix=".obj")
     temp_path = f"{safe_dir}/{safe_filename}"
@@ -234,6 +261,10 @@ def run_segmentation(v, f, jaw):
         segmenter.process(temp_path, temp_json)
         with open(temp_json, 'r') as jf:
             result_json = json.load(jf)
+        if return_input_vertices:
+            # BEFORE the finally clause deletes the file.
+            return result_json, _vertices_as_the_pipeline_loaded_them(
+                temp_path, v)
         return result_json
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
@@ -430,7 +461,8 @@ async def segment(sid: str):
             raise RuntimeError(model_status.get("error") or "AI segmentation model did not initialize.")
         _SEGMENTATION_STATE["message"] = "Running ToothGroupNetwork on this arch..."
 
-        result_json = await asyncio.to_thread(run_segmentation, v, f, arch)
+        result_json, used_verts = await asyncio.to_thread(
+            run_segmentation, v, f, arch, True)
         check = jaw_naming.verify_fdi_matches_jaw(result_json, arch)
         if not check["ok"]:
             raise HTTPException(500, check["diagnosis"])
@@ -438,6 +470,22 @@ async def segment(sid: str):
         labels, _ = jaw_naming.extract_labels(result_json, expect_jaw=arch)
         if len(labels) != len(v):
             raise HTTPException(500, "Label array does not match mesh.")
+
+        # THE LABELS ARE MOVED ONTO OUR ARRAY BY POSITION, NEVER BY INDEX.
+        # The length check above is the one that used to stand alone, and it
+        # cannot see the failure it appears to guard: four different loaders
+        # produce 94,848 vertices from this project's real scan in four
+        # different ORDERS, so the count agrees while the correspondence is
+        # wrong. Measured on the cached real-scan labels read by index, the
+        # median per-tooth bounding box is 50.71mm - most of a mandible - and
+        # 13.97mm once transferred by position. That was reported as a model
+        # failure for a model that had segmented the arch correctly.
+        try:
+            labels, transfer = segmentation_providers.\
+                transfer_labels_by_position(used_verts, labels, v)
+        except segmentation_providers.LabelTransferError as e:
+            raise HTTPException(500, f"Segmentation labels do not belong to "
+                                     f"this mesh: {e}")
 
         # HYBRID FALLBACK. Tier 1 is the model; any tooth whose region is
         # geometrically impossible - split across two places, or implausibly
@@ -457,6 +505,17 @@ async def segment(sid: str):
 
         STORE.put(sid, "labels", labels)
         STORE.put(sid, "segmentation_tiers", hybrid["teeth"])
+        # The spatial diagnostic, computed on what the session will actually
+        # hold. A label array that is not indexed to this mesh is a different
+        # failure from a model that segmented badly, and no metric computed
+        # on the labels alone - IoU included - can tell them apart.
+        try:
+            diag = segmentation_diagnostics.label_report(v, f, labels)
+        except Exception as e:                            # noqa: BLE001
+            diag = {"error": f"{type(e).__name__}: {e}"}
+        diag["label_transfer"] = transfer
+        diag["provider"] = segmentation_providers.DEFAULT_PROVIDER
+        STORE.put(sid, "segmentation_diagnostics", diag)
         _n_teeth = int(len(set(int(x) for x in labels)) - (1 if 0 in set(
             int(x) for x in labels) else 0))
         _record(sid, audit.SEGMENTED, arch=arch,
@@ -1486,6 +1545,43 @@ def get_labels(sid: str):
         raise HTTPException(404, "Segmentation has not been run for this session.")
     return {"labels": np.asarray(labels).astype(int).tolist(),
             "jaw": jaw_naming.jaw_for_arch(STORE.arch(sid))}
+
+
+@app.get("/api/segmentation/providers")
+def segmentation_provider_registry():
+    """Which segmentation backends exist, and the state of each.
+
+    A CANDIDATE IS NOT A CHOICE. `meshsegnet` is listed with
+    `available: false` and its audit attached, so the UI can show what has
+    been considered without offering a backend that would raise.
+    """
+    return {"default": segmentation_providers.DEFAULT_PROVIDER,
+            "providers": segmentation_providers.registry()}
+
+
+@app.get("/api/session/{sid}/segmentation-diagnostics")
+def segmentation_spatial_diagnostics(sid: str, recompute: bool = False):
+    """Per-tooth bounding box, counts and disconnected components.
+
+    THE QUESTION THIS ANSWERS IS NOT "is the model good". It is whether the
+    labels are attached to this mesh at all - a failure no metric computed on
+    the labels alone can see, IoU included, because a mis-indexed array still
+    scores against itself perfectly.
+    """
+    try:
+        v = STORE.require(sid, "verts")
+        f = STORE.require(sid, "faces")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+    labels = STORE.get(sid, "labels")
+    if labels is None:
+        raise HTTPException(404, "Segmentation has not been run for this session.")
+    cached = STORE.get(sid, "segmentation_diagnostics")
+    if cached is not None and not recompute:
+        return _jsonable(cached)
+    rep = segmentation_diagnostics.label_report(v, f, labels)
+    STORE.put(sid, "segmentation_diagnostics", rep)
+    return _jsonable(rep)
 
 
 @app.get("/api/session/{sid}/teeth")
@@ -3582,6 +3678,15 @@ def close_session(sid: str):
 class FinalExportRequest(StageExportRequest):
     """One validated stage, for printing. Inherits the staging settings."""
     stage: int = 0          # 0 means "the last stage", the planned setup
+    # WHAT COMES BACK. "zip" is the default and is unchanged: a binary STL
+    # cannot carry a verdict, and a lab handed a bare STL has no record of
+    # what was checked. The other two exist because a slicer wants a file it
+    # can open and a reviewer wants the numbers without a 3D model attached -
+    # and both still go through the SAME gate, so neither is a way around it.
+    #   zip       the STL and manifest.json together  (default)
+    #   stl       the raw binary STL, for a slicer or CAD package
+    #   manifest  the manifest as JSON, no geometry
+    fmt: str = "zip"
 
 
 @app.post("/api/session/{sid}/export/final")
@@ -3677,6 +3782,11 @@ def export_final(sid: str, req: FinalExportRequest):
             "validation, and NO REAL DE-IDENTIFIED SCAN has been run through "
             "this gate - every number behind it is synthetic."),
         "manufacturing_gate": gate,
+        # THE SAME GATES, RESTATED AS THE CLAIMS A PERSON ACTUALLY ASKS
+        # ABOUT. Each row names its evidence, so a claim cannot be made by a
+        # row that measured nothing; a claim with missing evidence reads
+        # false, never true by default.
+        "evidence_report": mfg.manufacturing_evidence_report(chosen),
         "validation": chosen["stl_validation"],
         "interfaces": chosen.get("interfaces"),
         "volume_mm3": chosen.get("volume_mm3"),
@@ -3698,26 +3808,54 @@ def export_final(sid: str, req: FinalExportRequest):
         "disclaimer": export_clinical_report.DISCLAIMER,
     }
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(name, blob)
-        z.writestr("manifest.json", json.dumps(_jsonable(final_manifest), indent=2))
+    fmt = (req.fmt or "zip").lower()
+    if fmt not in ("zip", "stl", "manifest"):
+        raise HTTPException(422, _jsonable({
+            "error": f"Unknown export format {req.fmt!r}.",
+            "available": ["zip", "stl", "manifest"]}))
+
+    # EVERY FORMAT IS THE SAME GATED BYTES. The gate above has already run and
+    # already refused; choosing a format cannot route around it, and the
+    # X-Print-Ready header is set identically on all three.
+    if fmt == "stl":
+        buf = io.BytesIO(blob)
+        media = "model/stl"
+        download = name
+    elif fmt == "manifest":
+        buf = io.BytesIO(
+            json.dumps(_jsonable(final_manifest), indent=2).encode("utf-8"))
+        media = "application/json"
+        download = f"{manifest['arch']}_Stage_{wanted:02d}_FINAL_manifest.json"
+    else:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(name, blob)
+            z.writestr("manifest.json",
+                       json.dumps(_jsonable(final_manifest), indent=2))
+        media = "application/zip"
+        download = f"{manifest['arch']}_Stage_{wanted:02d}_FINAL.zip"
     buf.seek(0)
 
     _record(sid, audit.EXPORTED, arch=manifest["arch"],
-            detail=f"final print STL, stage {wanted}",
+            detail=f"final print STL, stage {wanted}, format {fmt}",
             values={"stage": int(wanted), "triangles": int(chosen["triangles"]),
                     "print_ready": bool(gate.get("print_ready"))})
 
     return StreamingResponse(
-        buf, media_type="application/zip",
+        buf, media_type=media,
         headers={"Content-Disposition":
-                     f'attachment; filename="{manifest["arch"]}_Stage_{wanted:02d}_FINAL.zip"',
+                     f'attachment; filename="{download}"',
                  "X-Print-Ready": ("true" if gate.get("print_ready")
                                    else "false"),
                  "X-Stage": str(wanted),
                  "X-Open-Edges": str(chosen["stl_validation"]["open_edges"]),
                  "X-Nonmanifold-Edges": str(chosen["stl_validation"]["nonmanifold_edges"]),
                  "X-Components": str(chosen["stl_validation"]["connected_components"]),
+                 "X-Claims-Verified": (
+                     "true" if final_manifest["evidence_report"]
+                     ["all_claims_verified"] else "false"),
+                 "X-Export-Format": fmt,
                  "Access-Control-Expose-Headers":
-                     "X-Print-Ready, X-Stage, X-Open-Edges, X-Nonmanifold-Edges, X-Components"})
+                     "X-Print-Ready, X-Stage, X-Open-Edges, "
+                     "X-Nonmanifold-Edges, X-Components, X-Claims-Verified, "
+                     "X-Export-Format"})

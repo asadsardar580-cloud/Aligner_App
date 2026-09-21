@@ -405,7 +405,22 @@ class CastProbe:
         parallel = np.abs(det) < 1e-12
         inv_det = np.divide(1.0, det, out=np.zeros_like(det), where=~parallel)
 
-        out = np.zeros(len(pts))
+        # A MISS IS NaN, NOT ZERO, and the difference is the whole point.
+        # This used to return 0.0 when the ray hit nothing, which reads as
+        # "the cast is 0mm thick here" - a measurement - when what happened
+        # is "there is no cast under this point at all". The caller takes the
+        # MINIMUM over the rim, so one rim point sitting over an embrasure,
+        # over a neighbouring socket opening or past the arch's inner edge
+        # dragged the whole tooth's thickness to 0.0 and its `wall_limit`
+        # with it. Measured on the real scan, every tooth reported
+        # local_cast_thickness_mm 0.0 on a cast at least 3mm thick.
+        #
+        # The caller already filters with `np.isfinite`, so it was written
+        # against this contract - 0.0 is finite, so the filter never fired.
+        # Same rule as NOT_CHECKED is not CLEAR (CLAUDE.md section 14), and
+        # the same rule `test_a_genuine_ray_miss_cannot_become_a_success`
+        # pins for `drop_to_surface`.
+        out = np.full(len(pts), np.nan)
         for i, p in enumerate(pts):
             tvec = p - v0
             u_bary = np.einsum("ij,ij->i", tvec, pvec) * inv_det
@@ -414,7 +429,8 @@ class CastProbe:
             t = np.einsum("ij,ij->i", e2, qvec) * inv_det
             hit = (~parallel) & (u_bary >= -1e-9) & (v_bary >= -1e-9) \
                 & (u_bary + v_bary <= 1 + 1e-9) & (t > 1e-6)
-            out[i] = float(t[hit].max()) if hit.any() else 0.0
+            if hit.any():
+                out[i] = float(t[hit].max())
         return out
 
     def drop_to_surface(self, pts, u_axis, max_distance=None):
@@ -678,6 +694,14 @@ def build_stage_tooth_interface(
     local_thickness = float(np.nanmin(finite)) if len(finite) else 0.0
     wall_limit = local_thickness * pol.safe_wall_fraction
     diag["local_cast_thickness_mm"] = round(local_thickness, 4)
+    # HOW MANY RIM POINTS HAVE NO CAST UNDER THEM AT ALL. Distinct from a thin
+    # cast: an interproximal embrasure, the arch's inner edge and a
+    # neighbour's open socket all produce a ray that hits nothing, and calling
+    # that "0mm of material" made the minimum above meaningless for the whole
+    # tooth. Reported so the caller can tell a thin wall from a missing one.
+    diag["rim_points_with_cast_below"] = int(len(finite))
+    diag["rim_points_with_no_cast_below"] = int(len(thickness) - len(finite))
+    diag["local_cast_thickness_measured"] = bool(len(finite))
     diag["wall_limit_mm"] = round(wall_limit, 4)
     diag["policy"] = pol.to_dict()
 
@@ -1583,6 +1607,33 @@ def interface_continuity(rim_k, cavity_verts, tol_mm=1.0):
     }
 
 
+THRESHOLD_NOTE = ("engineering validation threshold for this prototype, "
+                  "not a clinical tolerance")
+
+
+def _raycast_scene(verts, faces):
+    """An Open3D BVH over a mesh, or None. Shared by the surface probes.
+
+    Open3D is a declared, load-bearing dependency (CLAUDE.md section 19), so
+    this adds nothing to the install. It is still guarded, because a geometry
+    module that cannot be imported without it would make every headless test
+    depend on a wheel none of them need.
+    """
+    try:
+        import open3d as o3d
+    except Exception:
+        return None
+    try:
+        mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(np.asarray(verts, float)),
+            o3d.utility.Vector3iVector(np.asarray(faces, np.int64)))
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+        return scene
+    except Exception:
+        return None
+
+
 def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
                        band_mm=1.5, step_mm=0.25):
     """Is the crown -> cast transition a blend, or an artificial ledge?
@@ -1596,9 +1647,47 @@ def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
     RADIAL PROFILE: walk outward from the rim in `step_mm` rings and take the
     surface height along u_oa. A blend falls away gradually; a ledge puts most
     of its fall into one step, which is what `largest_step_share` catches.
+
+    THE HEIGHT IS RAY-CAST, NOT READ OFF THE NEAREST VERTEX, and that is the
+    correction that matters. The first version took the height of the nearest
+    VERTEX to each radial probe - the fourth appearance in this codebase of
+    the mistake `CastProbe.signed`, `surface_deviation` and `old_site_quality`
+    were each corrected for. Measured on the 0.6mm extrusion + 3 degree tip
+    case it was written against, the nearest vertex sits 0.52 to 1.31mm from
+    the probe while the rings are 0.25mm apart, so the sampled "profile" is
+    four to five times coarser than its own sampling interval. What that
+    produces is LATCH AND JUMP: the same vertex answers several consecutive
+    rings, then the query switches to another one and the whole difference
+    appears as a single step. Stage 3 of that case read
+
+        -0.2266, -0.2307, -0.4292, -0.4292, -0.3741, -0.4292, -0.4406
+
+    - one value repeated three times, and not monotonic - and was refused as
+    a ledge at share 0.9274. The same stage, same written STL, ray cast:
+
+         1.8251,  0.7563, -0.3238, -0.8028, -1.5329, -1.8032, -2.0234
+
+    strictly decreasing, 3.85mm of fall spread across six steps, share 0.2807.
+    The refusal was an artefact of the measurement, not a defect in the
+    geometry, and the threshold below is UNCHANGED at 0.75.
+
+    THE DENOMINATOR IS THE PATH LENGTH, NOT THE ENDPOINT DIFFERENCE. `total`
+    used to be `|h[0] - h[-1]|`, which is wrong in both directions: a profile
+    that dips and recovers has a small endpoint difference and reports a share
+    above 1.0 while being smooth, and a pure spike that returns to where it
+    started has an endpoint difference of ZERO and is waved through. Summing
+    `|diff|` measures the excursion the surface actually makes. On the case
+    above the choice of denominator alone flips the verdict - 0.9276 against
+    0.6123 - on identical numbers.
+
+    A MEASUREMENT THAT CANNOT BE TAKEN IS NOT A PASS. If the rays cannot be
+    cast, `looks_like_a_ledge` is None rather than False, so
+    `aggregate_print_gate` refuses exactly as it does for a real ledge. There
+    is deliberately no fall back to the nearest-vertex profile: a method known
+    to be wrong is worse than no method, because it answers.
     """
-    from scipy.spatial import cKDTree
     verts = np.asarray(final_verts, float)
+    faces = np.asarray(final_faces, np.int64)
     rim = np.asarray(rim_k, float)
     u = np.asarray(u_oa_k, float)
     u = u / (np.linalg.norm(u) or 1.0)
@@ -1608,32 +1697,76 @@ def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
     rn = np.linalg.norm(radial, axis=1, keepdims=True)
     rdir = np.divide(radial, np.where(rn < 1e-12, 1.0, rn))
 
-    tree = cKDTree(verts)
-    rings, heights = [], []
-    for off in np.arange(0.0, band_mm + 1e-9, step_mm):
-        probe = rim + rdir * off
-        _, idx = tree.query(probe, workers=-1)
-        rings.append(float(off))
-        heights.append(float(np.median((verts[idx] - centre) @ u)))
+    offsets = np.arange(0.0, band_mm + 1e-9, step_mm)
+    heights, hit_fracs = [], []
+    scene = _raycast_scene(verts, faces)
+    if scene is None:
+        return {"measured": False,
+                "looks_like_a_ledge": None,
+                "reason": "no ray-casting backend; the nearest-vertex "
+                          "profile it replaced is not used as a fallback "
+                          "because it is known to be wrong",
+                "threshold_note": THRESHOLD_NOTE}
 
-    heights = np.asarray(heights)
+    import open3d as o3d
+    span = float(np.linalg.norm(np.ptp(verts, axis=0))) + 10.0
+    for off in offsets:
+        probe = rim + rdir * float(off)
+        origin = (probe + u * span).astype(np.float32)
+        direction = np.tile((-u).astype(np.float32), (len(probe), 1))
+        hits = scene.cast_rays(
+            o3d.core.Tensor(np.ascontiguousarray(
+                np.hstack([origin, direction]), np.float32)))
+        t = hits["t_hit"].numpy().astype(float)
+        ok = np.isfinite(t)
+        hit_fracs.append(float(ok.mean()))
+        if not ok.any():
+            heights.append(np.nan)
+            continue
+        # FIRST hit from far above = the OUTER surface, which is the one a
+        # thermoforming sheet touches. Not the nearest surface, which on a
+        # probe sitting inside the solid can be the underside of the cast.
+        pts = origin[ok].astype(float) - u * t[ok][:, None]
+        heights.append(float(np.median((pts - centre) @ u)))
+
+    heights = np.asarray(heights, float)
+    worst_hit = float(min(hit_fracs)) if hit_fracs else 0.0
+    if not np.all(np.isfinite(heights)) or worst_hit < 0.5:
+        return {"measured": False,
+                "looks_like_a_ledge": None,
+                "ring_offsets_mm": [round(float(x), 3) for x in offsets],
+                "ray_hit_fraction_min": round(worst_hit, 4),
+                "reason": "the transition band is not reachable by a ray "
+                          "along the long axis on enough of the rim",
+                "threshold_note": THRESHOLD_NOTE}
+
     drops = np.diff(heights)
-    total = float(abs(heights[0] - heights[-1]))
-    worst_step = float(abs(drops).max()) if len(drops) else 0.0
-    step_share = float(worst_step / total) if total > 1e-6 else 0.0
+    path = float(np.abs(drops).sum())
+    endpoint = float(abs(heights[0] - heights[-1]))
+    worst_step = float(np.abs(drops).max()) if len(drops) else 0.0
+    step_share = float(worst_step / path) if path > 1e-6 else 0.0
+    monotonic = bool(np.all(drops <= 1e-9) or np.all(drops >= -1e-9))
     return {
-        "ring_offsets_mm": [round(x, 3) for x in rings],
+        "measured": True,
+        "method": "raycast_outer_surface",
+        "ring_offsets_mm": [round(float(x), 3) for x in offsets],
         "ring_heights_mm": [round(float(x), 4) for x in heights],
-        "total_fall_mm": round(total, 4),
+        "ray_hit_fraction_min": round(worst_hit, 4),
+        # `total_fall_mm` keeps its name and changes its meaning: it is now
+        # the path length. `endpoint_fall_mm` is the old quantity, reported so
+        # the two can be compared on any case that argues about the verdict.
+        "total_fall_mm": round(path, 4),
+        "endpoint_fall_mm": round(endpoint, 4),
+        "monotonic": monotonic,
         "largest_single_step_mm": round(worst_step, 4),
         "largest_step_share": round(step_share, 4),
         # A blend spreads its fall across rings. Three quarters of the whole
-        # fall inside one 0.25mm step is a cliff. ENGINEERING VALIDATION
+        # excursion inside one 0.25mm step is a cliff. ENGINEERING VALIDATION
         # THRESHOLD for this prototype, chosen from the collar bug this check
-        # was written to catch - not a clinical tolerance.
-        "looks_like_a_ledge": bool(step_share > 0.75 and total > 0.2),
-        "threshold_note": "engineering validation threshold for this prototype, "
-                          "not a clinical tolerance",
+        # was written to catch - not a clinical tolerance. UNCHANGED when the
+        # sampling was corrected: the fix was the measurement, not the bar.
+        "looks_like_a_ledge": bool(step_share > 0.75 and path > 0.2),
+        "threshold_note": THRESHOLD_NOTE,
     }
 
 
@@ -2511,3 +2644,101 @@ def validate_printable_stl(blob, expect_components=1):
         "manufacturing geometry validated against engineering gates. NOT a "
         "claim of clinical validation, and NOT the full manufacturing gate.")
     return report
+
+
+# ===========================================================================
+# THE EVIDENCE REPORT
+# ===========================================================================
+
+def manufacturing_evidence_report(stage, policy=None):
+    """Each claim a final stage makes, and the measurement behind it.
+
+    WHY THIS EXISTS BESIDE `aggregate_print_gate` RATHER THAN INSTEAD OF IT.
+    The gate answers one question - may this be printed - and it answers it in
+    the vocabulary of the checks it runs. This answers the question a person
+    actually asks about an exported file: "the tooth moved where I asked, the
+    rest of the cast is untouched, the old socket is closed, there is no
+    invented root and no shelf around the margin - show me." Each row names
+    the claim in those words, the measured value, and WHICH gate is the
+    evidence, so a claim can never be made by a row that measured nothing.
+
+    A claim whose evidence is missing reads `verified: false` with
+    `evidence: null`. It never reads true by default, and it is never omitted
+    - an absent row is indistinguishable from a passing one, which is the
+    whole failure mode `NOT_CHECKED is not CLEAR` exists to prevent.
+    """
+    gate = stage.get("manufacturing_gate") or aggregate_print_gate(stage, policy)
+    by_name = {g["gate"]: g for g in gate.get("gates", [])}
+
+    def claim(text, gates, detail):
+        rows = [by_name.get(g) for g in gates]
+        present = [r for r in rows if r is not None]
+        return {
+            "claim": text,
+            "verified": bool(present) and len(present) == len(gates)
+            and all(r["passed"] for r in present),
+            "evidence_gates": gates,
+            "evidence": {r["gate"]: r["measured"] for r in present} or None,
+            "missing_evidence": [g for g, r in zip(gates, rows) if r is None],
+            "how": detail,
+        }
+
+    claims = [
+        claim("the tooth is at the target matrix, as a rigid body",
+              ["crown_is_an_exact_rigid_transform", "clinical_consistency"],
+              "intrinsic edge lengths, sampled pairwise distances, R^T R - I "
+              "and det(R) - 1 on the crown; and the stage's prescription "
+              "against its own share of the committed one"),
+        claim("the cast outside the local interface is unchanged",
+              ["unaffected_cast_fidelity_two_sided",
+               "reconstruction_inside_envelope"],
+              "point-to-TRIANGLE distance in BOTH directions outside the "
+              "allowed reconstruction envelope - never vertex identity, "
+              "because a boolean legitimately retessellates"),
+        claim("the socket the tooth left is restored",
+              ["old_site_restored"],
+              "crater depth, plateau height, largest step and patch count "
+              "over the old site in the T0 rim's own frame"),
+        claim("a new local interface exists at the target position",
+              ["every_interface_built",
+               "interface_continuous_around_every_rim"],
+              "the interface was built for every moved tooth and closes "
+              "around the rim as one band rather than islands"),
+        claim("there is no artificial root column",
+              ["root_length_independent", "synthetic_exposure_within_bound"],
+              "no manufacturing geometry is derived from root_length_mm, and "
+              "the area of invented geometry surviving to the outside of the "
+              "model is within bound"),
+        claim("no synthetic seat or ramp is exposed on the surface",
+              ["synthetic_exposure_within_bound", "no_exposed_clearance_wall"],
+              "per-triangle provenance on the fused boundary: a triangle "
+              "that came from the connector and survived to the outside IS "
+              "exposed synthetic anatomy"),
+        claim("there is no unintended collar or ledge at the margin",
+              ["no_transition_ledge"],
+              "the radial emergence profile, ray cast off the outer surface, "
+              "and the share of its whole excursion landing in one step"),
+        claim("the model is one physical body",
+              ["single_positive_manifold_body", "body_count_agrees_with_stl",
+               "no_self_touching_boundary"],
+              "manifold3d decompose() - physical bodies, not index "
+              "components - agreeing with the written file's own component "
+              "count, with no boundary that touches itself"),
+        claim("the written STL survives a round trip",
+              ["written_stl_topology"],
+              "finite, closed, one component, positive volume, consistent "
+              "winding, measured on the BYTES after a downstream reader's "
+              "weld rather than on the in-memory buffer"),
+    ]
+
+    unverified = [c["claim"] for c in claims if not c["verified"]]
+    return {
+        "all_claims_verified": not unverified,
+        "unverified_claims": unverified,
+        "claims": claims,
+        "print_ready": bool(gate.get("print_ready")),
+        "source": "aggregate_print_gate, measured on the written STL",
+        "wording_note": (
+            "engineering and manufacturing validation. NOT a claim of "
+            "clinical validation, and not a statement about any patient."),
+    }

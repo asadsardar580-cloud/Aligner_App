@@ -41,6 +41,8 @@ import arch_frame
 import core_geometry as cg
 import manufacturing as mfg
 import stl_io
+import segmentation_providers
+import segmentation_diagnostics
 from session_store import STORE
 
 SCAN = "case_lower.stl"
@@ -165,25 +167,36 @@ def main() -> int:
                   f"from the segmentation without it.")
             return 2
         lab = json.load(open(LABELS))
-        # THE LABELS INDEX THE RAW FILE, NOT THE CONDITIONED MESH.
-        # `condition_mesh` welds with `np.unique(v, axis=0)`, which REORDERS
-        # the array lexicographically even when it removes nothing - both are
-        # 94,848 vertices here, so the count agrees and the correspondence
-        # does not. Reading `labels[i]` against `v[i]` scattered each tooth
-        # across the whole arch: FDI 31's 4,337 labelled vertices produced a
-        # largest connected region of 157, and the "crown" cut from it
-        # enclosed 0.1mm3. They are remapped BY POSITION, which is the only
-        # thing the two arrays share.
+        # THE LABELS INDEX NEITHER ARRAY THIS SCRIPT HOLDS. They are keyed
+        # to the order the segmentation pipeline's own loader produced when
+        # it welded the raw STL, and the count agrees with both of ours -
+        # 94,848 - so nothing here could ever have noticed.
         raw_lab = np.asarray(lab["labels"], np.int64)
-        if len(raw_lab) != len(verts):
-            print(f"    WARNING: {LABELS} has {len(raw_lab)} labels for "
-                  f"{len(verts)} raw vertices; cannot be trusted")
-        from scipy.spatial import cKDTree as _KD
-        _d, _i = _KD(verts).query(v, workers=-1)
-        lab_arr = raw_lab[np.clip(_i, 0, len(raw_lab) - 1)]
-        lab_arr[_d > 1e-6] = 0
-        print(f"    label remap         {int((_d <= 1e-6).sum()):,} of "
-              f"{len(v):,} conditioned vertices matched a raw vertex exactly")
+        # AND THEY DO NOT INDEX `verts` EITHER, WHICH IS WHERE THIS USED TO GO
+        # WRONG. An STL has no vertex list - it is triangle soup - so every
+        # reader invents an order when it welds. `stl_io.parse_stl_bytes`
+        # welds with np.unique, which is LEXICOGRAPHIC; the segmentation
+        # pipeline's loader keeps FIRST OCCURRENCE. Both give 94,848 vertices
+        # for this scan, so remapping `verts -> v` by position moved the
+        # labels between two arrays that were already in the same order and
+        # preserved the error exactly. Measured, per-tooth box diagonal
+        # median: 50.71mm remapped the old way, 13.97mm from the right source.
+        src = segmentation_providers.first_occurrence_vertex_order(verts, faces)
+        try:
+            lab_arr, xfer = (segmentation_providers
+                             .transfer_labels_by_position(
+                                 src, raw_lab, v))
+        except segmentation_providers.LabelTransferError as e:
+            print(f"    LABEL TRANSFER FAILED: {e}")
+            return 2
+        print(f"    label transfer      {xfer['destination_vertices']:,} "
+              f"vertices matched exactly (worst gap "
+              f"{xfer['max_position_gap_mm']:.3g} mm), "
+              f"{xfer['reordered_vertices']:,} reordered")
+        rep = segmentation_diagnostics.label_report(v, f, lab_arr)
+        print("\n[3b] SEGMENTATION SPATIAL DIAGNOSTIC")
+        print("    " + segmentation_diagnostics.format_report(rep)
+              .replace("\n", "\n    "))
         seeds = pick_seed_points(v, lab_arr, args.fdi)
         print(f"\n[4] TOOTH SELECTION")
         print(f"    labelled teeth      {len(seeds)} "

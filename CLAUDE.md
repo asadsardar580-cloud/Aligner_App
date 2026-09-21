@@ -30,12 +30,14 @@ that used to shadow the real `tooth_segmentation/` modules.
 
 ```
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names without importing (88 files)
-python run_all_tests.py                 # CANONICAL runner — 36 entries
+python check_structure.py               # undefined names without importing (96 files)
+python run_all_tests.py                 # CANONICAL runner — 39 entries
 python -m pytest -q                     # runs alongside; both must pass
 python bench_signed_distance.py         # scores the signed-distance method
-python real_scan_regression.py          # the real scan, end to end — see §23
+python real_scan_regression.py          # the real scan, end to end — see §23, §24.7
+python -m pytest test_segmentation_mapping.py   # labels belong to the mesh — §24.3
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
+node frontend/verify-palette.mjs        # 32 distinct FDI colours — §24.5
 cd frontend && npm run lint && npm run build && npm run smoke
 ```
 
@@ -1006,13 +1008,18 @@ Covered by `test_failsafes.py` (18), `test_telemetry.py` (12) and
 * `u_bl` is pinned buccal from the arch frame, so `u_md`'s sign varies by quadrant (unavoidable — the arch is mirror-symmetric). The frame reports `u_md_points_distal`; the sliders do not yet use it.
 * **A pinched cast rim loses a small spur.** `_open_pinch_vertices` deletes the smaller fan at a neck, and `/cut` drops the smaller lobe of a self-touching socket rim. Both are a handful of triangles and both are recorded, but neither is reconstructed.
 * **`trim_to_arch` is not stable on a very coarse mesh.** Measured: at ~18 samples across the band the trim nearly severs the arch and `np.bincount(labels).argmax()` picks a different largest component under rotation — an 80% volume swing. Unreachable at scan density (187k faces across the same band) and worth remembering before anyone decimates a scan upstream.
-* **The staged export still needs one interactive wand cut to be judged end to end.** It passes
-  on the synthetic arch and now REFUSES the real scan's auto-cut crowns cleanly and by name
-  instead of fracturing — which is the correct behaviour, since those crowns are thin shells
-  (8.8 mm³ at genus 2, a 0.2 mm speck, and one that fractures into 3). What has not been shown
-  is a real crown cut with the wand passing the gate and fusing, because that cannot be produced
-  headlessly. FDI 46 (136.3 mm³, χ=2) passes the screen and fuses to one body, which is the
-  closest evidence available here.
+* **UPDATED 2026-09-21 — real crowns now cut; the MANUFACTURING RECONSTRUCTION on them does
+  not yet build.** The old text here said no real crown could be produced headlessly, and that
+  was a consequence of the label-mapping defect (§24.3), not of the scan. With the labels
+  transferred by position, **seven real teeth cut successfully** — FDI 32, 34, 41, 42, 44, 45
+  and 46 — three of them producing a proper socket cup rather than the flat fallback, and one
+  of the seven built a complete local interface. What has still not been shown is a real crown
+  reaching a validated final STL: staging refuses with `interface_unbuildable_wall_too_thin`,
+  `outside_reconstruction_envelope` and `interface_construction_failed`, by name and with
+  numbers (§24.7). **The wand itself is still not the route** — its auto tolerance returns
+  25.00 mm on this scan and floods a quarter of the arch — so the selection comes from the
+  segmentation label's own largest connected component, which is what the shipped fallback
+  does anyway (§17).
 * **The antagonist check has never run against a real opposing arch.** There is no upper-arch
   scan in this repo; every test uses a synthetic plate or the lower arch mirrored into occlusion.
   The arithmetic and the wiring are pinned; a clinical result is not.
@@ -2031,6 +2038,19 @@ written for the collar bug it caught, and moving it to make a case pass is the
 parameter sweep this work does not do.
 
 **REAL-SCAN MANUFACTURING REGRESSION = EXECUTED THROUGH TOOTH SELECTION ONLY.**
+> **SUPERSEDED 2026-09-21 by §24.3 — the second bullet below is the right
+> observation with the wrong array, and the conclusion drawn from it is
+> false.** The labels index neither `verts` nor `v`: they are keyed to the
+> order the segmentation pipeline's own loader produced, which is FIRST
+> OCCURRENCE, while both of this project's arrays are LEXICOGRAPHIC. So the
+> remap described below moved labels between two arrays that were already in
+> the same order and preserved the error exactly. Transferred from the right
+> source the labels ARE spatially coherent — median per-tooth box diagonal
+> 13.97 mm against 50.71 mm — and **seven real teeth now cut successfully**.
+> The claim that no single-tooth crown can be produced from this scan
+> headlessly is withdrawn. What remains unverified is the manufacturing
+> reconstruction on those crowns; see §24.7.
+
 `real_scan_regression.py` drives `case_lower.stl` through upload, conditioning,
 occlusal plane, tooth selection, cut, movement and staging entry, and stops
 there because no single-tooth crown can be produced from this scan headlessly.
@@ -2053,6 +2073,314 @@ Nothing in §23 is based on the real scan. **This is the same open issue §19 ha
 carried since Phase 5** — the staged export still needs one interactive wand cut
 to be judged end to end — and it is now measured rather than asserted.
 
-Covered by `test_manufacturing_interface.py` (38), `test_manufacturing_matrix.py`
-(25), `real_scan_regression.py`, `bench_signed_distance.py` and
-`MANUFACTURING_RECONSTRUCTION_CHANGELOG.md` §V.
+Covered by `test_manufacturing_interface.py`, `test_manufacturing_matrix.py`,
+`real_scan_regression.py`, `bench_signed_distance.py` and
+`MANUFACTURING_RECONSTRUCTION_CHANGELOG.md` §V. **The test counts in this
+section are historical — §24 adds to both files.**
+
+
+## 24. RESOLVED: THE LEDGE WAS A MEASUREMENT, THE SEGMENTATION WAS A MAPPING
+
+Two blockers, both reported as defects in the thing being measured, and both
+turning out to be defects in the measuring. Neither threshold moved.
+
+### 24.1 The stage-3 ledge refusal was an artefact of nearest-vertex sampling
+
+`no_transition_ledge` refused 0.6mm extrusion + 3 degrees of tip at stage 3
+with `largest_step_share` 0.9274. `transition_quality` read its radial profile
+off the **nearest VERTEX** to each probe - the fourth appearance in this
+codebase of the mistake `CastProbe.signed`, `surface_deviation` and
+`old_site_quality` were each corrected for. Measured on that case, the nearest
+vertex sits **0.52 to 1.31mm** from the probe while the rings are **0.25mm**
+apart, so the sampled profile was four to five times coarser than its own
+sampling interval. What that produces is LATCH AND JUMP: one vertex answers
+several consecutive rings, the query then switches, and the whole difference
+appears as a single step. Stage 3, same written STL, both ways:
+
+| | ring heights, mm |
+|---|---|
+| nearest vertex, as shipped | −0.2266, −0.2307, **−0.4292, −0.4292**, −0.3741, **−0.4292**, −0.4406 |
+| ray cast off the outer surface | 1.8251, 0.7563, −0.3238, −0.8028, −1.5329, −1.8032, −2.0234 |
+
+One value repeated three times and **not monotonic**, against a strictly
+decreasing profile spreading 3.85mm of fall across six steps. Share 0.9274
+against **0.2807**. Every tooth in every stage reads 0.2467 to 0.2816 on the
+real surface, which is a stable emergence profile, not a cliff.
+
+**THE OLD MEASUREMENT WAS WRONG IN BOTH DIRECTIONS, and the second direction
+is the one nobody looked for.** Four controls, each a solid of revolution
+whose profile is known before the measurement runs:
+
+| control | old method | corrected |
+|---|---|---|
+| **a cylindrical collar** - the exact artefact this check exists to catch | share **0.0000**, ledge **False** | share 1.0000, ledge **True** |
+| a smooth cone, 13 radial rings | 0.2222, blend | 0.1667, blend |
+| **the SAME cone, one triangle strip** | share **1.0000**, ledge **True** | 0.1667, **blend** |
+| a 3.5mm cone | 0.5000, blend | 0.1667, blend |
+
+So it **missed a textbook collar entirely** - every probe's nearest vertex sat
+on the flat plate, giving a perfectly flat profile with no fall at all - and
+it **rejected a provably linear ramp** when the band was spanned by single
+large triangles. The gate that had never refused anything but this one case
+had, in fact, never been able to catch the thing it was written for.
+
+**The denominator was wrong too.** `total` was `|h[0] − h[-1]|`, which fails
+in both directions: a profile that dips and recovers reports a share above 1.0
+while being smooth, and a pure spike returning to where it started has an
+endpoint difference of ZERO and is waved through. It is now the path length,
+`sum |diff|`. On the failing case the denominator **alone** flips the verdict -
+0.9276 against 0.6123 on identical numbers.
+
+**THE THRESHOLD IS UNCHANGED AT 0.75.** The fix is the measurement. A
+measurement that cannot be taken returns `looks_like_a_ledge: None`, so the
+gate refuses exactly as it does for a real ledge, and there is deliberately no
+fall back to the nearest-vertex profile: a method known to be wrong is worse
+than no method, because it answers.
+
+### 24.2 `local_thickness` encoded a ray miss as a measurement of zero
+
+Found while driving the real scan. A ray that hits nothing returned **0.0** -
+"the cast is 0mm thick here" - when what happened is "there is no cast under
+this point at all". The caller takes the MINIMUM over the rim, so **one** rim
+point over an interproximal embrasure, over a neighbour's open socket or past
+the arch's inner edge dragged the whole tooth's thickness to zero. Measured on
+the real scan: every tooth reported `local_cast_thickness_mm 0.0` on a cast at
+least 3mm thick.
+
+The caller already filtered with `np.isfinite`, so it was written against the
+contract the callee did not honour - and 0.0 is finite, so the filter never
+fired. A miss is now NaN, with `rim_points_with_no_cast_below` reported
+separately, because a thin wall and a missing one are different facts. Same
+rule as `test_a_genuine_ray_miss_cannot_become_a_success` already pins for
+`drop_to_surface`.
+
+### 24.3 The real scan's segmentation was never incoherent
+
+Reported as a production blocker: all twelve labelled teeth flood a quarter of
+the arch, best IoU 0.01-0.05, FDI 31 spans 33.8 x 34.4 x 15.3mm. **Every one
+of those numbers is correct and the conclusion drawn from them was wrong.**
+
+An STL has no vertex list - it is triangle soup - so every reader invents an
+order when it welds, and this project has four:
+
+| loader | order | vertices |
+|---|---|---|
+| `trimesh.load_mesh(obj, process=False)` | preserved, **0 rows differ** | 94,848 |
+| `open3d.io.read_triangle_mesh(obj)` | NOT preserved | 94,848 |
+| open3d + `remove_duplicated_vertices` | first occurrence | 94,848 |
+| `stl_io.parse_stl_bytes` / `condition_mesh` | `np.unique` - LEXICOGRAPHIC | 94,848 |
+
+All four agree on the count, so every length check and every assertion passed
+while three of the four correspondences were wrong. Measured on the cached
+labels, per-tooth bounding-box diagonal, median over the twelve teeth:
+
+| | median box | plausible | connected |
+|---|---|---|---|
+| read by index against the app's array | **50.71 mm** | 0/12 | 0/12 |
+| transferred by POSITION from the right source | **13.97 mm** | 9/12 | 7/12 |
+
+The transfer matched **all 94,848 vertices at gap 0.0** with the permutation
+differing at **every single index**. Before it, each tooth fell into 83 to 435
+disconnected pieces with its largest component between 2.8% and 20.6% of the
+label. After it: **seven of twelve are a single connected region**, and
+**eleven of twelve have their largest piece at 98.7% or better** - the
+remainder being a handful of stray triangles. Only FDI 37 is genuinely split,
+at 0.518.
+
+**`real_scan_regression.py` had a position remap already, and it fixed the
+wrong hop** - it moved labels from `stl_io.parse_stl_bytes` to `condition_mesh`,
+two arrays already in the same order, and preserved the error exactly. The
+labels never belonged to either.
+
+**NO METRIC COMPUTED ON THE LABELS ALONE CAN SEE THIS, IoU INCLUDED**, because
+a mis-indexed array scores against itself perfectly. It takes a GEOMETRIC
+check, which is what `segmentation_diagnostics.label_report` is: per label,
+vertex and face count, bounding box, box diagonal, centroid and disconnected
+component count, plus an `indexed_to_this_mesh` verdict from the median. One
+implausible tooth is a model problem; all of them is a mapping problem, and
+the median is what separates the two.
+
+**What the corrected labels leave is a genuine and much smaller model
+question.** Three of twelve are still wrong: FDI 37 is two teeth merged into
+one label (two components, largest 0.518), and 36 and 47 are oversized at
+26.9mm and 27.5mm. That is `segmentation_fallback`'s job, and it can only do
+it now that the other nine do not also look broken.
+
+**The live path was correct already, by the good fortune of one keyword
+argument.** `run_segmentation` writes an OBJ in our order, and the inference
+pipeline reads it with `read_txt_obj_ls(use_tri_mesh=True)` -
+`trimesh.load_mesh(process=False)` - which preserves it. The vendored source
+carries the comment *"In some cases, trimesh can change vertex order"*
+directly above that function. Nothing checked it. `/segment` now transfers by
+position regardless and records the transfer, so a loader change shows up as a
+number rather than as scattered teeth months later.
+
+### 24.4 The provider abstraction, and an audit that names its own gaps
+
+`segmentation_providers.py`: `ToothGroupNetworkProvider` (primary, wired to the
+weights) and `MeshSegNetProvider` (**candidate, not installed, not
+benchmarked**). The candidate's `segment()` **raises**, on the CLAUDE.md s.16
+precedent - a stub returning plausible labels would drive a cut, a C_res and a
+printed aligner, and output from a function of that name is reasonably
+believed. Its audit records that MeshSegNet classifies **faces**, not vertices,
+from a 15-channel per-cell feature vector, and that its published pipeline
+mean-centres the mesh, which collides with rule 3.1 and would have to be
+inverted exactly rather than approximately. Licence, dependencies, Windows CPU
+support, inference time, axis and label conventions are recorded as
+**NOT_VERIFIED_HERE**: they need the upstream repository, which this
+environment does not have. **No benchmark of TGN against MeshSegNet has been
+run, and none is quoted.** TCATSeg was not installed, as instructed.
+
+### 24.5 One colour table, and seventeen teeth used to share
+
+`PALETTE[i % PALETTE.length]` over fifteen colours and 32 teeth meant FDI 11
+and 31 were both `#e6194b`, 12 and 32 both `#3cb44b`, and so on for every pair
+sixteen apart - an upper right central incisor and a lower left central
+incisor rendered identically. The colour also depended on the tooth's **index
+in an array literal**, not on its FDI number.
+
+`frontend/src/fdiPalette.js` makes the colour a **pure function of the FDI
+number**: same tooth, same colour, across a refresh, a re-segmentation, a
+change of provider, and any ordering anything returns teeth in. The 32 teeth
+take the 32 evenly spaced hues; consecutive teeth take slots 11 apart (coprime
+with 32, so every slot is hit once) which puts 123.75 degrees between
+neighbours; and because 11 x 3 = 1 (mod 32), the two teeth landing on ADJACENT
+hues always differ by 3 in the index and therefore always land in different
+lightness buckets - the one place hue separation is weakest is exactly where
+lightness separation is guaranteed.
+
+**THE FIRST VERSION FAILED ITS OWN CHECK**, which is the argument for having
+one. Lightness around 0.46-0.77 at saturation near 0.6 produced a band of pale
+colours: worst pair dE 11.83, and **FDI 14 landed dE 4.09 from the GINGIVA**.
+The constants shipped are the maximum of the worst-case separation over a
+search of 15 hue strides x 15 lightness cycles x 9 saturation cycles.
+`verify-palette.mjs` measures, and fails below a floor:
+
+| | dE |
+|---|---|
+| minimum over all 496 pairs | **15.98** |
+| minimum between neighbours and mirrored pairs | 50.76 |
+| minimum from any tooth to the gingiva | 52.55 |
+| minimum from any tooth to the viewport background | 62.72 |
+
+The background row is there because two colours can be far apart from each
+other and both invisible. Selection is a **treatment laid over** the tooth's
+own colour, never a replacement, so a selected tooth is still identifiable as
+that tooth. An unknown id returns grey, never a confident tooth colour.
+
+### 24.6 The evidence report, and three export formats behind one gate
+
+`mfg.manufacturing_evidence_report` restates the aggregate gate as the nine
+claims a person actually asks about an exported file - the tooth is at the
+target matrix as a rigid body; the cast outside the interface is unchanged;
+the old socket is restored; a new local interface exists; there is no
+artificial root column; no synthetic seat or ramp is exposed; there is no
+collar or ledge at the margin; the model is one physical body; the written STL
+survives a round trip. **Each row names the gates that are its evidence**, so
+a claim can never be made by a row that measured nothing, and a claim with
+missing evidence reads false rather than being omitted. An empty stage fails
+all nine, asserted.
+
+`/export/final` gains `fmt`: `zip` (default, unchanged), `stl` (bare, for a
+slicer) and `manifest` (the record, no geometry). **A format is not a way
+around the gate** - all three are the same already-refused-or-validated bytes,
+carry the same `X-Print-Ready`, and a test asserts the raw STL and the STL
+inside the ZIP are byte-identical.
+
+### 24.7 Where the real scan now stands
+
+**REAL-SCAN MANUFACTURING REGRESSION = STILL NOT VERIFIED END TO END**, and it
+is much closer and far better measured than it was.
+
+What now works that did not: the labels are coherent, and **seven real teeth
+cut successfully** from their own label components - FDI 32, 34, 41, 42, 44,
+45 and 46, three of them producing a proper socket cup rather than the flat
+fallback. One of the seven built a complete local interface (`ok=True`).
+
+What still refuses, by name and with numbers, on a cast where all seven
+sockets were filled: `interface_unbuildable_wall_too_thin` (the lower ring
+cannot seat), `outside_reconstruction_envelope` (rim separation 4.2-4.7mm),
+and `interface_construction_failed` (31 of 166 collar points unresolved).
+
+Driven alone, FDI 45 reaches staging and refuses `wall_too_thin` with
+`rim_separation_max_mm 2.9085` and `local_cast_thickness_mm` **0.0155**. That
+last number is the one the 24.2 fix made honest - it read a flat 0.0 before,
+which was a ray miss wearing a measurement's clothes. 0.0155mm is a real
+knife-edge somewhere under that rim, almost certainly where the trim boundary
+or an embrasure passes beneath it, and `wall_limit` is `safe_wall_fraction`
+times it, so the refusal is arithmetically correct.
+
+**WHAT THAT EXPOSES IS A STATISTIC, NOT A THRESHOLD, and it is left alone
+deliberately.** `local_thickness` is reduced with `np.nanmin` over the whole
+rim, so ONE knife-edge point governs the wall limit for the entire tooth.
+A low percentile, or a per-point limit, is very likely the right reduction -
+but changing it would be tuning a gate until a case passes, which is the one
+thing this work does not do. It needs its own evidence: what the thickness
+profile around a real rim actually looks like, and what a wall limit should
+mean when part of the rim overhangs nothing at all. That is the next piece of
+work, and it is a geometry question rather than a parameter.
+
+These are real-anatomy difficulties on a genuine intraoral scan, not the
+mapping bug. **Nothing in sections 21, 23 or 24 that concerns manufacturing
+gates is based on the real scan.**
+
+### 24.8 The frontend, and the dependency audit
+
+**WHAT SHIPPED.** `theme.js` holds the design tokens - an 8px spacing scale,
+one accent, the surface and state colours, and motion durations that all pass
+through `duration()` so one media query stills the interface.
+`installGlobalStyles` writes the focus, hover, pressed, disabled and
+`prefers-reduced-motion` rules **once**, as a stylesheet, rather than at the
+sixty-odd inline style sites that would each have to remember them.
+`:focus-visible`, not `:focus`, so a mouse click leaves no ring while keyboard
+navigation still shows one.
+
+`ToothLegend.jsx` is the first component extracted from `App.jsx`. It turns a
+colour back into an FDI number, which is what makes 32 colours useful, and it
+makes the palette **inspectable** - a duplicate colour is obvious in a legend
+and invisible in a viewport, which is how seventeen teeth came to share one. It
+carries the per-tooth review badges from `segmentation_diagnostics` with their
+REASONS, and it says in words when the labels are not indexed to this mesh,
+because no accuracy metric can show that.
+
+**IT TAKES A SUMMARY, NOT THE LABEL ARRAY.** The per-vertex labels are 94,848
+integers on a real scan and stay in a ref; the legend receives at most 32
+counts. Passing the array would drag it into a dependency list and into every
+reconciliation, which is the rule that keeps three.js transforms and stage
+scrubbing off the render path.
+
+**The deps-array trap was checked, not assumed, for the sixth time.**
+`loadSegDiagnostics` had to enter two dependency arrays. It is declared at
+`App.jsx:378` and both consumers are at 1255 and 1461, so there is no temporal
+dead zone and the fix is safe - §13's rule is to verify the declaration order
+before taking that lint fix, and this is what verifying it looks like.
+
+**DEPENDENCY AUDIT.** `three-mesh-bvh` is load-bearing (`bvh.js`, 555x on
+raycasts, §15). `@radix-ui/react-accordion` is used by `Panel.jsx`,
+`@radix-ui/react-slider` and `lucide-react` by `StagingTimeline.jsx`.
+**`three-bvh-csg` was imported nowhere** - it appeared only in `package.json`
+and the lockfile - and has been removed. Every boolean in this app is backend
+`manifold3d`, so its presence also implied browser-side CSG that does not
+exist. The bundle is unchanged by the removal because an unimported package is
+already tree-shaken; what it removes is install weight and a false signal. No
+UI framework was added and framer-motion was not brought back.
+
+### 24.9 What was NOT done
+
+* **The workspace was not redesigned.** The top bar, left workflow rail,
+  right context panel and bottom staging dock are not built, `App.jsx` is
+  still one ~2,700-line file, and only `ToothLegend` has been extracted from
+  it. The existing `S` style object has NOT been migrated onto `theme.js`;
+  the tokens are the base for that work, not the work.
+* **No browser performance measurements were taken this pass** - initial
+  load, segmentation responsiveness, 3D interaction, stage scrubbing, shadow
+  toggle and attachment placement are all unmeasured here. There is no
+  browser in this environment.
+* **MeshSegNet was not benchmarked** against ToothGroupNetwork. See 24.4.
+* **Real-scan manufacturing is still NOT VERIFIED end to end.** See 24.7.
+* **The viewport darkening is still mitigated, not root-caused** (section 22).
+
+Covered by `test_segmentation_mapping.py` (12), the four transition controls
+and the unmeasurable-transition test in `test_manufacturing_interface.py`, the
+evidence and export-format tests in `test_manufacturing_matrix.py`,
+`frontend/verify-palette.mjs` and `real_scan_regression.py`.

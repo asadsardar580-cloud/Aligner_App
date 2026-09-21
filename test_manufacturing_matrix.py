@@ -14,12 +14,15 @@ manufacturing gates". So these tests assert per STAGE, never per case.
 """
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import pytest
 
 import api_core
 import core_geometry as cg
 import manufacturing as mfg
+import stl_io
 from api_core import build_stage_bundle, StageExportRequest
 from test_staging_export import moved_session
 
@@ -423,6 +426,157 @@ def test_every_stage_records_where_its_geometry_came_from():
           + ", ".join(f"stage {s['stage']} synthetic "
                       f"{s['synthetic_exposure']['exposed_synthetic_fraction']*100:.2f}%"
                       for s in stages))
+
+
+def _response_bytes(res):
+    """Collect a StreamingResponse. Starlette wraps a synchronous file-like
+    body in an ASYNC iterator, so a plain join does not work on it."""
+    import asyncio
+
+    async def _drain():
+        out = bytearray()
+        async for chunk in res.body_iterator:
+            out += chunk if isinstance(chunk, (bytes, bytearray)) else chunk.encode()
+        return bytes(out)
+
+    return asyncio.run(_drain())
+
+
+
+# ===========================================================================
+# THE EVIDENCE REPORT, AND THE THREE EXPORT FORMATS
+#
+# The formats exist because a slicer wants a file it can open and a reviewer
+# wants the numbers without a model attached. The thing that must be true of
+# all three is that they are the SAME GATED BYTES - a format is not a way
+# around the gate.
+# ===========================================================================
+
+def test_the_evidence_report_cannot_make_a_claim_it_did_not_measure():
+    """An empty stage must fail every claim, exactly as the gate itself does.
+    A claim that reads true by default is worse than no claim."""
+    rep = mfg.manufacturing_evidence_report({})
+    assert rep["all_claims_verified"] is False
+    assert len(rep["claims"]) == 9, rep
+    for c in rep["claims"]:
+        assert c["verified"] is False, c
+        # and it says WHY - the evidence is named and missing, not absent
+        assert c["evidence_gates"], c
+    assert "clinical" in rep["wording_note"].lower()
+    print(f"PASS  an empty stage fails all {len(rep['claims'])} claims")
+
+
+def test_every_claim_names_a_gate_that_actually_exists():
+    """A claim whose evidence gate is misspelled would report `missing` for
+    ever and never be noticed. Checked against the gate's own vocabulary."""
+    gate = mfg.aggregate_print_gate({})
+    known = {g["gate"] for g in gate["gates"]}
+    rep = mfg.manufacturing_evidence_report({})
+    for c in rep["claims"]:
+        for g in c["evidence_gates"]:
+            assert g in known, f"{c['claim']!r} cites unknown gate {g!r}"
+        assert not c["missing_evidence"], c
+    print(f"PASS  all {len(rep['claims'])} claims cite real gates "
+          f"({len(known)} in the vocabulary)")
+
+
+def test_a_print_ready_stage_verifies_every_claim():
+    stages, bundle = _stages([dict(d_oa=0.25), dict(d_md=0.4)], 3)
+    ready = [s for s in stages
+             if (s.get("manufacturing_gate") or {}).get("print_ready")]
+    assert ready, ("no stage was print ready, so this test cannot check the "
+                   "positive case: "
+                   + str([(s["stage"],
+                           (s.get("manufacturing_gate") or {}).get("failed_gates"))
+                          for s in stages]))
+    for s in ready:
+        rep = mfg.manufacturing_evidence_report(s)
+        assert rep["all_claims_verified"] is True, rep["unverified_claims"]
+        assert rep["print_ready"] is True
+    print(f"PASS  {len(ready)}/{len(stages)} stages verify all 9 claims")
+
+
+@pytest.mark.parametrize("fmt,media", [
+    ("zip", "application/zip"),
+    ("stl", "model/stl"),
+    ("manifest", "application/json"),
+])
+def test_every_export_format_is_the_same_gated_bytes(fmt, media):
+    """A format cannot route around the gate. All three carry the same
+    X-Print-Ready, and the STL inside the ZIP is byte-identical to the raw
+    STL the `stl` format returns."""
+    import json as _json
+
+    sid, tids, _ = moved_session(prescriptions=[dict(d_oa=0.25),
+                                                dict(d_md=0.4)])
+    try:
+        req = api_core.FinalExportRequest(stages=3, fmt=fmt)
+        res = api_core.export_final(sid, req)
+        assert res.media_type == media, res.media_type
+        assert res.headers["X-Print-Ready"] == "true"
+        assert res.headers["X-Export-Format"] == fmt
+        assert res.headers["X-Claims-Verified"] == "true"
+        body = _response_bytes(res)
+        assert len(body) > 0
+
+        if fmt == "stl":
+            v, f = stl_io.parse_stl_bytes(body)
+            assert len(f) > 0 and cg.signed_volume(v, f) > 0
+        elif fmt == "manifest":
+            man = _json.loads(body.decode("utf-8"))
+            assert man["print_ready"] is True
+            assert man["evidence_report"]["all_claims_verified"] is True
+            assert len(man["evidence_report"]["claims"]) == 9
+            # THE MANIFEST CARRIES NO GEOMETRY. It is the record, not the part.
+            assert "vertices" not in man and "faces" not in man
+        else:
+            import zipfile as _zf
+            z = _zf.ZipFile(io.BytesIO(body))
+            names = z.namelist()
+            assert "manifest.json" in names
+            stls = [n for n in names if n.endswith(".stl")]
+            assert len(stls) == 1, names
+        print(f"PASS  format {fmt}: {len(body):,} bytes, "
+              f"X-Print-Ready={res.headers['X-Print-Ready']}")
+    finally:
+        api_core.close_session(sid)
+
+
+def test_the_raw_stl_and_the_zipped_stl_are_the_same_bytes():
+    """Otherwise one of the two is not the file that was validated."""
+    import zipfile as _zf
+
+    sid, tids, _ = moved_session(prescriptions=[dict(d_oa=0.25),
+                                                dict(d_md=0.4)])
+    try:
+        raw = api_core.export_final(
+            sid, api_core.FinalExportRequest(stages=3, fmt="stl"))
+        raw_bytes = _response_bytes(raw)
+        zipped = api_core.export_final(
+            sid, api_core.FinalExportRequest(stages=3, fmt="zip"))
+        zip_bytes = _response_bytes(zipped)
+        z = _zf.ZipFile(io.BytesIO(zip_bytes))
+        inner = z.read([n for n in z.namelist() if n.endswith(".stl")][0])
+        assert inner == raw_bytes, (
+            f"the raw STL is {len(raw_bytes)} bytes and the zipped one is "
+            f"{len(inner)} - they are not the same file")
+        print(f"PASS  raw and zipped STL are byte-identical "
+              f"({len(raw_bytes):,} bytes)")
+    finally:
+        api_core.close_session(sid)
+
+
+def test_an_unknown_export_format_is_refused_by_name():
+    sid, tids, _ = moved_session(prescriptions=[dict(d_oa=0.25),
+                                                dict(d_md=0.4)])
+    try:
+        with pytest.raises(Exception) as e:
+            api_core.export_final(
+                sid, api_core.FinalExportRequest(stages=3, fmt="obj"))
+        assert "obj" in str(e.value) or "format" in str(e.value).lower()
+        print(f"PASS  an unknown format is refused: {str(e.value)[:90]}")
+    finally:
+        api_core.close_session(sid)
 
 
 if __name__ == "__main__":

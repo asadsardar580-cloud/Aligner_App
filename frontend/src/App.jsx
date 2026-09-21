@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import * as THREE from "three";
+import { rgbForFDI, GINGIVA_HEX, SELECTION_HEX }
+  from "./fdiPalette.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { frameArch, attachResize, pickAcrossArches } from "./frameArch";
@@ -9,6 +11,8 @@ import { installBVH, refreshBoundsTree, dropBoundsTree, configureRaycaster } fro
 import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
          toothAxes, deltaFromClinical, clinicalAtStage, stagingFor } from "./toothGizmo";
 import StagingTimeline from "./StagingTimeline";
+import ToothLegend from "./ToothLegend";
+import { installGlobalStyles } from "./theme";
 import { useStagePlayback } from "./useStagePlayback";
 import ValidationPanel, { PASS, REVIEW, UNKNOWN } from "./ValidationPanel";
 import AttachmentPanel from "./AttachmentPanel";
@@ -40,8 +44,8 @@ const HEALTH_UI = {
   degraded:  { dot: "#f58231", label: "Backend up, AI unavailable" },
   offline:   { dot: "#e6194b", label: "Backend not running" },
 };
-const GINGIVA = new THREE.Color("#d9a7a0");
-const SELECTED = new THREE.Color("#3fa9ff");
+const GINGIVA = new THREE.Color(GINGIVA_HEX);
+const SELECTED = new THREE.Color(SELECTION_HEX);
 const CROWN_COL = new THREE.Color("#2ecc71");
 
 /**
@@ -223,16 +227,13 @@ function applyExtraction(archRec, removedFaces, socketCap, scene) {
   }
 }
 
-const PALETTE = [
-  "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
-  "#911eb4", "#46f0f0", "#f032e6", "#bcf60c", "#fabebe",
-  "#008080", "#e6beff", "#9a6324", "#fffac8", "#800000"
-];
-
-const FDI_COLOURS = {};
-[11,12,13,14,15,16,17,18, 21,22,23,24,25,26,27,28, 31,32,33,34,35,36,37,38, 41,42,43,44,45,46,47,48].forEach((fdi, i) => {
-    FDI_COLOURS[fdi] = new THREE.Color(PALETTE[i % PALETTE.length]).toArray();
-});
+// THE TOOTH COLOUR TABLE LIVES IN ONE MODULE - `src/fdiPalette.js`.
+// What was here was fifteen hex strings indexed by position over 32 teeth,
+// `PALETTE[i % PALETTE.length]`, so SEVENTEEN teeth shared a colour with
+// another tooth: FDI 11 and 31 were both #e6194b. `colorForFDI` is a pure
+// function of the FDI number, so the same tooth is the same colour across a
+// refresh, a re-segmentation and a change of segmentation provider.
+// `verify-palette.mjs` measures the separation rather than asserting it.
 
 /**
  * The six clinical degrees of freedom, with the step each one is prescribed in.
@@ -361,6 +362,28 @@ export default function App() {
   // WHICH tooth a selection covers — and therefore unable to pick the right
   // root length before the cut, since /cut needs it in the request.
   const labels = useRef({});
+  // A SUMMARY OF THE LABELS, not the labels. At most 32 entries, so it is
+  // safe in React state where the 94,848-integer array is not.
+  const [legend, setLegend] = useState(null);
+  const [segDiagnostics, setSegDiagnostics] = useState(null);
+
+  /**
+   * The per-tooth spatial diagnostic: bounding box, counts and disconnected
+   * components per label. It answers a question no accuracy metric can - are
+   * these labels attached to THIS mesh at all - so it is fetched whenever
+   * labels arrive, not only on demand. A failure is silent by design: the
+   * legend simply renders without review badges rather than blocking on a
+   * diagnostic.
+   */
+  const loadSegDiagnostics = useCallback(async (sid) => {
+    try {
+      const r = await fetch(
+        `${API}/api/session/${sid}/segmentation-diagnostics`);
+      setSegDiagnostics(r.ok ? await r.json() : null);
+    } catch {
+      setSegDiagnostics(null);
+    }
+  }, []);
   const stateRef = useRef();
   const gizmoRef = useRef(null);
 
@@ -507,6 +530,10 @@ export default function App() {
   useEffect(() => {
     const mount = mountRef.current;
     const scene = new THREE.Scene();
+    // Focus rings, hover/active feedback and the reduced-motion rule, in one
+    // stylesheet rather than at sixty call sites. Idempotent: React 19
+    // StrictMode mounts effects twice in development.
+    installGlobalStyles();
     scene.background = new THREE.Color(0x0d0f12);
 
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
@@ -1161,7 +1188,12 @@ export default function App() {
 
     if (info.has_segmentation) {
       const r = await fetch(`${API}/api/session/${sid}/labels`);
-      if (r.ok) labels.current[archName] = (await r.json()).labels;
+      if (r.ok) {
+        const got = (await r.json()).labels;
+        labels.current[archName] = got;
+        setLegend(summariseLabels(got));
+        loadSegDiagnostics(sid);
+      }
     }
 
     let frame = null;
@@ -1220,7 +1252,7 @@ export default function App() {
       }
     }
     return { info, frame, session: { session_id: sid, ...info } };
-  }, [mountArch]);
+  }, [mountArch, loadSegDiagnostics]);
 
   // Restore on mount. Runs once; a failed or expired session is dropped
   // silently rather than leaving a dead id to fail every later request.
@@ -1378,12 +1410,14 @@ export default function App() {
       const n = arches.current[active].geometry.attributes.position.count;
       const c = new Float32Array(n * 3);
       for (let i = 0; i < n; i++) {
-        const [r,g,b] = FDI_COLOURS[data.labels[i]] ?? [0.85,0.75,0.72]; 
+        const [r,g,b] = rgbForFDI(data.labels[i]); 
         c[i*3]=r; c[i*3+1]=g; c[i*3+2]=b;
       }
       arches.current[active].geometry.setAttribute("color", new THREE.BufferAttribute(c, 3));
       arches.current[active].geometry.userData.baseColors = Float32Array.from(c);
       labels.current[active] = data.labels;
+      setLegend(summariseLabels(data.labels));
+      loadSegDiagnostics(sid);
       const took = segmentStartedAt.current
         ? ` (${Math.round((Date.now() - segmentStartedAt.current) / 1000)}s)`
         : "";
@@ -1424,7 +1458,7 @@ export default function App() {
       setSegmenting(false);
       setBusy(false);
     }
-  }, [sessions, active, segmenting]);
+  }, [sessions, active, segmenting, loadSegDiagnostics]);
 
   const handleDefineOcclusalPlane = async () => {
     const sid = sessions[active]?.session_id;
@@ -2128,7 +2162,7 @@ export default function App() {
    * the ACTUAL WRITTEN STL and returns nothing at all if any gate fails, so
    * the UI cannot download something and call it print ready when it is not.
    */
-  const exportFinal = async () => {
+  const exportFinal = async (fmt = "zip") => {
     const sid = sessions[active]?.session_id;
     if (!sid || !staging.total) return;
     setBusy(true);
@@ -2137,7 +2171,13 @@ export default function App() {
     try {
       const res = await fetch(`${API}/api/session/${sid}/export/final`, {
         method: "POST", headers: { "Content-Type": "application/json" },
+        // THE FORMAT IS NOT A WAY AROUND THE GATE. All three come from the
+        // same validated bytes and carry the same X-Print-Ready; `stl` is
+        // for a slicer, `manifest` is the record without a model attached,
+        // and `zip` is both together, which stays the default because a bare
+        // STL cannot carry the verdict.
         body: JSON.stringify({ stage: stage || staging.total,
+                               fmt,
                                opposing_session_id: opposingSessionId() }),
       });
       if (!res.ok) {
@@ -2158,7 +2198,9 @@ export default function App() {
       const href = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = href;
-      a.download = `Stage_${stage || staging.total}_FINAL.zip`;
+      const ext = fmt === "stl" ? "stl" : fmt === "manifest" ? "json" : "zip";
+      const suffix = fmt === "manifest" ? "_manifest" : "";
+      a.download = `Stage_${stage || staging.total}_FINAL${suffix}.${ext}`;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(href);
       // READ THE SERVER'S VERDICT, never infer it from HTTP 200. A 200 means
@@ -2428,6 +2470,30 @@ export default function App() {
           <button onClick={runSegmentation} disabled={busy || segmenting || !sessions[active]} style={{...S.primary, marginTop: 10}}>
             {segmenting ? "Segmenting…" : "Segment Teeth"}
           </button>
+          {/* WHICH COLOUR IS WHICH TOOTH. Thirty-two colours on a cast are
+              only useful if they can be turned back into an FDI number, and
+              until now there was nowhere to look one up. It also makes the
+              palette inspectable: a duplicate colour is obvious in a legend
+              and invisible in a viewport, which is how seventeen teeth came
+              to share one. It takes a SUMMARY, never the 94,848-integer
+              label array - that stays in a ref. */}
+          {legend && legend.size > 0 && (
+            <div style={{ marginTop: 12 }} data-testid="tooth-legend">
+              <ToothLegend counts={legend} diagnostics={segDiagnostics} />
+              {segDiagnostics
+                && segDiagnostics.indexed_to_this_mesh === false && (
+                /* THE LABELS ARE NOT ON THIS MESH. Distinct from a model that
+                   segmented badly, and far more serious: every FDI, every
+                   colour and every cut derived from them is meaningless. No
+                   accuracy metric can see it, so it is said in words. */
+                <div style={{ ...S.rootClamp, marginTop: 8 }}
+                     data-testid="labels-not-indexed">
+                  <b>Labels are not indexed to this mesh.</b>{" "}
+                  {segDiagnostics.reason}
+                </div>
+              )}
+            </div>
+          )}
           {/* DIAGNOSTIC. Separates a lighting problem from a geometry problem
               without reloading the case. Presentation only - it cannot change
               an exported STL. */}
@@ -2585,12 +2651,34 @@ export default function App() {
                     style={{...S.chip, marginTop: 6}}>
               Export All Stages (1&ndash;{staging.total || "?"}) &mdash; fused solids
             </button>
-            <button onClick={exportFinal} disabled={busy || !staging.total}
+            {/* ONCLICK PASSES THE CLICK EVENT AS THE FIRST ARGUMENT, so
+                `onClick={exportFinal}` handed a React SyntheticEvent to the
+                `fmt` parameter and asked the server for a format named
+                "[object Object]". Every one of these is wrapped. */}
+            <button onClick={() => exportFinal("zip")}
+                    disabled={busy || !staging.total}
                     data-testid="export-final"
+                    title="One validated stage as an STL plus its manifest. Refused outright if any manufacturing gate fails."
                     style={{...S.primary, marginTop: 6,
                             background: "linear-gradient(#7ad07a,#3f9d4a)"}}>
               Export Final Print STL
             </button>
+            <div style={{display: "flex", gap: 6, marginTop: 6}}>
+              <button onClick={() => exportFinal("stl")}
+                      disabled={busy || !staging.total}
+                      data-testid="export-final-stl"
+                      title="The same validated bytes as a bare .stl, for a slicer or CAD package. The verdict travels in the response headers, not in the file."
+                      style={{...S.chip, flex: 1}}>
+                .STL only
+              </button>
+              <button onClick={() => exportFinal("manifest")}
+                      disabled={busy || !staging.total}
+                      data-testid="export-final-manifest"
+                      title="The manufacturing record as JSON, with no geometry: every gate, what it measured, and the nine claims it supports."
+                      style={{...S.chip, flex: 1}}>
+                Manifest only
+              </button>
+            </div>
             {printVerdict && (
               <div data-testid="print-verdict"
                    style={printVerdict.ready ? S.printReady : S.printNotReady}>
@@ -2675,6 +2763,16 @@ export default function App() {
       <footer style={S.status}>{status}</footer>
     </div>
   );
+}
+
+function summariseLabels(arr) {
+  const m = new Map();
+  if (!arr) return m;
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (v) m.set(v, (m.get(v) || 0) + 1);
+  }
+  return m;
 }
 
 const S = {

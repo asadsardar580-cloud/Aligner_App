@@ -743,3 +743,77 @@ cost **0.90 s PER STAGE**, so a 31-stage plan paid ~28 s of forensics on top of
 a 4.2 s export, and `/export/final` paid it again. It answers a question that
 only arises when something is wrong, so it runs when something is wrong, and it
 is wrapped: a diagnostic must never be the thing that fails an export.
+
+
+## W. 2026-09-21 — THE LEDGE WAS THE MEASUREMENT; THE LABELS WERE THE MAPPING
+
+Two blockers, both defects in the measuring rather than in the thing measured.
+**Neither threshold moved.**
+
+### W.1 `transition_quality` sampled the nearest VERTEX
+
+The refusal §V recorded as a limitation — 0.6mm extrusion + 3 degrees of tip,
+stage 3, `no_transition_ledge` at `largest_step_share` 0.9274 — was an artefact.
+The radial profile was read off the nearest vertex to each probe. Measured on
+that case the nearest vertex sits **0.52 to 1.31mm** from the probe while the
+rings are **0.25mm** apart, so the profile was four to five times coarser than
+its own sampling interval. Same stage, same written STL:
+
+    nearest vertex   -0.2266 -0.2307 -0.4292 -0.4292 -0.3741 -0.4292 -0.4406
+    ray cast          1.8251  0.7563 -0.3238 -0.8028 -1.5329 -1.8032 -2.0234
+
+One value three times and not monotonic, against strictly decreasing. Share
+0.9274 against 0.2807. Across all teeth and stages the real surface reads
+0.2467–0.2816.
+
+**Wrong in BOTH directions**, proven on four solids of revolution whose answer
+is known before the measurement runs:
+
+| control | old | corrected |
+|---|---|---|
+| cylindrical collar (the artefact it exists to catch) | share 0.0000, **MISSED** | 1.0000, caught |
+| smooth cone, 13 rings | 0.2222, blend | 0.1667, blend |
+| the SAME cone, one triangle strip | 1.0000, **false positive** | 0.1667, blend |
+| 3.5mm cone | 0.5000, blend | 0.1667, blend |
+
+The denominator was also wrong: `|h[0]-h[-1]|` lets a dip-and-recover report
+above 1.0 and gives a pure spike a share of ZERO. It is now the path length; on
+the failing case the denominator alone flips the verdict, 0.9276 vs 0.6123.
+
+Threshold unchanged at 0.75. An unmeasurable transition returns
+`looks_like_a_ledge: None`, so the gate refuses as it would for a real ledge,
+and there is no fall back to the method known to be wrong.
+
+### W.2 `local_thickness` returned 0.0 for a ray that hit nothing
+
+The caller filtered with `np.isfinite`, so it was written against a NaN
+contract the callee did not honour — and 0.0 is finite. The caller takes the
+MINIMUM over the rim, so one point over an embrasure zeroed the whole tooth's
+`wall_limit`. Every real-scan tooth reported `local_cast_thickness_mm 0.0` on
+a cast at least 3mm thick. A miss is now NaN, with
+`rim_points_with_no_cast_below` reported separately. FDI 45 now reads a genuine
+**0.0155mm**, which is a real knife-edge, and the `wall_too_thin` refusal on it
+is arithmetically correct. **The reduction — `nanmin` over the whole rim, so
+one point governs the tooth — is left alone**: changing it would be tuning a
+gate until a case passes.
+
+### W.3 The evidence report and three export formats
+
+`mfg.manufacturing_evidence_report` restates the aggregate gate as nine claims,
+each naming the gates that are its evidence, so a claim cannot be made by a row
+that measured nothing. An empty stage fails all nine, asserted.
+`/export/final` gains `fmt` = `zip` (default) / `stl` / `manifest`; all three
+are the same gated bytes and a test asserts the raw STL and the zipped STL are
+byte-identical.
+
+### W.4 Where the real scan now stands
+
+Labels transferred by position are coherent (median per-tooth box 50.71mm ->
+13.97mm), and **seven real teeth cut successfully** — FDI 32, 34, 41, 42, 44,
+45, 46 — three producing a proper socket cup. One of seven built a complete
+interface. Staging still refuses: `wall_too_thin`,
+`outside_reconstruction_envelope` (rim separation 4.2–4.7mm) and
+`interface_construction_failed` (31 of 166 collar points).
+
+**REAL-SCAN MANUFACTURING REGRESSION = STILL NOT VERIFIED END TO END.**
+Nothing in §U, §V or §W that concerns manufacturing gates is based on it.

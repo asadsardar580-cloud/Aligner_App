@@ -106,17 +106,21 @@ sidebar's connection badge, or poll `/api/ai/status`.
 
 ```powershell
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names, without importing (61 files)
-python run_all_tests.py                 # canonical runner — 36 entries
-python -m pytest -q                     # runs alongside; both must pass
+python check_structure.py               # undefined names, without importing (96 files)
+python run_all_tests.py                 # canonical runner — 39 entries
+python -m pytest -q                     # runs alongside; both must pass — 334 passed
 python bench_signed_distance.py         # scores the signed-distance method
 python real_scan_regression.py          # the real scan, end to end
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
+node frontend/verify-framing.mjs        # occlusal framing, rigid-motion invariant
+node frontend/verify-shadowrig.mjs      # shadow rig arithmetic
+node frontend/verify-palette.mjs        # 32 distinct FDI colours, measured in Lab
 
 cd frontend
 npm run lint
 npm run build
 npm run smoke                           # SSR render of <App/>; catches TDZ crashes a build cannot
+npx playwright test                     # browser E2E against the production build
 ```
 
 **`npm run smoke` earns its place.** A `vite build` succeeds on code that throws during render — a
@@ -124,25 +128,38 @@ dependency array referencing a `const` declared further down the component crash
 white screen while building cleanly. The smoke test renders `<App/>` in node and catches exactly
 that.
 
-**Read `24/24` with a caveat:** three entries (`test_interproximal.py`, `test_auto_color.py`,
-`test_incisal_edge.py`) contain no assertions. They are characterization scripts that print
-measurements and exit 0, so they report PASS regardless. The suite is 21 enforcing tests plus 3
-reports.
+**The three assertion-free entries were fixed on 2026-09-16.** `test_interproximal.py`,
+`test_auto_color.py` and `test_incisal_edge.py` used to print measurements and exit 0, reporting
+PASS regardless of what they measured. Every suite entry now carries enforcing assertions, so
+every entry can fail.
 
 ## Current limitations
 
 - **Segmentation is not solved.** No reproducible mm-accuracy figure exists for the AI path; the
   numbers quoted in older documents describe the *classical* segmenter, which `/segment` does not
-  use. Do not treat any segmentation output as verified.
+  use. Do not treat any segmentation output as verified. What IS now checked is whether the labels
+  belong to the mesh at all — `segmentation_diagnostics` measures per-tooth bounding box, counts
+  and disconnected components, because a label array read against the wrong vertex ordering scores
+  perfectly on every accuracy metric including IoU. On the real scan that check moved the median
+  per-tooth box from 50.71 mm to 13.97 mm (CLAUDE.md §24.3).
+- **Real-scan manufacturing is NOT VERIFIED end to end.** Seven real teeth now cut successfully,
+  one of seven builds a complete local interface, and staging refuses by name with measured
+  numbers. No manufacturing gate result anywhere is based on the real scan (CLAUDE.md §24.7).
+- **The workspace redesign is not done.** The FDI colour system, the tooth legend, the design
+  tokens and the focus and reduced-motion rules shipped; the top bar, workflow rail and context
+  panel did not, and `App.jsx` is still one large file (CLAUDE.md §24.9).
 - **Segmentation cannot be cancelled** — ~236 s on a real scan, and `asyncio.to_thread` gives no
   cancellation point inside the model.
-- **A browser refresh loses the case.** The server holds nearly everything, but several keys are not
-  exposed by any endpoint and the session id lives only in React state. Sessions are in-memory with
-  a sliding 1-hour TTL and a 4-session cap, so a server restart is unrecoverable by design.
+- **A browser refresh now restores the case**, since the hydration endpoints landed: crowns, poses,
+  the occlusal frame and the labels come back, and only the session id lives in `localStorage`.
+  Sessions are still in-memory with a sliding 1-hour TTL and a 4-session cap, so a **server restart**
+  is unrecoverable by design and the persistent re-upload banner says so.
 - **The antagonist collision check has never run against a real opposing arch.** `checked: false`
   means "not checked", never "no interference".
-- **`cut_guard.check_crown` is bypassed** — it computes its metrics and returns `ok=True`
-  unconditionally, so the `/cut` refusal that depends on it is unreachable.
+- **`cut_guard.check_crown` measures but does not gate.** The unconditional `ok=True` was removed,
+  but `MIN_COMPACTNESS` and `MIN_RIM_CONCAVITY` have never been measured against real cuts, so the
+  result is reported as `crown_advisory` rather than used as a refusal. A threshold becomes a
+  refusal only with numbers behind it.
 - No authentication, TLS, authorization or audit logging. **This is a localhost development
   prototype**; do not expose it to a network.
 
