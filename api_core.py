@@ -285,6 +285,17 @@ def run_segmentation(v, f, jaw, return_input_vertices=False):
 class OcclusalPlaneRequest(BaseModel):
     points: list[list[float]]
 
+class SelectToothRequest(BaseModel):
+    """Either a vertex id or a point in scanner coordinates.
+
+    A vertex id when the client raycast the arch and read the nearest corner
+    of the hit triangle; a point when it only has the intersection. Both
+    resolve against THIS session's mesh, never a provider's array.
+    """
+    vertex_id: int = None
+    point: list[float] = None
+
+
 class WandRequest(BaseModel):
     point: list[float]
     tolerance: float | None = None
@@ -643,10 +654,141 @@ def wand(sid: str, req: WandRequest):
     
     auto = cut_guard.auto_tolerance(dist)
     tol = req.tolerance if req.tolerance else auto["tolerance"]
-    
+
     ids = np.nonzero(dist <= tol)[0]
     finite = dist[np.isfinite(dist)]
-    return {"vertex_ids": ids.tolist(), "tolerance": tol, "seed": seed.tolist(), "seed_moved_mm": round(float(np.linalg.norm(seed - clicked)), 3), "max_distance": float(finite.max()) if finite.size else 0.0}
+    # A TOLERANCE THAT WAS NEVER FOUND MUST NOT READ LIKE ONE THAT WAS.
+    # `auto_tolerance` scans 1.0 to 25.0mm looking for a plateau in the flood's
+    # growth - the sulcus barrier - and when there is none it returns its own
+    # CEILING, 25.0, with `plateau_found: False`. That flag was computed and
+    # then dropped here, so the response said `tolerance: 25.0` in exactly the
+    # field a found plateau uses. Measured on this project's real scan, the
+    # ceiling comes back for all sixteen teeth and floods 26,408 of 94,848
+    # vertices - a quarter of the arch, 15.7% of it belonging to the tooth
+    # clicked - and the client had no way to tell that from a measurement.
+    #
+    # THE FLOOD IS NOT CHANGED. The wand is the CORRECTION tool now (see
+    # /select-tooth), and refusing here would break the one route that needs
+    # no segmentation at all. What changes is that the response says so.
+    auto_used = not req.tolerance
+    return {"vertex_ids": ids.tolist(), "tolerance": tol,
+            "tolerance_source": "caller" if req.tolerance else "auto",
+            "plateau_found": bool(auto["plateau_found"]),
+            "tolerance_is_a_ceiling_not_a_measurement":
+                bool(auto_used and not auto["plateau_found"]),
+            "selected_fraction_of_arch": round(float(len(ids) / max(len(v), 1)), 4),
+            "note": (
+                "No plateau in the flood's growth was found between 1.0 and "
+                f"{auto['tolerance']:.1f} mm, so this is the scan's ceiling "
+                "rather than a measured tooth boundary. Click the tooth "
+                "instead (it reads the segmentation label), or set a "
+                "tolerance by hand."
+                if auto_used and not auto["plateau_found"] else None),
+            "seed": seed.tolist(),
+            "seed_moved_mm": round(float(np.linalg.norm(seed - clicked)), 3),
+            "max_distance": float(finite.max()) if finite.size else 0.0}
+
+@app.post("/api/session/{sid}/select-tooth")
+def select_tooth(sid: str, req: SelectToothRequest):
+    """A click on a tooth selects THAT TOOTH, from the canonical labels.
+
+    THE WAND IS NOT THE ROUTE FOR AN ORDINARY SELECTION, and measurement is
+    why. `/wand` floods geodesically from a snapped seed, and on this
+    project's real scan its auto tolerance returns 25.00 mm and selects
+    26,408 of 94,848 vertices - a quarter of the arch (s.19, s.24.7).
+    Narrowing it by hand does not help: `snap_seed_to_ridge` moves the seed
+    up to 3 mm to the nearest high-concavity point, which is the interdental
+    sulcus BETWEEN two teeth, and the best IoU against any label over
+    tolerances of 1 to 8 mm measured 0.01 to 0.05.
+
+    Segmentation has already answered this question. This endpoint reads the
+    label under the click and returns that label's own region, so the
+    clinical path is click -> whole tooth. The wand and the brush stay
+    exactly as they are, for CORRECTING a region the model got wrong.
+
+    THE REGION IS THE LABEL'S LARGEST CONNECTED COMPONENT, not every vertex
+    carrying the label, and that is the same rule `real_scan_regression.py`
+    and tier 2 of `segmentation_fallback` already use. A label can carry a
+    handful of stray triangles on a neighbour - measured on the real scan,
+    eleven of twelve teeth have their largest piece at 98.7% or better - and
+    a crown built from two disconnected pieces cannot close watertight, so
+    `/cut` would refuse it 422 with a message about the cut rather than
+    about the label.
+    """
+    try:
+        v = STORE.require(sid, "verts")
+        f = STORE.require(sid, "faces")
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+
+    labels = STORE.get(sid, "labels")
+    if labels is None:
+        raise HTTPException(
+            409, "This arch has not been segmented. Run Segment Teeth first, "
+                 "or use the wand to select a region by hand.")
+    labels = np.asarray(labels).astype(np.int64).reshape(-1)
+    if len(labels) != len(v):
+        raise HTTPException(500, "The stored labels do not match this mesh.")
+
+    # THE CLICK IS RESOLVED ON THIS MESH, never on a provider's array. The
+    # client raycasts the geometry it is drawing, which is this `v`/`f` in
+    # this order, so a vertex id or a point both land here unambiguously.
+    if req.vertex_id is not None:
+        if not (0 <= req.vertex_id < len(v)):
+            raise HTTPException(400, f"vertex_id {req.vertex_id} is outside "
+                                     f"this mesh's {len(v)} vertices")
+        vid = int(req.vertex_id)
+    elif req.point is not None and len(req.point) == 3:
+        from scipy.spatial import cKDTree
+        tree = STORE.get(sid, "vertex_tree")
+        if tree is None:
+            tree = cKDTree(v)
+            STORE.put(sid, "vertex_tree", tree)
+        _, vid = tree.query(np.asarray(req.point, float))
+        vid = int(vid)
+    else:
+        raise HTTPException(400, "provide either vertex_id or point [x,y,z]")
+
+    fdi = int(labels[vid])
+    if fdi == 0:
+        return {"fdi": None, "vertex_ids": [], "clicked_vertex": vid,
+                "route": "gingiva",
+                "message": "That point is gingiva, not a tooth. Click a "
+                           "tooth, or use the wand to select by hand."}
+
+    mask = labels == fdi
+    # Faces whose three corners all carry the label - the same strict rule
+    # `segmentation_diagnostics` uses, so the two agree about what a tooth is.
+    fmask = mask[f].all(axis=1)
+    n_faces_all = int(fmask.sum())
+    components = 1
+    if n_faces_all:
+        fmask = cg.largest_face_component(f, fmask)
+    kept = int(fmask.sum())
+    ids = np.unique(f[fmask].reshape(-1)) if kept else np.where(mask)[0]
+
+    diag = STORE.get(sid, "segmentation_diagnostics") or {}
+    row = next((r for r in diag.get("teeth", []) if r.get("label") == fdi), {})
+
+    STORE.put(sid, "selection", ids)
+    return {
+        "fdi": fdi,
+        "vertex_ids": [int(x) for x in ids],
+        "clicked_vertex": vid,
+        "route": "segmentation label",
+        "label_vertices": int(mask.sum()),
+        "label_faces": n_faces_all,
+        "kept_faces": kept,
+        "discarded_faces": n_faces_all - kept,
+        # Carried through so the client never has to re-derive a verdict the
+        # server already measured, and so a tooth the diagnostic flagged is
+        # flagged at the moment it is selected rather than after the cut.
+        "components": row.get("components"),
+        "largest_component_fraction": row.get("largest_component_fraction"),
+        "bbox_diagonal_mm": row.get("bbox_diagonal_mm"),
+        "plausible_size": row.get("plausible_size"),
+    }
+
 
 @app.post("/api/session/{sid}/wand/threshold")
 def wand_threshold(sid: str, req: ThresholdRequest):
@@ -2231,6 +2373,15 @@ MAX_TRANSLATION_PER_STAGE_MM = 0.25
 # be invisible in the exported STL — which is exactly why it is refused loudly.
 MAX_PRINT_COMPENSATION_MM = 0.5
 
+# Headroom kept beyond a socket rim when the manufacturing trim widens itself.
+# The trim's predicate is on FACE CENTROIDS, so the band's real edge sits up to
+# about half a face inside the nominal margin, and the collar's foot is seeded
+# `seat_bottom_outset_mm` further out than the rim again. 1.0mm covers both on
+# a scan whose mean edge is ~0.4mm. It is headroom on a structural guarantee,
+# not a tuned threshold: the guarantee is that the trim never deletes the cast
+# the reconstruction has to seat into.
+TRIM_RIM_HEADROOM_MM = 1.0
+
 # How far the plug is raised into the crown so the two share volume rather than
 # a surface. Well under the shallowest clinical crown, and buried either way.
 PLUG_LIFT_MM = 1.0
@@ -2652,8 +2803,54 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
     sealed_v, sealed_f, sockets = _seal_sockets(v, f, sid, extracted, flush=True)
     try:
         curve, _ = cg.fit_arch_curve(v, af)
+        # THE TRIM MAY NOT CUT THE CAST OUT FROM UNDER A SOCKET RIM, and until
+        # now it could. `ARCH_TRIM_MARGIN_MM` (7.0) was chosen in s.10 from
+        # measurements of the WHOLE arch - kept fraction 96.7%, material still
+        # inside the arch opening 3.35% - and those numbers are still right.
+        # What they do not describe is a wide molar, whose cervical rim reaches
+        # further from the fitted ridge than the band does. Measured on this
+        # project's real scan, FDI 46 at margin 7.0: 53 of 280 rim points ended
+        # up to 1.2961mm OUTSIDE the finished cast, and the transition collar
+        # then refused `interface_unbuildable_wall_too_thin` with 40 points its
+        # foot could not seat into. It was refusing correctly, about geometry
+        # the trim had deleted, while reporting a cast 2.8573mm thick as too
+        # thin.
+        #
+        #   margin   FDI 45            FDI 46
+        #     7.0    ok                REFUSED (53 rim points outside, 1.2961mm)
+        #     9.0    ok                ok      (0 outside)
+        #    12.0    ok                ok
+        #    15.0    ok                ok
+        #
+        # SO THE MARGIN IS NOT RAISED GLOBALLY - that would undo a measured
+        # decision to make one case pass, and would loosen the trim for every
+        # case that never needed it. It is raised only as far as the rims that
+        # actually exist require, per export, and the manifest records by how
+        # much and why. A case with no cuts trims exactly as it did before.
+        trim_margin = float(req.trim_margin_mm)
+        rim_reach = 0.0
+        for _t in teeth:
+            # `socket_rim` is an ndarray, and `x or []` evaluates bool(x) -
+            # which raises on any array of length > 1.
+            _raw = _t["rec"].get("socket_rim")
+            if _raw is None:
+                continue
+            _rim = np.asarray(_raw, np.int64).reshape(-1)
+            if not len(_rim):
+                continue
+            rim_reach = max(rim_reach, float(
+                cg.distance_to_arch_curve(v[_rim], af, curve).max()))
+        margin_floor = (rim_reach + mfg.DEFAULT_POLICY.seat_bottom_outset_mm
+                        + TRIM_RIM_HEADROOM_MM) if rim_reach > 0.0 else 0.0
+        trim_raised = margin_floor > trim_margin
+        if trim_raised:
+            trim_margin = float(margin_floor)
         tv, tf, trim_info = cg.trim_to_arch(sealed_v, sealed_f, af,
-                                            margin_mm=req.trim_margin_mm, curve=curve)
+                                            margin_mm=trim_margin, curve=curve)
+        trim_info["margin_requested_mm"] = round(float(req.trim_margin_mm), 4)
+        trim_info["margin_used_mm"] = round(float(trim_margin), 4)
+        trim_info["margin_raised_for_socket_rims"] = bool(trim_raised)
+        trim_info["socket_rim_max_distance_to_ridge_mm"] = round(rim_reach, 4)
         bv, bf, base_info = cg.build_cast_base(tv, tf, af,
                                                base_thickness_mm=req.base_thickness_mm,
                                                rim=trim_info["rim_loop"])
@@ -3127,6 +3324,18 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # instead of after it.
         sv = sv.astype(np.float32).astype(np.float64)
         _pre_weld_v, sf_pre_weld = sv, sf
+        # AND ITS OWN LABELS. `stage_labels` is re-indexed onto the
+        # WELDED faces twenty lines below, so keeping only the
+        # pre-weld faces here left `serialisation_forensics` indexing
+        # 168,562 faces into a 168,560-entry label array. Measured on
+        # the real scan it raised `IndexError: index 168560 is out of
+        # bounds`, was swallowed by the try/except around the call,
+        # and the manifest reported `edge_forensics.ran: false` - so
+        # the one tool built to attribute an offending edge to the
+        # geometry that made it was silently absent on exactly the
+        # stages that have one. The comment below already warns about
+        # this class of mistake; it happened anyway, at the call site.
+        _pre_weld_labels = stage_labels
 
         # SELF-TOUCH, MEASURED BEFORE THE WELD. manifold3d records a boundary
         # that touches itself as two vertices at an IDENTICAL position under
@@ -3390,7 +3599,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         if post_weld["nonmanifold_edges"] or post_weld["open_edges"]:
             try:
                 edge_forensics = mfg.serialisation_forensics(
-                    _pre_weld_v, sf_pre_weld, stage_labels, limit=8,
+                    _pre_weld_v, sf_pre_weld, _pre_weld_labels, limit=8,
                     write=cg.write_binary_stl_bytes,
                     read=stl_io.parse_stl_bytes)
                 edge_forensics["ran"] = True

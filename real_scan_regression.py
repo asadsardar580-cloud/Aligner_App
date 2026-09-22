@@ -305,13 +305,9 @@ def main() -> int:
             if isinstance(detail, dict):
                 print(f"    gate            {detail.get('gate')}")
                 print(f"    error           {detail.get('error')}")
-                d_ = detail.get("diagnostics") or {}
-                for kk in ("rim_points", "interface_mode",
-                           "crown_penetration_mm", "rim_separation_max_mm",
-                           "local_cast_thickness_mm", "crown_bbox",
-                           "collar_top_unresolved_points"):
-                    if kk in d_:
-                        print(f"      {kk:<30} {d_[kk]}")
+                d = detail.get("diagnostics") or {}
+                for kk in sorted(d.keys()):
+                    print(f"      {kk:<30} {d[kk]}")
             else:
                 print(f"    detail          {str(detail)[:500]}")
             print()

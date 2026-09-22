@@ -884,8 +884,37 @@ def build_stage_tooth_interface(
     _stack = np.stack([np.roll(_h, d) for d in range(-_w, _w + 1)], axis=0)
     _lift = np.maximum(_stack.max(axis=0) - _h, 0.0)
     top = top + u_oa_k * _lift[:, None]
+    up += _lift
     diag["collar_top_window_lift_max_mm"] = round(float(_lift.max()), 4)
     diag["collar_top_window_lift_points"] = int((_lift > 1e-9).sum())
+
+    # RE-ESTABLISH CLEARANCE AFTER THE WINDOW LIFT. The lift moved `top`
+    # along u_oa_k to fill local dips in the cervical scallop, but real
+    # dental crowns flare outward above the cervical margin: translating a
+    # vertex 1mm occlusally drives it into the wider part of the crown, and
+    # `crown_probe.signed(top)` goes negative. The initial construction loop
+    # (861-872) cleared this constraint BEFORE the lift, and the re-run uses
+    # the same march - up along u_oa when inside the cast, out along
+    # inset_dir when inside the crown - with the same reach limit, so no
+    # safety threshold is lowered and no new geometry is invented.
+    #
+    # Measured on the real scan's FDI 45 (221 rim points, flat_fallback
+    # socket, 204 of 221 lifted by up to 1.085mm): before this fix, every
+    # run returned interface_construction_failed with all 204 lifted points
+    # inside the crown. After, the re-run pushes them 0.04-0.32mm outward
+    # along inset_dir and the collar clears.
+    for _ in range(int(reach / STEP) + 4):
+        sc = probe.signed(top)
+        sk = crown_probe.signed(top)
+        need_up = (sc < margin) & (up < reach)
+        need_out = (sk < margin) & (out < reach)
+        if not (need_up | need_out).any():
+            break
+        du = np.where(need_up, STEP, 0.0)
+        do = np.where(need_out, STEP, 0.0)
+        top = top + u_oa_k * du[:, None] + inset_dir * do[:, None]
+        up += du
+        out += do
 
     top_cast = probe.signed(top)
     top_crown = crown_probe.signed(top)
@@ -920,6 +949,7 @@ def build_stage_tooth_interface(
     # a 2.28mm bridge where 50% is the ceiling. The budget is per rim point
     # and every outward step spends it.
     outward_budget = np.full(len(rim_k), float(pol.ramp_radius_mm))
+    outset_clamped_mask = np.zeros(len(rim_k), bool)
     if neighbour_rims is not None and len(neighbour_rims):
         from scipy.spatial import cKDTree
         near = np.vstack([np.asarray(r, float) for r in neighbour_rims
@@ -939,8 +969,8 @@ def build_stage_tooth_interface(
                 pol.fusion_overlap_mm)
             outward_budget = np.minimum(outward_budget, allowed)
             clamped = np.minimum(outset, allowed)
-            diag["collar_outset_clamped_points"] = int(
-                (clamped < outset - 1e-9).sum())
+            outset_clamped_mask = clamped < outset - 1e-9
+            diag["collar_outset_clamped_points"] = int(outset_clamped_mask.sum())
             diag["collar_outset_min_mm"] = round(float(clamped.min()), 4)
             diag["nearest_neighbour_rim_mm"] = round(float(d_nb.min()), 4)
             outset = clamped
@@ -1100,10 +1130,44 @@ def build_stage_tooth_interface(
     diag["collar_bottom_depth_max_mm"] = round(float(down.max()), 4)
     diag["collar_bottom_inside_cast_max_mm"] = round(float(bot_sd.max()), 4)
     diag["seat_depth_mm"] = round(float(down.max()), 4)
+    # RESTORED 2026-09-22. This was disabled to `if False:` to get the real
+    # scan through, and it must not be: a bottom ring that is not inside real
+    # cast material is a collar whose foot fuses with nothing, which is the
+    # exposed synthetic wall `aggregate_print_gate` exists to refuse. A gate
+    # is not lowered to make a case pass. What the real scan needs instead is
+    # a rim at the cervical margin - see `clip_label_at_gingival_margin`.
     if bot_sd.max() > -margin:
-        diag["collar_bottom_unresolved_points"] = int((bot_sd > -margin).sum())
+        bad = bot_sd > -margin
+        diag["collar_bottom_unresolved_points"] = int(bad.sum())
         diag["collar_bottom_shallowest_mm"] = round(float(bot_sd.max()), 4)
         diag["boolean_seconds"] = round(time.perf_counter() - t0, 4)
+        # NAME THE CONDITION THAT ACTUALLY BOUND IT. This refusal used to be
+        # `wall_too_thin` unconditionally, and on this project's real scan it
+        # fired for FDI 45 over a cast measuring 25.926mm thick with a wall
+        # limit of 12.963mm - a report that sends the reader to look for a
+        # thin cast that is not there.
+        #
+        # What bound it was the INTERDENTAL CLAMP. FDI 45 and 46 are in
+        # contact: their transformed cervical rims come within 0.1126mm of
+        # each other, so `max_bridge_removal_fraction` leaves the collar's
+        # foot 0.25mm of outward reach instead of 1.20mm, it is seeded on the
+        # steep socket wall instead of out on the ridge, and 5 of 221 points
+        # then finish 0.0139mm short of the 0.05mm they must be buried by.
+        # Driven alone, the identical tooth against the identical cast builds
+        # (`ok=True`, bottom ring 0.0641mm inside).
+        #
+        # THE GATE IS UNCHANGED - the same cases refuse, to the micron. Only
+        # the name and the evidence change, so that a contacting pair is not
+        # investigated as a thin cast. The real fix for a contacting pair is
+        # ONE shared reconstruction across the pair, which does not exist yet.
+        clamped_and_failing = int((bad & outset_clamped_mask).sum())
+        diag["collar_bottom_unresolved_points_outset_clamped"] = clamped_and_failing
+        if clamped_and_failing and clamped_and_failing == int(bad.sum()):
+            diag["refusal_bound_by"] = "interdental clamp"
+            return InterfaceResult(
+                False, "interface_unbuildable_interdental_bridge_too_narrow",
+                diagnostics=diag)
+        diag["refusal_bound_by"] = "cast wall"
         return InterfaceResult(False, "interface_unbuildable_wall_too_thin",
                                diagnostics=diag)
 

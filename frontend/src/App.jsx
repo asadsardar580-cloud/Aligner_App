@@ -12,7 +12,9 @@ import { ToothGizmo, pickOcclusalPlane, rootDefaultForFDI, ROOT_DEFAULTS_MM,
          toothAxes, deltaFromClinical, clinicalAtStage, stagingFor } from "./toothGizmo";
 import StagingTimeline from "./StagingTimeline";
 import ToothLegend from "./ToothLegend";
-import { installGlobalStyles } from "./theme";
+import WorkflowRail from "./WorkflowRail.jsx";
+import ToothInspector from "./ToothInspector.jsx";
+import { installGlobalStyles, prefersReducedMotion } from "./theme";
 import { useStagePlayback } from "./useStagePlayback";
 import ValidationPanel, { PASS, REVIEW, UNKNOWN } from "./ValidationPanel";
 import AttachmentPanel from "./AttachmentPanel";
@@ -350,6 +352,69 @@ function ReferenceBand({ spec, value }) {
       {band.note && <div style={{ color: "#5a616b" }}>{band.note}</div>}
     </div>
   );
+}
+
+/**
+ * The workflow, derived from state that already exists.
+ *
+ * FOUR STATES. `blocked` carries a REASON and `pending` does not, because "not
+ * yet" and "cannot, because X" are different facts - the same distinction
+ * ValidationPanel draws between a failing check and one never computed.
+ *
+ * Module scope, pure, no hooks: see WorkflowRail.jsx for why.
+ */
+function workflowSteps(st) {
+  const blocked = (reason) => ({ state: "blocked", reason });
+  const steps = [];
+
+  steps.push({ id: "biometrics", title: "Load arch",
+               ...(st.archLoaded
+                   ? { state: "done", detail: st.archDetail }
+                   : { state: "current" }) });
+
+  steps.push({ id: "biometrics", title: "Occlusal reference",
+               ...(!st.archLoaded ? blocked("load a scan first")
+                   : st.planeSet ? { state: "done" } : { state: "current" }) });
+
+  steps.push({ id: "biometrics", title: "Segment teeth",
+               ...(!st.planeSet ? blocked("set the occlusal plane first")
+                   : st.segmented
+                     ? { state: "done", detail: st.segDetail }
+                     : { state: "current" }) });
+
+  steps.push({ id: "prep", title: "Select a tooth",
+               ...(!st.segmented
+                     ? { state: st.archLoaded ? "current" : "pending" }
+                   : st.selectionCount
+                     ? { state: "done", detail: `${st.selectionCount} vertices` }
+                     : { state: "current" }) });
+
+  steps.push({ id: "cut", title: "Clinical cut",
+               ...(!st.selectionCount && !st.cutCount
+                     ? blocked("select a tooth first")
+                   : st.cutCount
+                     ? { state: "done",
+                         detail: `${st.cutCount} crown${st.cutCount > 1 ? "s" : ""}` }
+                     : { state: "current" }) });
+
+  steps.push({ id: "kinematics", title: "Movement",
+               ...(!st.cutCount ? blocked("cut a crown first")
+                   : st.staged
+                     ? { state: "done", detail: `${st.stageCount} stages` }
+                   : st.activeTooth ? { state: "current" }
+                   : { state: "pending" }) });
+
+  steps.push({ id: "attachments", title: "Attachments",
+               ...(!st.cutCount ? blocked("cut a crown first")
+                   : st.attachmentCount
+                     ? { state: "done", detail: `${st.attachmentCount} placed` }
+                     : { state: "pending" }) });
+
+  steps.push({ id: "export", title: "Validate & export",
+               ...(!st.staged ? blocked("prescribe a movement first")
+                   : { state: "current" }) });
+
+  return steps.map((x, i) => ({ ...x, key: `${x.id}-${i}` }));
 }
 
 export default function App() {
@@ -2416,6 +2481,70 @@ export default function App() {
     if (!sid) return;
     
     setActive(hit.archName);
+    // CLICKING A TOOTH SELECTS THAT TOOTH, FROM THE SEGMENTATION LABELS.
+    // The wand is the CORRECTION tool, not the selection tool, and the
+    // measurement is what decides it: on this project's real scan the wand's
+    // auto tolerance returns 25.00 mm for every one of the sixteen teeth and
+    // floods a quarter of the arch, because `snap_seed_to_ridge` moves the
+    // seed to the nearest high-concavity point, which is the interdental
+    // sulcus BETWEEN two teeth. Measured over all sixteen, same click points:
+    //
+    //     label route   100.0% of the selected vertices belong to the tooth
+    //     wand route     15.7%, taking 25.3% of the arch per click
+    //
+    // Falls through to the wand when there is nothing to read - the arch has
+    // not been segmented, or the click landed on gingiva - so the manual
+    // route is never removed, only stopped from being mandatory.
+    if (labels.current[hit.archName]) {
+      setStatus("Selecting tooth...");
+      try {
+        const r = await fetch(`${API}/api/session/${sid}/select-tooth`, {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({point: [hit.point.x, hit.point.y, hit.point.z]}),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d.fdi && d.vertex_ids.length) {
+            setSelection(d.vertex_ids);
+            highlightSelection(arches.current[hit.archName].geometry, d.vertex_ids);
+            // Landmarks belong to the tooth that was selected, not to the one
+            // before it, and a stale pair silently cuts the wrong shape.
+            setMesialPt(null);
+            setDistalPt(null);
+            const rev = reviewByFdi.current[d.fdi];
+            if (rev?.blocks_auto_cut) {
+              setPickMode("mesial");
+              setReviewFlag({ fdi: d.fdi, confidence: rev.confidence,
+                              threshold: rev.auto_cut_threshold,
+                              failed: rev.failed_factors || [],
+                              action: rev.action });
+            } else {
+              setReviewFlag(null);
+            }
+            const split = d.largest_component_fraction != null &&
+                          d.largest_component_fraction < 0.95;
+            setStatus(`Tooth ${d.fdi} selected — ${d.vertex_ids.length} vertices, `
+              + `${d.kept_faces} faces`
+              + (d.discarded_faces ? `, ${d.discarded_faces} stray face(s) dropped` : "")
+              + (split ? " — REVIEW: this label is in more than one piece" : "")
+              + ". Use the wand or brush to correct it.");
+            fetch(`${API}/api/session/${sid}/selection`, {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({vertex_ids: d.vertex_ids}),
+            });
+            return;
+          }
+          if (d.route === "gingiva") {
+            setStatus("That point is gingiva. Click a tooth, or drag with the brush.");
+            return;
+          }
+        }
+      } catch {
+        // A failed lookup must not strand the clinician: fall through to the
+        // wand, which needs no segmentation at all.
+      }
+    }
+
     setStatus("Calculating boundaries...");
     
     const res = await fetch(`${API}/api/session/${sid}/wand`, {
@@ -2428,7 +2557,17 @@ export default function App() {
       setTolerance(data.tolerance); 
       setSelection(data.vertex_ids);
       highlightSelection(arches.current[hit.archName].geometry, data.vertex_ids);
-      setStatus(`Selected ${data.vertex_ids.length} vertices. (Auto-tolerance: ${data.tolerance.toFixed(1)})`);
+      // The backend now says whether that tolerance was MEASURED or is just
+      // the scan's ceiling. On this project's real scan no plateau is found on
+      // any tooth, so the wand returns 25.0 mm and floods a quarter of the
+      // arch - and the old message presented that as an auto-tolerance.
+      setStatus(data.tolerance_is_a_ceiling_not_a_measurement
+        ? `Selected ${data.vertex_ids.length} vertices `
+          + `(${(data.selected_fraction_of_arch * 100).toFixed(1)}% of the arch) — `
+          + `NO tooth boundary was found, so ${data.tolerance.toFixed(1)} mm is the `
+          + `search ceiling, not a measurement. Click the tooth itself to select it, `
+          + `or set a tolerance by hand.`
+        : `Selected ${data.vertex_ids.length} vertices. (Auto-tolerance: ${data.tolerance.toFixed(1)})`);
 
       // CONFIDENCE GATE. If the model's label for this region is below the
       // auto-cut threshold, the FDI is not reliable enough to choose the root
@@ -2489,6 +2628,74 @@ export default function App() {
             {health.detail ? <span style={{ color: "#8b93a0" }}> — {health.detail}</span> : null}
           </span>
         </div>
+
+        {/* THE WORKFLOW, AND THE TOOTH. Seven accordion headings described
+            the workflow's ORDER and never its STATE - a restored case showed
+            seven closed panels and the clinician opened each one to find out
+            where they were. Both components are pure and take summaries; the
+            94,848-integer label array stays in its ref. */}
+        <WorkflowRail
+          steps={workflowSteps({
+            archLoaded: !!sessions[active],
+            archDetail: sessions[active]?.vertices
+              ? `${sessions[active].vertices.toLocaleString()} verts`
+              : null,
+            planeSet: !!archFrame,
+            segmented: !!(legend && legend.size > 0),
+            segDetail: legend && legend.size > 0
+              ? `${legend.size} teeth` : null,
+            selectionCount: selection.length,
+            cutCount: Object.keys(teeth.current).length,
+            activeTooth,
+            staged: staging.total > 0,
+            stageCount: staging.total,
+            attachmentCount: placedAttachments.length,
+          })}
+          onSelect={(id) => {
+            const el = document.querySelector(`[data-state][value="${id}"]`)
+              || document.getElementById(`panel-${id}`);
+            el?.scrollIntoView({ block: "nearest",
+                                 behavior: prefersReducedMotion() ? "auto" : "smooth" });
+          }}
+        />
+
+        {(selection.length > 0 || activeTooth) && (
+          <ToothInspector
+            fdi={activeTooth
+              ? (teeth.current[activeTooth]?.fdi ?? null)
+              : fdiForSelection(selection)}
+            vertexCount={selection.length || null}
+            faceCount={null}
+            diagnostics={(() => {
+              const f = activeTooth
+                ? teeth.current[activeTooth]?.fdi
+                : fdiForSelection(selection);
+              if (f == null || !segDiagnostics?.teeth) return null;
+              return segDiagnostics.teeth.find((r) => r.label === f) || null;
+            })()}
+            review={(() => {
+              const f = activeTooth
+                ? teeth.current[activeTooth]?.fdi
+                : fdiForSelection(selection);
+              return f == null ? null : (reviewByFdi.current[f] || null);
+            })()}
+            rootLengthMm={activeTooth
+              ? teeth.current[activeTooth]?.root_length_mm ?? null
+              : (() => {
+                  const f = fdiForSelection(selection);
+                  return f == null ? rootLength : rootDefaultForFDI(f);
+                })()}
+            rootLengthSource={(() => {
+              const f = activeTooth
+                ? teeth.current[activeTooth]?.fdi
+                : fdiForSelection(selection);
+              return f == null ? "session default" : `FDI ${f} (Wheeler)`;
+            })()}
+            prescription={activeTooth ? kinematics : null}
+            moved={!!activeTooth && staging.total > 0}
+            stage={stage || null}
+          />
+        )}
 
         <Panel id="biometrics" step="1" title="Arches & Biometrics">
           {["maxillary", "mandibular"].map((a) => (

@@ -258,6 +258,138 @@ def test_first_occurrence_order_is_what_a_dedup_loader_produces():
           f"({len(mine)} vertices) and differs from the app's array")
 
 
+# ===========================================================================
+# TWO PROVIDERS, TWO INTERNAL ORDERINGS, ONE CANONICAL MESH
+#
+# The application's mesh is whatever `condition_mesh` produced, and NOTHING a
+# provider does to its own copy may become that. The two installed providers
+# get there by genuinely different routes:
+#
+#   ToothGroupNetwork   writes an OBJ, a loader reads it back in ITS order,
+#                       and the labels come home by POSITION
+#   CrossTooth          classifies FACES and maps them home by COORDINATE
+#                       (a 3-neighbour KNN on cell centroids)
+#
+# so neither one's array is canonical, and a regression has to prove that
+# holds even when the orderings differ at every index.
+# ===========================================================================
+
+def _two_tooth_mesh():
+    """Two separated blocks: unambiguous labels, real face connectivity."""
+    import trimesh
+    a = trimesh.creation.box(extents=(6, 6, 6))
+    b = trimesh.creation.box(extents=(6, 6, 6))
+    b.apply_translation([20.0, 0.0, 0.0])
+    m = trimesh.util.concatenate([a, b])
+    v = np.asarray(m.vertices, float)
+    f = np.asarray(m.faces, np.int64)
+    lab = np.where(v[:, 0] > 10.0, 41, 31).astype(np.int64)
+    return v, f, lab
+
+
+def test_two_providers_with_DIFFERENT_internal_orderings_agree_on_the_mesh():
+    """The regression the whole module exists for, stated as two providers.
+
+    Provider A is given the canonical array and hands its labels back in a
+    SHUFFLED order - the ToothGroupNetwork hazard, where a loader reorders
+    and every count check still passes. Provider B never indexes an array at
+    all; it labels geometry and the labels come home by coordinate - the
+    CrossTooth route. Both must land on the same canonical labels.
+
+    If this ever fails, the symptom in the product is not an exception. It is
+    teeth scattered across the arch, which reads as a bad model: measured on
+    the real scan, the median per-tooth bounding box was 50.71 mm against
+    13.97 mm, and that was reported as a segmentation failure for a model
+    that had segmented correctly.
+    """
+    v, f, truth = _two_tooth_mesh()
+
+    # --- provider A: a different ORDER, same points -------------------
+    perm = np.random.default_rng(4).permutation(len(v))
+    a_verts, a_labels = v[perm], truth[perm]
+    assert not np.array_equal(a_verts, v), "the fixture did not reorder"
+    moved_a, info_a = sp.transfer_labels_by_position(a_verts, a_labels, v)
+    assert info_a["identity"] is False
+    assert info_a["reordered_vertices"] == int((perm != np.arange(len(v))).sum())
+    assert info_a["max_position_gap_mm"] == 0.0
+    np.testing.assert_array_equal(moved_a, truth)
+
+    # --- provider B: no ordering at all, labels carried by coordinate --
+    from sklearn.neighbors import KNeighborsClassifier
+    cent = v[f].mean(axis=1)
+    cell_lab = truth[f[:, 0]]
+    keep = np.random.default_rng(9).permutation(len(cent))[: len(cent) // 2]
+    knn = KNeighborsClassifier(n_neighbors=3).fit(cent[keep], cell_lab[keep])
+    moved_b = knn.predict(v).astype(np.int64)
+    np.testing.assert_array_equal(moved_b, truth)
+
+    # --- the point: two routes, one answer ----------------------------
+    np.testing.assert_array_equal(moved_a, moved_b)
+    for moved in (moved_a, moved_b):
+        rep = sd.label_report(v, f, moved)
+        assert rep["indexed_to_this_mesh"] is True
+        assert {r["label"] for r in rep["teeth"]} == {31, 41}
+    print(f"PASS  a shuffled-order provider and a coordinate-keyed provider "
+          f"agree on all {len(v)} canonical vertices")
+
+
+def test_the_fixture_REPRODUCES_the_defect_when_the_transfer_is_skipped():
+    """Read by INDEX, the same labels are wrong. Otherwise nothing is tested.
+
+    CLAUDE.md section 5 records the rule: verify a fixture reproduces the bug
+    before trusting the regression that it passes.
+    """
+    v, f, truth = _two_tooth_mesh()
+    perm = np.random.default_rng(4).permutation(len(v))
+    by_index = truth[perm]                       # what a length check accepts
+
+    assert len(by_index) == len(v), "the count agrees - that is the trap"
+    assert sorted(np.bincount(by_index)) == sorted(np.bincount(truth)),         "the per-label COUNTS agree too"
+    wrong = int((by_index != truth).sum())
+    assert wrong > 0, "the fixture did not reproduce the defect"
+
+    rep = sd.label_report(v, f, by_index)
+    diag = max(r["bbox_diagonal_mm"] for r in rep["teeth"])
+    good = sd.label_report(v, f, truth)
+    diag_ok = max(r["bbox_diagonal_mm"] for r in good["teeth"])
+    assert diag > diag_ok * 1.5, (diag, diag_ok)
+    print(f"PASS  by index: {wrong} of {len(v)} labels wrong, largest tooth "
+          f"box {diag:.2f} mm against {diag_ok:.2f} mm correct - and every "
+          f"count check passes")
+
+
+def test_a_providers_array_is_NEVER_written_back_as_the_session_mesh():
+    """Static: no provider result may be stored as `verts`.
+
+    `transfer_labels_by_position` makes the ORDER irrelevant, and this makes
+    sure nobody sidesteps it by adopting the provider's array instead - which
+    would be the tidy-looking fix and would silently invalidate every vertex
+    id the client holds, the extraction mask, and the brush index (s.6).
+    """
+    import ast
+
+    src = open("api_core.py", encoding="utf-8").read()
+    tree = ast.parse(src)
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = ast.dump(node.func)
+        if "STORE" not in fn or "'put'" not in fn:
+            continue
+        if len(node.args) < 3:
+            continue
+        key = node.args[1]
+        if not (isinstance(key, ast.Constant) and key.value in
+                ("verts", "faces")):
+            continue
+        val = ast.dump(node.args[2])
+        if "used_verts" in val or "provider" in val or "result.labels" in val:
+            bad.append((key.value, node.lineno))
+    assert not bad, f"a provider array is being stored as the mesh: {bad}"
+    print("PASS  no provider array is ever stored as `verts` or `faces`")
+
+
 if __name__ == "__main__":
     import sys
     failures = []

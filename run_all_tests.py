@@ -34,6 +34,8 @@ TESTS = [
     ("manufacturing matrix", "test_manufacturing_matrix.py"),
     ("segmentation mapping", "test_segmentation_mapping.py"),
     ("crosstooth provider",  "test_crosstooth_adapter.py"),
+    ("click-to-select",      "test_click_to_select.py"),
+    ("pointops shim",        "verify_pointops.py"),
     ("face order",           "test_face_order.py"),
     ("auto colour",          "test_auto_color.py"),
     ("bleed fix",            "test_bleed_fix.py"),

@@ -159,12 +159,20 @@ def format_report(rep):
                f"{rep.get('n_vertices')} vertices; median tooth box diagonal "
                f"{rep.get('median_bbox_diagonal_mm')} mm")
     out.append(f"{'label':>6} {'verts':>7} {'faces':>7}  "
-               f"{'bbox (mm)':>22} {'diag':>7} {'parts':>6} {'largest':>8}")
+               f"{'bbox (mm)':>22} {'diag':>7} {'parts':>6} {'largest':>8} "
+               f"{'size':>6} {'review':>7}")
     for r in rep.get("teeth", []):
         bb = r["bbox_mm"]
-        flag = "  " if (r["plausible_size"] and r["connected"]) else "<<"
+        # SAY WHICH TEST FAILED, not just THAT one did. The old column was a
+        # bare "<<" for either condition, so a tooth of implausible SIZE - two
+        # teeth merged into one label - read identically to one that is merely
+        # in two PIECES, which is the far more common and far less serious
+        # case. They lead to different actions.
+        size = "ok" if r["plausible_size"] else "BIG"
+        review = "ok" if (r["plausible_size"] and r["connected"]) else "REVIEW"
         out.append(f"{r['label']:>6} {r['vertices']:>7} {r['faces']:>7}  "
                    f"{bb[0]:>6.2f} x{bb[1]:>6.2f} x{bb[2]:>6.2f} "
                    f"{r['bbox_diagonal_mm']:>7.2f} {r['components']:>6} "
-                   f"{str(r['largest_component_fraction']):>8} {flag}")
+                   f"{str(r['largest_component_fraction']):>8} "
+                   f"{size:>6} {review:>7}")
     return "\n".join(out)

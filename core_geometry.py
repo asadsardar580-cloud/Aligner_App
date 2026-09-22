@@ -5104,6 +5104,40 @@ def _fill_interior_holes(verts: np.ndarray, faces: np.ndarray):
     return verts, faces, filled, outer
 
 
+def distance_to_arch_curve(points: np.ndarray, arch_frame: dict,
+                           curve: np.ndarray | None = None,
+                           verts: np.ndarray | None = None) -> np.ndarray:
+    """Distance from each point to the fitted occlusal ridge, in the arch plane.
+
+    This is EXACTLY the quantity `trim_to_arch` compares against `margin_mm`,
+    exposed so a caller can ask "would the trim keep this?" rather than
+    reimplement the basis and the densification and drift from it.
+
+    It exists because the trim can cut the cast out from under a socket rim
+    and nothing downstream could see that it had. Measured on this project's
+    real scan, FDI 46 (a first molar) at the shipped 7.0mm margin: 53 of its
+    280 cervical rim points ended up as much as 1.2961mm OUTSIDE the finished
+    cast, and `build_stage_tooth_interface` then refused
+    `interface_unbuildable_wall_too_thin` with 40 unresolvable points - a
+    correct refusal about geometry that had been deleted, reported as though
+    the cast were too thin. At 9.0mm: 0 points outside, and the interface
+    builds. The local cast thickness is 2.8573mm at both margins, so
+    thickness was never the variable.
+    """
+    pts = np.asarray(points, float).reshape(-1, 3)
+    if curve is None:
+        if verts is None:
+            raise ValueError("distance_to_arch_curve needs `curve`, or `verts` "
+                             "to fit one from.")
+        curve, _ = fit_arch_curve(np.asarray(verts, float), arch_frame)
+    samples = _polyline_samples(np.asarray(curve, float))
+    origin, e1, e2, _ = _arch_basis(arch_frame)
+    rel = pts - origin
+    from scipy.spatial import cKDTree
+    dist, _ = cKDTree(samples).query(np.column_stack([rel @ e1, rel @ e2]))
+    return np.asarray(dist, float)
+
+
 def trim_to_arch(verts: np.ndarray, faces: np.ndarray, arch_frame: dict,
                  margin_mm: float = ARCH_TRIM_MARGIN_MM,
                  curve: np.ndarray | None = None):

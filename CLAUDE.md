@@ -37,6 +37,8 @@ python -m pytest -q                     # runs alongside; both must pass
 python bench_signed_distance.py         # scores the signed-distance method
 python real_scan_regression.py          # the real scan, end to end — see §23, §24.7
 python benchmark_providers.py           # every segmentation model, one scan — §25
+python verify_pointops.py               # the CPU pointops shim, against upstream - s26.1
+python -m pytest test_click_to_select.py        # click a tooth, get that tooth - s26.4
 python -m pytest test_segmentation_mapping.py   # labels belong to the mesh — §24.3
 node frontend/verify-kinematics.mjs     # cross-language kinematics pin
 node frontend/verify-palette.mjs        # 32 distinct FDI colours — §24.5
@@ -1010,6 +1012,14 @@ Covered by `test_failsafes.py` (18), `test_telemetry.py` (12) and
 * `u_bl` is pinned buccal from the arch frame, so `u_md`'s sign varies by quadrant (unavoidable — the arch is mirror-symmetric). The frame reports `u_md_points_distal`; the sliders do not yet use it.
 * **A pinched cast rim loses a small spur.** `_open_pinch_vertices` deletes the smaller fan at a neck, and `/cut` drops the smaller lobe of a self-touching socket rim. Both are a handful of triangles and both are recorded, but neither is reconstructed.
 * **`trim_to_arch` is not stable on a very coarse mesh.** Measured: at ~18 samples across the band the trim nearly severs the arch and `np.bincount(labels).argmax()` picks a different largest component under rotation — an 80% volume swing. Unreachable at scan density (187k faces across the same band) and worth remembering before anyone decimates a scan upstream.
+* **SUPERSEDED 2026-09-22 by s.26.8 - the reconstruction now BUILDS on a real crown and
+  reaches a written, re-read STL.** FDI 45 goes STL -> occlusal plane -> segmentation ->
+  click-to-select (100% purity) -> cut -> C_res movement -> local cast reconstruction ->
+  staged fused solid -> written STL -> reread, closed, one component, ZERO open edges.
+  It is still NOT PRINT READY: four aggregate gates fail, and the one the forensics can
+  localise is a single 0.09515mm self-touching edge whose four incident faces are all
+  ORIGINAL_CAST. The wand is still not the route and no longer needs to be (s.26.4).
+  The text below is kept because it is what the numbers used to say.
 * **UPDATED 2026-09-21 — real crowns now cut; the MANUFACTURING RECONSTRUCTION on them does
   not yet build.** The old text here said no real crown could be produced headlessly, and that
   was a consequence of the label-mapping defect (§24.3), not of the scan. With the labels
@@ -2663,3 +2673,397 @@ walk** (99/99).
 
 Covered by `test_crosstooth_adapter.py` (32), `benchmark_providers.py` and
 `crosstooth_bridge.py`.
+
+## 26. RESOLVED: THE NEIGHBOURHOOD SEARCH, THE TRIM, AND THE CLICK
+
+Five defects, and four of them reported themselves as something else: a model
+that segments badly, a cast that is too thin, a knife-edge rim, and a tooth
+boundary that was never found. The fifth never reported at all.
+
+### 26.1 `pointops_cpu` returned the wrong neighbours, in two independent ways
+
+Both networks in this repository are Point Transformers, and every layer of
+both is a k-nearest-neighbour gather. The CPU shim they run on here was wrong
+twice, and neither fault raises: **a neighbourhood search that returns the
+wrong neighbours does not crash, it produces a model that segments badly,
+which is indistinguishable from a model that is not very good.**
+
+**1. `torch.cdist` in float32 cancels catastrophically at scanner
+coordinates.** It computes the matrix-multiply expansion
+`||a||² + ||b||² − 2a·b`, and rule 3.1 means this repository NEVER re-centres
+a scan — the coordinates are wherever the scanner put them. Measured on
+`case_lower.stl`, 2,000 queries into 16,000 points, k=16, against an exact
+float64 reference:
+
+| offset from origin | f32, mm | f32, `donot_use_mm` | f64, mm |
+|---|---|---|---|
+| 0.0 mm | **20 wrong rows** | 0 | 0 |
+| 37.1 mm (this scan) | **94** | 0 | — |
+| 137.5 mm (what `test_api_core` pins) | **551** | 1 | 1 |
+| 500.0 mm | **1917** | 2 | 2 |
+| ms per 1000×16000 block | 53.8 | 137.9 | **104.2** |
+
+**FLOAT64 IS BOTH THE MOST ACCURATE AND THE FASTER OF THE TWO CORRECT
+OPTIONS**, because it keeps the BLAS matmul path while `donot_use_mm_for_
+euclid_dist` materialises an (m, n, 3) difference tensor. The first choice
+made here was `donot_use_mm`, which is correct and made a TGN segmentation
+886.81 s; float64 brought it to **369.87 s**. `_KNN_BLOCK_ELEMS` halved to
+8,000,000 so a float64 distance matrix costs the same peak bytes as the
+float32 one did, not twice as many.
+
+**2. `interpolation` weighted by inverse SQUARED distance.** The upstream
+wrapper returns `sqrt(dist2)` and weights by `1/(d + 1e-8)`; this module kept
+the squared value, declared that it had with `KNN_RETURNS_SQUARED_DISTANCE`,
+and then **ignored its own flag**. That is a different interpolation, and
+`TransitionUp` calls it on four of five decoder stages in both networks. k=1
+was unaffected either way — a single weight normalises to 1.0 — which is why
+`heads.py:50` never showed it.
+
+**It was confined to this one function, and that was PROVEN rather than
+assumed.** `verify_pointops.py` AST-walks `pointops_cpu.py`,
+`crosstooth_bridge.py`, `ToothGroupNetwork/models`, `CrossTooth/models` and
+`CrossTooth/compete` for every `a, b = knnquery(...)` and classifies each as
+discards / converts / **READS IT RAW**: 7 call sites, all safe. The rest of
+the file is checked against independent NumPy references written from the
+vendored upstream wrapper.
+
+**The correction is visible in the output.** ToothGroupNetwork went from 11
+teeth to 12 on this scan, and from 4 of 11 in one connected piece to 7 of 12.
+
+### 26.2 The arch trim deleted the cast out from under a molar's rim
+
+`interface_unbuildable_wall_too_thin` on FDI 46, over a cast measuring
+**2.8573 mm** thick. The refusal was arithmetically correct and named the
+wrong thing: the cast was not thin, it was **absent**.
+
+`build_cast_base` keeps the horseshoe band within `ARCH_TRIM_MARGIN_MM` of the
+fitted ridge. §10 chose 7.0 from whole-arch measurements that are still right.
+What they do not describe is a wide molar, whose cervical rim reaches further
+from the ridge than the band does — FDI 46's rim reaches **9.385 mm**.
+Measured, same scan, same tooth, same everything else:
+
+| margin | rim points outside the cast | max outside | interface |
+|---|---|---|---|
+| **7.0** | **53 of 280** | **1.2961 mm** | REFUSED, 40 points |
+| 9.0 | 0 | 0.0000 mm | **ok** |
+| 12.0 | 0 | 0.0000 mm | ok |
+| 15.0 | 0 | 0.0000 mm | ok |
+
+and `local_cast_thickness_mm` reads 2.8573 at **every** one of those margins,
+so thickness was never the variable.
+
+**THE MARGIN IS NOT RAISED GLOBALLY.** That would undo a measured decision to
+make one case pass and loosen the trim for every case that never needed it.
+`build_stage_bundle` computes a FLOOR from the rims that actually exist —
+`max(distance_to_arch_curve(rim)) + seat_bottom_outset_mm +
+TRIM_RIM_HEADROOM_MM` — raises the margin only if the request is below it, and
+records `margin_requested_mm`, `margin_used_mm`,
+`margin_raised_for_socket_rims` and `socket_rim_max_distance_to_ridge_mm` in
+the manifest. Measured: FDI 46 present → 7.0 raised to **11.585 mm**; FDI 45
+alone (rims reach 4.106 mm) → **7.0 left exactly as it was**.
+
+`cg.distance_to_arch_curve` exists so the floor is built on the trim's OWN
+quantity rather than a reimplementation of it, and a test asserts no face the
+helper puts outside the band survives the trim at 4, 7 and 11 mm.
+
+### 26.3 §24.7's open question is answered, and the answer is that the probe was aimed at the wrong object
+
+§24.7 recorded `local_cast_thickness_mm` **0.0155** on FDI 45 and asked
+whether reducing the rim's thickness profile with `np.nanmin` is defensible,
+calling it "the next piece of work". The follow-up measurement on the raw scan
+looked worse still — 196 of 221 rim points with no cast beneath them, minimum
+0.1178 mm — and that reading is an **artefact**.
+
+**An intraoral scan is an OPEN SHELL.** A ray dropped from a cervical rim
+point runs down the OUTSIDE of the gingival wall and hits nothing, so the
+misses measure the scan's topology, not the cast's thickness. Against the
+solid the manufacturing path actually builds:
+
+| | rim points | no cast below | min | p10 | median |
+|---|---|---|---|---|---|
+| FDI 45, probed on the raw scan | 221 | **196** | 0.1178 | 0.1717 | 0.2990 |
+| FDI 45, probed on the cast base | 221 | **0** | **25.6760** | 26.0392 | 27.5319 |
+| FDI 46, probed on the raw scan | 280 | **226** | 0.2446 | 1.4435 | 4.0355 |
+| FDI 46, probed on the cast base | 280 | **0** | **2.8573** | 5.9982 | 26.3189 |
+
+**SO `np.nanmin` IS NOT THE PROBLEM AND THE REDUCTION IS LEFT ALONE.** There
+is no knife-edge under those rims. §24.7's question was well posed against the
+number it had; the number was measuring a different object. The `local_
+thickness` fix in §24.2 — a ray miss returns NaN rather than 0.0 — remains
+correct and is what made the artefact legible instead of silent.
+
+### 26.4 Clicking a tooth selects that tooth
+
+The workflow the product is for is *click a tooth → the whole tooth is
+selected*. Until now `onPointerDown` went straight to `/wand`, so the geodesic
+flood was the only route, and §19 has recorded since Phase 5 that it does not
+isolate a tooth on this scan. Measured over all sixteen teeth, clicking each
+tooth's own surface:
+
+| route | of the selected vertices, how many are the clicked tooth |
+|---|---|
+| segmentation label (`POST /select-tooth`) | **100.0%** |
+| geodesic wand | 15.7%, taking 25.3% of the arch per click |
+
+`/select-tooth` reads the label under the click and returns that label's own
+**largest connected component** — the same rule tier 2 of `segmentation_
+fallback` already uses, because a label carries a handful of triangles on its
+neighbour and a crown built from two disconnected pieces cannot close
+watertight. It refuses 409 on an unsegmented arch and points at the wand, 400
+on an out-of-range vertex id (**a negative id must not select from the end of
+the array** — §14 records that exact defect in `/cut`), 500 on a label array
+of the wrong length, and returns `route: "gingiva"` with `fdi: null` on
+tissue. **The brush and the wand are untouched**; they are the CORRECTION
+tools now, not the selection tool.
+
+### 26.5 The wand's auto tolerance was a search ceiling wearing a measurement's name
+
+`cut_guard.auto_tolerance` scans 1.0 to 25.0 mm for a plateau in the flood's
+growth — the sulcus barrier — and when there is none it returns its own
+CEILING with `plateau_found: False`. **`/wand` computed that flag and dropped
+it**, returning `tolerance: 25.0` in the same field a found plateau uses. On
+this scan the ceiling comes back for all sixteen teeth.
+
+The flood is NOT changed — the wand needs no segmentation at all and refusing
+here would break the one route that works without it. What changed is that the
+response carries `plateau_found`, `tolerance_is_a_ceiling_not_a_measurement`
+and `selected_fraction_of_arch`, and the client says so in words instead of
+reporting an auto-tolerance.
+
+### 26.6 A contacting pair refuses, and it now refuses under its own name
+
+FDI 45 builds `ok=True` driven alone. In an export that also moves FDI 46 it
+refused `interface_unbuildable_wall_too_thin` — over a cast **25.926 mm**
+thick with a wall limit of 12.963 mm, which sends the reader to look for a thin
+cast that is not there.
+
+What bound it is the INTERDENTAL CLAMP. The two teeth are in contact: their
+transformed cervical rims come within **0.1126 mm**, so
+`max_bridge_removal_fraction` leaves the collar's foot **0.25 mm** of outward
+reach instead of 1.20 mm, it is seeded on the steep socket wall rather than out
+on the ridge, and **5 of 221 points finish 0.0139 mm short** of the 0.05 mm
+they must be buried by. Same for 46 against 45: 5 of 280, short by 0.0427 mm.
+
+**THE GATE IS UNCHANGED — the same cases refuse, to the micron.** Only the
+name and the evidence changed: `interface_unbuildable_interdental_bridge_too_
+narrow`, with `collar_bottom_unresolved_points_outset_clamped` and
+`refusal_bound_by`. The real fix for a contacting pair is ONE shared
+reconstruction across the pair, which the original plan contemplated and which
+does not exist. **It is recorded as missing rather than approximated**, and no
+threshold was moved toward it.
+
+> **A gate was found disabled and has been restored.** `manufacturing.py`'s
+> bottom-ring check had been edited to `if False:` to get the real scan
+> through. A bottom ring not inside real cast material is a collar whose foot
+> fuses with nothing — the exposed synthetic wall `aggregate_print_gate`
+> exists to refuse. The other edit in the same pass, the window-lift clearance
+> re-establishment, is KEPT: it re-runs the identical march the construction
+> loop already performs, with the same reach limit, and it is what unblocked
+> FDI 45 (204 of 221 lifted points were left inside the crown by the window
+> lift, and `interface_construction_failed` was the result).
+
+### 26.7 The forensics built for this had never once run
+
+`edge_forensics` measures the whole serialisation chain and attributes every
+offending edge to the geometry that made it. On the real scan it reported
+`ran: false, reason: "IndexError: index 168560 is out of bounds for axis 0
+with size 168560"`.
+
+`stage_labels` is re-indexed onto the WELDED faces twenty lines after
+`_pre_weld_v, sf_pre_weld = sv, sf`, so the call handed it **168,562 pre-weld
+faces and a 168,560-entry post-weld label array**. The exception was swallowed
+by the try/except around the call, and the manifest said the forensics did not
+run — so the one tool that can name the source of an offending edge was
+silently absent on exactly the stages that have one. The comment four lines
+above the capture already warns about this class of mistake; it happened
+anyway, at the call site. `_pre_weld_labels` is captured with the arrays it
+belongs to.
+
+**A guard that reports its own failure as "did not run" is a guard nobody will
+chase.**
+
+### 26.8 The real scan, end to end
+
+`STL → occlusal plane → CrossTooth segmentation → click-to-select → cut →
+C_res movement → local cast reconstruction → staged fused solid → written STL
+→ reread` **now completes on `case_lower.stl`.** This is the first time a real
+crown has reached a written, re-read manufacturing STL.
+
+FDI 45, 0.25 mm extrusion, 1 stage, on the real mandible:
+
+| | |
+|---|---|
+| segmentation | 16 teeth, `indexed_to_this_mesh: true`, median box 13.248 mm |
+| click-to-select | 3,178 vertices, 6,133 faces, **purity 100.0%** |
+| cut | crown 3,179 verts, rim 221, socket `flat_fallback` |
+| trim margin | 7.0 requested, 7.0 used (rims reach 4.106 mm) |
+| cast base | 162,596 faces, 28,841.727 mm³ |
+| interface | **built** — connector 241.0982 mm³, connector∩cast 163.3153 mm³ |
+| fused stage | 168,560 triangles, 28,954.8856 mm³, closed, 1 component |
+| open edges | **0**, before and after the weld and after the reread |
+| **NOT PRINT READY** | 4 gates: `written_stl_topology`, `body_count_agrees_with_stl`, `no_self_touching_boundary`, `old_site_restored` |
+
+Gates that PASSED, and they are not trivial: synthetic exposure 0.0066,
+exposed clearance wall 0.0 mm², unaffected-cast fidelity **0.0 mm in both
+directions**, reconstruction inside the envelope 0.0, every interface built,
+interface continuous around the rim.
+
+**THE REMAINING BLOCKER IS ONE EDGE, AND THE FORENSICS NAMES IT.** Edge
+163183, **0.09515 mm** long, four incident faces of 0.0111 / 0.0017 / 0.0047 /
+0.0088 mm², whose normals come in two pairs identical to four decimals —
+`[-0.8727, 0.0595, 0.4846]` twice and `[-0.9155, 0.0618, 0.3976]` twice. That
+is two sheets of surface lying on each other. Provenance:
+**`ORIGINAL_CAST` on all four faces.** Zero non-manifold edges before our
+export weld, one after, and the reader's weld then merges nothing further —
+so the weld is what expresses it, and the geometry is what carries it.
+
+**IT IS NOT INHERITED FROM THE CAST.** Asked directly, with no tooth cut at
+all: the trimmed, extruded cast base has **0 coincident position groups, 0
+zero-area triangles and 0 non-manifold edges after the export weld, at margins
+7.0, 9.0 and 11.585**, and the conditioned scan rounded to float32 has 0 as
+well. The self-touch is created by the union, where the collar's wall leaves
+the cast 0.38 mm outside the target rim's bounding box.
+
+`collapse_short_nonmanifold_edges` caps at 0.05 mm — scanner resolution is
+20–50 µm — and correctly refuses a 0.09515 mm edge. **The cap was not raised.**
+This is the §23 grazing-contact class on real anatomy, at one point, and
+closing it needs the connector's exit from the cast to cross transversally
+there, which is geometry work and not a threshold.
+
+### 26.9 The per-tooth verification table, CrossTooth, `case_lower.stl`
+
+16 teeth over 94,848 vertices, median box diagonal **13.248 mm**,
+`indexed_to_this_mesh: true`.
+
+```
+ label   verts   faces               bbox (mm)    diag  parts  largest   size  review
+    31    1938    3606    5.66 x  6.19 x  6.70   10.73      2   0.9964     ok  REVIEW
+    32    2339    4395    6.77 x  6.57 x  7.99   12.36      1      1.0     ok      ok
+    33    2949    5689    6.75 x  7.86 x  8.61   13.47      1      1.0     ok      ok
+    34    3231    6284    7.13 x  7.31 x  7.53   12.69      1      1.0     ok      ok
+    35    3306    6385    8.29 x  8.06 x  6.02   13.03      1      1.0     ok      ok
+    36    6264   12197   12.07 x 11.43 x  6.37   17.80      2   0.9999     ok  REVIEW
+    37    5253   10158   11.51 x 11.49 x  6.26   17.43      2   0.9999     ok  REVIEW
+    38    4001    7698   10.58 x  9.79 x  4.51   15.11      1      1.0     ok      ok
+    41    1964    3682    5.82 x  6.29 x  7.39   11.31      1      1.0     ok      ok
+    42    2201    4114    6.04 x  6.91 x  7.24   11.69      2   0.9886     ok  REVIEW
+    43    2759    5200    7.07 x  8.06 x  8.40   13.62      1      1.0     ok      ok
+    44    2773    5333    7.20 x  7.31 x  7.68   12.82      2   0.9998     ok  REVIEW
+    45    3186    6135    7.75 x  7.50 x  6.60   12.65      1      1.0     ok      ok
+    46    6204   12093   11.04 x 11.39 x  6.64   17.20      1      1.0     ok      ok
+    47    5046    9768   11.24 x 10.98 x  6.25   16.91      1      1.0     ok      ok
+    48    5653   10962   10.98 x 11.03 x  5.21   16.41      1      1.0     ok      ok
+```
+
+**Every tooth is of plausible size** — no label spans two teeth, which is the
+failure §24.3's corrected mapping left behind on ToothGroupNetwork. Eleven of
+sixteen are a single connected region and the five flagged REVIEW carry
+largest-component fractions of **0.9886 to 0.9999**, i.e. a handful of stray
+triangles on a neighbour, which is exactly what `/select-tooth`'s
+largest-component rule discards. `format_report` now separates the two
+verdicts: `size` (BIG = two teeth merged, a model problem) from `review` (in
+more than one piece, usually a few triangles), because the old single `<<`
+column made them look the same and they lead to different actions.
+
+**NONE OF THIS IS ACCURACY.** No segmentation model in this repository has
+been scored against an independent annotation and none can be here (§17).
+
+### 26.10 TGN vs CrossTooth on the corrected shim, same scan
+
+| | ToothGroupNetwork | CrossTooth |
+|---|---|---|
+| seconds | 369.87 | **19.59** |
+| teeth labelled | 12 | **16** |
+| median per-tooth box diagonal | 15.072 mm | **13.248 mm** |
+| **max** per-tooth box diagonal | **49.355 mm** | 17.805 mm |
+| teeth in ONE connected piece | 7 of 12 | **11 of 16** |
+| worst largest-component fraction | **0.5218** | 0.9886 |
+
+Vertex agreement on the 56,920 vertices both call a tooth: exact FDI
+**0.4853**; if CrossTooth's quadrants were mirrored, **0.0616**. So the two
+independently trained models agree on which side is 3x and which is 4x, which
+is the one thing inter-model agreement can settle. **It is not accuracy, and
+the default was not changed.**
+
+### 26.11 Provider-specific ordering can never become the canonical mesh
+
+The regression §24.3 asked for exists and is three tests. Provider A is handed
+the canonical array and returns labels in a SHUFFLED order — the
+ToothGroupNetwork hazard, where a loader reorders and every count check still
+passes. Provider B never indexes an array at all; it labels geometry and the
+labels come home by coordinate — the CrossTooth route. Both must land on the
+same canonical labels, and do.
+
+**The fixture is shown to REPRODUCE the defect first** (§5's rule): read by
+index, the same labels are wrong at 8 of 16 vertices with a largest-tooth box
+of 27.35 mm against 10.39 mm — **while the total count and every per-label
+count still agree.** A third test walks `api_core.py`'s AST and asserts no
+provider array is ever stored as `verts` or `faces`, which would be the
+tidy-looking fix and would silently invalidate every vertex id the client
+holds, the extraction mask and the brush index.
+
+### 26.12 The workspace
+
+`WorkflowRail.jsx` and `ToothInspector.jsx`, both pure, both taking summaries,
+neither holding state or a ref. The 94,848-integer label array stays where it
+was.
+
+**FOUR STATES IN THE RAIL, and the fourth is the point.** `done`, `current`,
+`blocked` and `pending` — a blocked step carries its REASON ("cut a crown
+first") and a pending one does not pretend to have one, the same distinction
+`ValidationPanel` draws between a failing check and one never computed and
+§14 draws between `NOT_CHECKED` and `CLEAR`. Seven accordion headings
+described the workflow's ORDER and never its STATE: a restored case showed
+seven closed panels and the clinician opened each to find out where they were.
+
+The inspector renders a measurement that was not taken as an **em dash, never
+a zero and never a green tick**, and `0` deliberately does not take that path
+because a genuine zero is a result. Its colour swatch comes from
+`colorForFDI`, the same pure function the viewport uses — a second palette is
+how seventeen teeth came to share one colour (§24.5).
+
+**`workflowSteps` is a MODULE-SCOPE PURE FUNCTION, not a hook.** A deps array
+is evaluated during render and this app has white-screened five times from one
+naming a `const` declared below it. A pure function over a plain object cannot
+participate in that at all. **This is the eighth time that trap has been
+checked rather than assumed.**
+
+Measured: bundle 272.75 → **276.41 KB gzip** (+3.66 KB, no new dependency),
+`npm run lint` 0 problems, `npm run smoke` RENDER OK, `npx playwright test`
+**17 passed / 9 skipped** (the nine need a running backend).
+
+### 26.13 CrossTooth carries no licence, and that is a commercial blocker
+
+`CrossTooth/` contains **no LICENSE, no COPYING and no `.git`**, so there is
+no licence text and no recoverable upstream commit to look one up against.
+The code is vendored and unmodified and the checkpoint is excluded from
+version control (§25.8), but *"a CVPR paper exists"* is not a grant of
+rights. **This is independent of every technical finding above** and it
+applies to the stated commercial mission, not to the research use it is
+being put to here. It needs a licence from the authors before CrossTooth
+output can ship in a product.
+
+### 26.14 What was NOT done
+
+* **The real scan still does not produce a PRINT READY stage.** One
+  0.09515 mm self-touching edge, fully characterised in §26.8. No cap, gate
+  or threshold was moved to get past it.
+* **A contacting pair of moving teeth cannot both be reconstructed.** The
+  shared-reconstruction branch does not exist; the refusal now names the
+  measured bridge width instead (§26.6).
+* **`old_site_restored` fails on the real scan and was not investigated.**
+  It is one of the four failing gates and the attention went to the
+  self-touch, which is the one the forensics could localise.
+* **No accuracy benchmark exists for either model**, and none can be run
+  here. §17 and §25.6 stand.
+* **Only the mandible was exercised.** There is still no maxillary scan.
+* **`App.jsx` is still one file** (~3,100 lines). Three components have been
+  extracted from it; the top bar, the bottom staging dock and the migration
+  of the `S` style object onto `theme.js` have not been done.
+* **No browser performance figures.** There is a browser for Playwright but
+  no profiler, and §24.9's list is unchanged.
+* **The viewport darkening is still MITIGATED, not root-caused** (§22).
+
+Covered by `test_click_to_select.py` (10), `verify_pointops.py`, the four
+trim regressions in `test_manufacturing_interface.py`, the three ordering
+regressions in `test_segmentation_mapping.py`, and `benchmark_providers.py`.

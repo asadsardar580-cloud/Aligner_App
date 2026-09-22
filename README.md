@@ -111,8 +111,9 @@ sidebar's connection badge, or poll `/api/ai/status`.
 
 ```powershell
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names, without importing (99 files)
-python run_all_tests.py                 # canonical runner — 40 entries
+python check_structure.py               # undefined names, without importing (101 files)
+python run_all_tests.py                 # canonical runner — 42 entries
+python verify_pointops.py               # the CPU pointops shim, against upstream
 python -m pytest -q                     # runs alongside; both must pass
 python benchmark_providers.py           # every segmentation model over one scan
 python bench_signed_distance.py         # scores the signed-distance method

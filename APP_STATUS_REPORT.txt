@@ -10,6 +10,38 @@ C:\Users\Lenovo\OneDrive\Desktop\Aligner_App.
 ----------------------------------------------------------------------------------------------------
 
 
+0-. UPDATE 2026-09-22 - READ CLAUDE.md s.26 FIRST
+==================================================================
+
+The real scan now completes the whole clinical path: STL -> occlusal plane ->
+CrossTooth segmentation -> CLICK-TO-SELECT (100.0% purity, against the wand's
+15.7%) -> cut -> C_res movement -> local cast reconstruction -> staged fused
+solid -> written STL -> reread. Closed, one component, ZERO open edges.
+
+It is still NOT PRINT READY. Four aggregate gates fail and the one that can be
+localised is a single 0.09515mm self-touching edge whose four incident faces
+are all ORIGINAL_CAST. No gate, cap or threshold was moved.
+
+Five defects were found and fixed, four of which reported themselves as
+something else - see CLAUDE.md s.26 for the measurements:
+
+  s.26.1  pointops_cpu returned the WRONG NEIGHBOURS, two independent ways
+  s.26.2  the arch trim deleted the cast out from under a molar's rim
+  s.26.3  s.24.7's 0.0155mm "knife-edge" was a probe aimed at an open shell
+  s.26.5  the wand's 25.0mm was a SEARCH CEILING reported as a measurement
+  s.26.7  edge_forensics had never once run (pre-weld faces, post-weld labels)
+
+Counts as of 2026-09-22: pytest 383 passed, run_all_tests 42 entries,
+check_structure 101/101, semgrep 9 rules / 0 findings, Playwright 17 passed /
+9 skipped, bundle 276.41 KB gzip.
+
+THE LINE BELOW ABOUT THE WAND (s.1213) IS SUPERSEDED: the wand is still not
+the route and no longer needs to be.
+
+
+----------------------------------------------------------------------------------------------------
+
+
 0A. WHAT CHANGED SINCE THIS DOCUMENT WAS WRITTEN (READ THIS FIRST)
 ==================================================================
 

@@ -12,8 +12,19 @@ __all__ = [
     "interpolation", "subtraction", "aggregation", "install",
 ]
 
+#: What `knnquery` puts in its second return value. The upstream wrapper
+#: (`ToothGroupNetwork/external_libs/pointops/functions/pointops.py`) returns
+#: `torch.sqrt(dist2)`, so a consumer written against upstream wants the
+#: DISTANCE. This module kept the squared value, and `interpolation` - in
+#: this same file - then used it as though it were the distance, which made
+#: its weights inverse-SQUARED-distance. That is a different interpolation.
+#: The flag stays because pointops forks genuinely differ on it; what changed
+#: is that `interpolation` now honours it instead of ignoring it.
 KNN_RETURNS_SQUARED_DISTANCE = True
-_KNN_BLOCK_ELEMS = 16_000_000
+#: Budget for one KNN block, in elements. Halved against the old value
+#: because the distance matrix is now float64: same peak bytes per block, not
+#: twice as many.
+_KNN_BLOCK_ELEMS = 8_000_000
 _KNN_CHUNK = 4096
 
 def _as_int_list(offset):
@@ -69,7 +80,36 @@ def knnquery(nsample, xyz, new_xyz, offset, new_offset):
         for lo in range(0, qry.shape[0], chunk):
             hi = min(lo + chunk, qry.shape[0])
             block = qry[lo:hi]
-            d2 = torch.cdist(block, ref) ** 2
+            # THE PRECISION HERE IS LOAD-BEARING, NOT A PERFORMANCE KNOB.
+            # torch.cdist computes the matrix-multiply expansion
+            # ||a||^2 + ||b||^2 - 2a.b, which in float32 cancels
+            # catastrophically when the coordinates are large relative to the
+            # distances being resolved - and rule 3.1 means this repository
+            # NEVER re-centres a scan, so the coordinates are wherever the
+            # scanner put them. Measured on case_lower.stl, 2,000 queries
+            # into 16,000 points, k=16, against an exact float64 reference:
+            #
+            #   offset from origin        f32 mm   f32 donot_use_mm   f64 mm
+            #      0.0 mm                     20                  0        0
+            #     37.1 mm (this scan)         94                  0        -
+            #    137.5 mm (the offset
+            #             test_api_core pins) 551                  1        1
+            #    500.0 mm                   1917                  2        2
+            #
+            #   ms per 1000x16000 block      53.8              137.9    104.2
+            #
+            # FLOAT64 IS BOTH THE MOST ACCURATE AND THE FASTER OF THE TWO
+            # CORRECT OPTIONS, because it keeps the BLAS matmul path while
+            # `donot_use_mm_for_euclid_dist` materialises an (m, n, 3)
+            # difference tensor. The residual 1-2 rows at large offsets are
+            # not this computation: the inputs are already float32, which is
+            # the network's own dtype, and float64 adds no error beyond that
+            # rounding (measured 1.8e-12 at the origin against 1.7e-3).
+            #
+            # A neighbourhood search that returns the wrong neighbours does
+            # not crash. It produces a model that segments badly, which is
+            # indistinguishable from a model that is not very good.
+            d2 = torch.cdist(block.double(), ref.double()) ** 2
             kd, ki = torch.topk(d2, k, dim=1, largest=False, sorted=True)
             if k < nsample:
                 pad = nsample - k
@@ -100,7 +140,23 @@ def grouping(input, idx):
     return input[idx.reshape(-1).long()].view(idx.shape[0], idx.shape[1], -1)
 
 def interpolation(xyz, new_xyz, feat, offset, new_offset, k=3):
+    """Inverse-DISTANCE weighted gather, as the upstream wrapper defines it.
+
+        idx, dist = knnquery(...)          # upstream returns sqrt(dist2)
+        dist_recip = 1.0 / (dist + 1e-8)
+        weight = dist_recip / dist_recip.sum(1, keepdim=True)
+
+    THIS USED TO IGNORE `KNN_RETURNS_SQUARED_DISTANCE` AND SO WEIGHTED BY
+    INVERSE SQUARED DISTANCE. It is the only consumer of that second return
+    value in this repository - ToothGroupNetwork discards it at all three of
+    its `knnquery` call sites - so the defect was confined here, and it is
+    real: `TransitionUp` calls this on four of five decoder stages in both
+    networks. k=1 was unaffected either way, because a single weight
+    normalises to 1.0, which is why `heads.py:50` never showed it.
+    """
     idx, dist = knnquery(k, xyz, new_xyz, offset, new_offset)
+    if KNN_RETURNS_SQUARED_DISTANCE:
+        dist = dist.clamp_min(0).sqrt()
     recip = 1.0 / (dist + 1e-8)
     weight = recip / recip.sum(dim=1, keepdim=True)
     out = torch.zeros(new_xyz.shape[0], feat.shape[1], dtype=feat.dtype)

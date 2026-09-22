@@ -962,6 +962,176 @@ def test_an_unmeasurable_transition_fails_the_gate_rather_than_passing_it():
     print("PASS  an unmeasurable transition fails no_transition_ledge")
 
 
+# ===========================================================================
+# THE TRIM MAY NOT DELETE THE CAST THE RECONSTRUCTION HAS TO SEAT INTO
+#
+# `build_cast_base` keeps only the horseshoe band within `margin_mm` of the
+# fitted occlusal ridge, and `ARCH_TRIM_MARGIN_MM` (7.0) was chosen in
+# CLAUDE.md s.10 from whole-arch measurements that are still correct. What
+# those numbers do not describe is a WIDE MOLAR, whose cervical rim reaches
+# further from the ridge than the band does.
+#
+# Measured on this project's real scan, FDI 46 (a first molar) at margin 7.0:
+#
+#     margin   rim points outside the cast   max outside   interface
+#       7.0          53 of 280                 1.2961 mm   REFUSED (40 pts)
+#       9.0           0                        0.0000 mm   ok
+#      12.0           0                        0.0000 mm   ok
+#      15.0           0                        0.0000 mm   ok
+#
+# and the locally measured cast thickness is 2.8573 mm at EVERY one of those
+# margins - so `interface_unbuildable_wall_too_thin` was a correct refusal
+# about geometry that had been deleted, reported under the name of a cast
+# that was too thin. The refusal is not relaxed. The deletion is prevented.
+# ===========================================================================
+
+def test_distance_to_arch_curve_IS_what_the_trim_thresholds():
+    """The helper has to measure the trim's own quantity, not a lookalike.
+
+    If it drifts from `trim_to_arch`'s predicate the margin floor built on it
+    is arithmetic about the wrong thing, and it would fail silently: the
+    export would still produce a cast, just one with the rim cut out of it
+    again.
+    """
+    sid, reqs, _ = arch_session(teeth=(-0.45, 0.45))
+    v = api_core.STORE.require(sid, "verts")
+    f = api_core.STORE.require(sid, "faces")
+    af = api_core.STORE.require(sid, "arch_frame")
+    curve, _ = cg.fit_arch_curve(v, af)
+
+    for margin in (4.0, 7.0, 11.0):
+        _tv, tf_, _ti = cg.trim_to_arch(v, f, af, margin_mm=margin, curve=curve)
+        # The predicate is on FACE CENTROIDS, so measure centroids.
+        cent_all = v[f].mean(axis=1)
+        d = cg.distance_to_arch_curve(cent_all, af, curve)
+        predicted = d < margin
+        # `trim_to_arch` then keeps the largest island and fills holes, so the
+        # kept set is a SUBSET of the predicate - never a superset. A face the
+        # helper says is outside the band must not survive.
+        kept = set(map(tuple, np.sort(tf_, axis=1).tolist()))
+        orig = np.sort(f, axis=1)
+        outside_but_kept = sum(
+            1 for i in np.where(~predicted)[0]
+            if tuple(orig[i].tolist()) in kept)
+        assert outside_but_kept == 0, (
+            f"margin {margin}: {outside_but_kept} faces the helper puts "
+            f"outside the band survived the trim - the helper and the trim "
+            f"disagree")
+    print("PASS  distance_to_arch_curve agrees with trim_to_arch at 4, 7 and 11 mm")
+
+
+def test_a_trim_margin_below_the_socket_rims_DELETES_THE_CAST_UNDER_THEM():
+    """The fixture has to reproduce the defect before the fix means anything.
+
+    CLAUDE.md s.5's rule. Driven here by asking for a margin the rims do not
+    fit inside, which is what a wide molar does to the shipped 7.0 by itself.
+    """
+    sid, tids, _ = moved_session()
+    try:
+        v = api_core.STORE.require(sid, "verts")
+        f = api_core.STORE.require(sid, "faces")
+        af = api_core.STORE.require(sid, "arch_frame")
+        extracted = api_core.STORE.get(sid, "extracted_faces")
+        sealed_v, sealed_f, _ = api_core._seal_sockets(v, f, sid, extracted,
+                                                       flush=True)
+        curve, _ = cg.fit_arch_curve(v, af)
+
+        rims = np.concatenate([
+            np.asarray(api_core.STORE.get(sid, f"tooth:{t}")["socket_rim"], np.int64)
+            for t in tids])
+        reach = float(cg.distance_to_arch_curve(v[rims], af, curve).max())
+        starved = max(1.0, reach - 1.5)          # deliberately too tight
+
+        tv_, tf_, ti = cg.trim_to_arch(sealed_v, sealed_f, af,
+                                       margin_mm=starved, curve=curve)
+        bv, bf, _bi = cg.build_cast_base(tv_, tf_, af, rim=ti["rim_loop"])
+        probe = mfg.CastProbe(bv, bf)
+        sgn = probe.signed(v[rims])
+        outside = int((sgn > 1e-6).sum())
+        assert outside > 0, (
+            f"the fixture did not reproduce the deletion: rims reach "
+            f"{reach:.3f} mm, trimmed at {starved:.3f} mm, and every rim "
+            f"point is still inside the cast")
+        print(f"PASS  rims reach {reach:.3f} mm; trimmed at {starved:.3f} mm "
+              f"leaves {outside} of {len(rims)} rim points up to "
+              f"{sgn.max():.4f} mm OUTSIDE the cast")
+    finally:
+        api_core.STORE.drop(sid)
+
+
+def test_the_export_RAISES_the_trim_margin_to_keep_every_socket_rim():
+    """And it says so in the manifest, with the number it measured.
+
+    The margin is not raised globally - that would undo s.10's measurement to
+    make one case pass, and loosen the trim for every case that never needed
+    it. It is raised per export, only as far as the rims that actually exist
+    require.
+    """
+    sid, tids, _ = moved_session()
+    try:
+        v = api_core.STORE.require(sid, "verts")
+        af = api_core.STORE.require(sid, "arch_frame")
+        curve, _ = cg.fit_arch_curve(v, af)
+        rims = np.concatenate([
+            np.asarray(api_core.STORE.get(sid, f"tooth:{t}")["socket_rim"], np.int64)
+            for t in tids])
+        reach = float(cg.distance_to_arch_curve(v[rims], af, curve).max())
+        starved = max(1.0, reach - 1.5)
+
+        res = api_core.build_stage_bundle(
+            sid, api_core.StageExportRequest(stages=1, trim_margin_mm=starved))
+        trim = res["manifest"]["trim"]
+
+        assert trim["margin_requested_mm"] == round(starved, 4)
+        assert trim["margin_raised_for_socket_rims"] is True
+        assert trim["margin_used_mm"] > trim["margin_requested_mm"]
+        # The guarantee, stated as arithmetic rather than as a hope.
+        floor = (trim["socket_rim_max_distance_to_ridge_mm"]
+                 + mfg.DEFAULT_POLICY.seat_bottom_outset_mm
+                 + api_core.TRIM_RIM_HEADROOM_MM)
+        assert trim["margin_used_mm"] >= floor - 1e-6, (trim, floor)
+        assert abs(trim["socket_rim_max_distance_to_ridge_mm"] - reach) < 1e-3
+
+        # And the rims really do survive it.
+        f = api_core.STORE.require(sid, "faces")
+        extracted = api_core.STORE.get(sid, "extracted_faces")
+        sealed_v, sealed_f, _ = api_core._seal_sockets(v, f, sid, extracted,
+                                                       flush=True)
+        tv_, tf_, ti = cg.trim_to_arch(sealed_v, sealed_f, af,
+                                       margin_mm=trim["margin_used_mm"],
+                                       curve=curve)
+        bv, bf, _bi = cg.build_cast_base(tv_, tf_, af, rim=ti["rim_loop"])
+        sgn = mfg.CastProbe(bv, bf).signed(v[rims])
+        assert int((sgn > 1e-6).sum()) == 0, (
+            f"{int((sgn > 1e-6).sum())} rim points are still outside the cast "
+            f"at the raised margin (max {sgn.max():.4f} mm)")
+        print(f"PASS  requested {starved:.3f} mm -> used "
+              f"{trim['margin_used_mm']:.3f} mm; all {len(rims)} rim points "
+              f"inside the cast")
+    finally:
+        api_core.STORE.drop(sid)
+
+
+def test_an_export_that_needs_no_raise_trims_exactly_as_before():
+    """A case whose rims fit inside the requested band must be UNCHANGED.
+
+    Otherwise this is a global loosening of the trim wearing a conditional's
+    clothes, and s.10's measurements would no longer describe what ships.
+    """
+    sid, tids, _ = moved_session()
+    try:
+        res = api_core.build_stage_bundle(
+            sid, api_core.StageExportRequest(stages=1, trim_margin_mm=25.0))
+        trim = res["manifest"]["trim"]
+        assert trim["margin_raised_for_socket_rims"] is False
+        assert trim["margin_used_mm"] == trim["margin_requested_mm"] == 25.0
+        print(f"PASS  rims reach "
+              f"{trim['socket_rim_max_distance_to_ridge_mm']:.3f} mm, well "
+              f"inside 25.0 mm - the margin is left alone")
+    finally:
+        api_core.STORE.drop(sid)
+
+
 if __name__ == "__main__":
     import sys
     failures = []
