@@ -75,6 +75,7 @@ TESTS = [
     ("suite runner",         "test_suite_runner.py"),
     ("solid bodies/voids",   "test_solid_bodies.py"),
     ("distance failure",     "test_distance_failure.py"),
+    ("self-intersect gate",  "test_self_intersection_gate.py"),
     ("self-intersection",    "test_self_intersection.py"),
     ("deformation construction", "test_deform_construction.py"),
     # THE REAL SCAN, AND THE EXPECTATION IS THE POINT. This records today's

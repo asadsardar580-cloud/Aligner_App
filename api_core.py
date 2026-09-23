@@ -37,6 +37,7 @@ import attachments as attachments_mod
 import audit
 import telemetry
 import manufacturing as mfg
+import self_intersection as si_mod
 
 
 # One trail per SESSION, because a session is what a clinician is working in and
@@ -3361,6 +3362,20 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         # file does anyway - this only moves that rounding to BEFORE the weld
         # instead of after it.
         sv = sv.astype(np.float32).astype(np.float64)
+
+        # GEOMETRIC SELF-INTERSECTION, measured HERE and nowhere else: after
+        # print compensation and after the float32 rounding, so it sees the
+        # positions the STL will actually contain. Every topology gate in this
+        # file measures connectivity, and a mesh whose triangles pass through
+        # each other is closed, manifold, one component and correctly wound.
+        # `cg.offset_along_normals` is a vertex-normal offset and this project
+        # has measured that operation folding at concavities three times
+        # (s.8's offset table; s.23's LOCAL_CLEARANCE self-touch), so the one
+        # step that can introduce it is immediately above.
+        _t_si = time.perf_counter()
+        self_intersection = si_mod.self_intersection_report(sv, sf)
+        self_intersection["seconds"] = round(time.perf_counter() - _t_si, 3)
+
         _pre_weld_v, sf_pre_weld = sv, sf
         # AND ITS OWN LABELS. `stage_labels` is re-indexed onto the
         # WELDED faces twenty lines below, so keeping only the
@@ -3724,6 +3739,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             "components": int(n_comp),
             # `inverted_crumbs_discarded` is kept as an alias for one release;
             # it always equals `internal_voids`. See `_solid_bodies`.
+            mfg.KEY_SELF_INTERSECTION: self_intersection,
             KEY_INTERNAL_VOIDS: int(void_info[KEY_INTERNAL_VOIDS]),
             KEY_INTERNAL_VOIDS_FILLED: float(
                 void_info[KEY_INTERNAL_VOIDS_FILLED]),

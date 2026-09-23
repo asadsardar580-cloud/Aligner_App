@@ -457,7 +457,8 @@ def test_the_evidence_report_cannot_make_a_claim_it_did_not_measure():
     A claim that reads true by default is worse than no claim."""
     rep = mfg.manufacturing_evidence_report({})
     assert rep["all_claims_verified"] is False
-    assert len(rep["claims"]) == 9, rep
+    # 10 since Phase 0.5 added the `no_self_intersection` claim.
+    assert len(rep["claims"]) == 10, rep
     for c in rep["claims"]:
         assert c["verified"] is False, c
         # and it says WHY - the evidence is named and missing, not absent
@@ -526,7 +527,8 @@ def test_every_export_format_is_the_same_gated_bytes(fmt, media):
             man = _json.loads(body.decode("utf-8"))
             assert man["print_ready"] is True
             assert man["evidence_report"]["all_claims_verified"] is True
-            assert len(man["evidence_report"]["claims"]) == 9
+            # 10 since Phase 0.5 added `no_self_intersection`.
+            assert len(man["evidence_report"]["claims"]) == 10
             # THE MANIFEST CARRIES NO GEOMETRY. It is the record, not the part.
             assert "vertices" not in man and "faces" not in man
         else:

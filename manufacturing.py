@@ -70,6 +70,11 @@ KEY_LOOKS_LIKE_A_LEDGE = "looks_like_a_ledge"
 #: taken. Its presence is the reason; its absence means the measurement ran.
 KEY_DISTANCE_FAILURE = "distance_measurement_failed"
 
+#: `stage[KEY_SELF_INTERSECTION]` - the geometric self-intersection report,
+#: measured on the float32-rounded positions AFTER print compensation, which
+#: is the geometry the file actually contains.
+KEY_SELF_INTERSECTION = "self_intersection"
+
 #: The last exception `_point_to_surface` swallowed, or None. Module-level so
 #: a caller can surface the REASON into its manifest without every signature
 #: growing an out-parameter. Read it immediately after the call.
@@ -2269,6 +2274,26 @@ def aggregate_print_gate(stage: dict, policy=None) -> dict:
          "point-to-TRIANGLE distance in BOTH directions, outside the allowed "
          "reconstruction envelope")
 
+    # GEOMETRIC self-intersection, which no topology gate can see. A mesh can
+    # be closed, manifold, one component and correctly wound while two of its
+    # triangles pass through each other - and `cg.offset_along_normals`, the
+    # print-compensation step, is a vertex-normal offset, which this project
+    # has already measured folding at concavities three separate times (s.8's
+    # offset table, s.23's LOCAL_CLEARANCE self-touch). Until now nothing
+    # anywhere in the repository tested for it.
+    #
+    # `measured: False` FAILS. A report that could not run is not a clean one.
+    si = stage.get(KEY_SELF_INTERSECTION) or {}
+    gate("no_self_intersection",
+         bool(si.get("measured")) and si.get("intersecting_pairs") == 0,
+         {"intersecting_pairs": si.get("intersecting_pairs"),
+          "faces_involved": si.get("faces_involved"),
+          "by_kind": si.get("by_kind"),
+          "measured": bool(si.get("measured")),
+          "reason": si.get("reason")},
+         "triangle/triangle intersection on the float32-rounded positions "
+         "after print compensation - the geometry the file actually holds")
+
     roi = stage.get("roi_compliance") or {}
     gate("reconstruction_inside_envelope", bool(roi.get("compliant")),
          roi.get("outside_envelope_area_mm2"),
@@ -2882,6 +2907,12 @@ def manufacturing_evidence_report(stage, policy=None):
               "manifold3d decompose() - physical bodies, not index "
               "components - agreeing with the written file's own component "
               "count, with no boundary that touches itself"),
+        claim("no two triangles of the model pass through each other",
+              ["no_self_intersection"],
+              "triangle/triangle intersection on the float32-rounded "
+              "positions after print compensation. A mesh can be closed, "
+              "manifold, one-component and correctly wound and still be "
+              "geometrically self-intersecting; a slicer will not print it"),
         claim("the written STL survives a round trip",
               ["written_stl_topology"],
               "finite, closed, one component, positive volume, consistent "
