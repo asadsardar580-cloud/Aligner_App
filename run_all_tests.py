@@ -82,6 +82,7 @@ TESTS = [
     ("deformation construction", "test_deform_construction.py"),
     ("stage matrix shared",  "test_stage_matrix_shared.py"),
     ("deformation vertex sets", "test_deformation_vertex_sets.py"),
+    ("deformation export API", "test_export_deformation_api.py"),
     # THE REAL SCAN, AND THE EXPECTATION IS THE POINT. This records today's
     # KNOWN state of the collar path, so the suite stays green on it while ANY
     # change in either direction turns it red. Update it deliberately when the

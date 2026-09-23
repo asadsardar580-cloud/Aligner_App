@@ -38,7 +38,10 @@ import audit
 import telemetry
 import manufacturing as mfg
 import self_intersection as si_mod
+from typing import Literal
 import stage_matrix
+import manufacturing_v2 as mfg2
+import deform_construction as dc
 
 
 # One trail per SESSION, because a session is what a clinician is working in and
@@ -2434,6 +2437,36 @@ class StageExportRequest(BaseModel):
     # is a nested insert, where a clearance between two parts genuinely belongs.
     print_compensation_mm: float = 0.0
 
+    # WHICH CONSTRUCTION BUILDS THE STAGE. "collar" is everything shipped to
+    # date and is the default; nothing about it changes when this field is
+    # absent, and every existing client keeps the behaviour it had.
+    #
+    #   collar       cut the crown, fill the old socket, build a transition
+    #                collar at the new cervical position, and union the parts
+    #                with manifold3d. s.21/s.23/s.26.
+    #   deformation  build the T0 cast ONCE with the teeth still in its
+    #                surface and, per stage, move the moving crown's vertices
+    #                by the rigid stage matrix while a harmonic blend carries
+    #                the gingiva inside a geodesic envelope. The index buffer
+    #                is inherited from T0 and never rebuilt, so there is no
+    #                socket, no cap, no collar and NO BOOLEAN - which is the
+    #                whole point: s.26.8's remaining real-scan blocker is a
+    #                0.09515mm self-touching edge created by a union, and a
+    #                construction with no union cannot create one.
+    #
+    # It is a request field rather than a server mode for the same reason
+    # `provider` is (s.25.7): the point of two constructions is running both
+    # over ONE case, and a server-wide switch makes that a restart apiece.
+    construction: Literal["collar", "deformation"] = "collar"
+
+    # Enamel the clinician has PRESCRIBED to be removed interproximally, in mm.
+    # Only the deformation construction reads it, and only to judge the
+    # implicit IPR it measures: a contact that closes by more than this plus
+    # the 0.05mm scanner-noise tolerance is enamel the plan never authorised,
+    # and `implicit_ipr_within_prescription` fails. DEFAULT 0.0 - no IPR
+    # unless it was prescribed, so the gate starts at its strictest.
+    prescribed_ipr_mm: float = 0.0
+
 
 # The per-stage translation limit staging_estimate divides by. Named here so
 # the compensation guard can say what it is comparing against.
@@ -4063,11 +4096,355 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             "base_mesh": (bv, bf)}
 
 
+# ---------------------------------------------------------------------------
+# The deformation construction, behind `construction="deformation"`
+# ---------------------------------------------------------------------------
+
+def _v2_evidence_report(gate: dict) -> dict:
+    """`aggregate_gate_v2`'s own gates, restated as claims.
+
+    NOT `mfg.manufacturing_evidence_report`, and the difference is not
+    cosmetic. That function reads the COLLAR's keys - interface continuity,
+    transition ledge, old-site restoration, synthetic exposure - and the
+    deformation construction builds none of those things, so every one of its
+    rows would read `false` for the honest reason that the measurement does
+    not exist here. A claim that reads false because it was never applicable
+    is indistinguishable, in a manifest, from one that failed.
+
+    So each row here names a gate that WAS measured, and `all_claims_verified`
+    is the aggregate gate's own answer - never a second opinion about it.
+    """
+    gates = gate.get("gates") or {}
+    return {
+        "construction": mfg2.CONSTRUCTION_ID,
+        "all_claims_verified": bool(gate.get("print_ready")),
+        "claims": [{"claim": name, "verified": bool(gates.get(name, {}).get("ok")),
+                    "evidence": gates.get(name)}
+                   for name in dc.REQUIRED_GATES],
+        "advisory": gate.get("advisory") or {},
+        "note": ("These are aggregate_gate_v2's REQUIRED_GATES restated one "
+                 "for one. The collar path's evidence report does not apply "
+                 "to this construction and is deliberately not produced."),
+    }
+
+
+def _v2_attachment_solids(teeth, matrices):
+    """Rebuild each attachment from its RECORD and carry it by the stage matrix.
+
+    REBUILT, NOT STORED. `place_attachment` keeps the parameters - shape,
+    dimensions, seat point, normal, rotation - and fuses the geometry into the
+    crown; the attachment's own mesh is not persisted anywhere. That is the
+    project's standing rule (s.15: the plan is prescriptions, derived visuals
+    are rederivable and none is persisted), and `build_attachment` is
+    deterministic in those parameters, so rebuilding reproduces exactly what
+    the clinician placed.
+
+    It is carried by the SAME stage matrix the crown's vertices are, so the
+    attachment cannot drift off the tooth it is bonded to.
+    """
+    solids = []
+    for t in teeth:
+        recs = t["rec"].get("attachments") or []
+        M = matrices.get(t["tid"])
+        if not recs or M is None:
+            continue
+        for rec in recs:
+            dims = rec.get("dimensions_mm") or {}
+            att = attachments_mod.build_attachment(
+                rec["shape"], t["rec"]["frame"], rec["position_xyz"],
+                size_mm={k: float(dims[k]) for k in ("md", "oa", "bl")
+                         if k in dims} or None)
+            solids.append({
+                "tooth_id": t["tid"],
+                "attachment_id": rec.get("attachment_id"),
+                "shape": rec["shape"],
+                "volume_mm3": rec.get("fused_volume_mm3"),
+                "verts": cg.apply_matrix(np.asarray(att["verts"], float), M),
+                "faces": np.asarray(att["faces"], np.int64)})
+    return solids
+
+
+def build_stage_bundle_v2(sid: str, req: StageExportRequest) -> dict:
+    """The deformation construction, in the collar bundle's own shape.
+
+    SAME RETURN SHAPE as `build_stage_bundle`, deliberately: `/export/stages`
+    and `/export/final` then need a dispatch and nothing else, and the two
+    constructions stay comparable stage for stage. What is NOT shared is the
+    gate - `dc.aggregate_gate_v2` decides here, because the collar's gate asks
+    about a collar.
+
+    THE SOCKETS ARE NOT SEALED AND THE CROWNS ARE NOT CUT OUT. `_seal_sockets`
+    has no counterpart in this path: the T0 cast is built from the scan with
+    the teeth still standing in its surface, so there is no hole to fill. The
+    cut's `face_mask` is used only to say WHICH vertices are the tooth.
+    """
+    t0_bundle = time.perf_counter()
+    try:
+        v, f = STORE.require(sid, "verts"), STORE.require(sid, "faces")
+        arch = STORE.arch(sid)
+    except SessionExpired as e:
+        raise HTTPException(404, str(e))
+
+    af = STORE.get(sid, "arch_frame")
+    if af is None:
+        raise HTTPException(409,
+            "Occlusal plane not defined for this session, so the cast base "
+            "cannot be built.")
+
+    # --- the teeth, and how long the case is ------------------------------
+    teeth = []
+    for key in STORE.keys(sid):
+        if not key.startswith("tooth:"):
+            continue
+        t = STORE.get(sid, key)
+        clinical = t.get("clinical") or {}
+        st = cg.staging_estimate(**{k: float(clinical.get(k, 0.0) or 0.0) for k in
+                                    stage_matrix.CLINICAL_KEYS})
+        teeth.append({"tid": key.split(":", 1)[1], "rec": t, "clinical": clinical,
+                      "staging": st, "fdi": _tooth_fdi(sid, t, f)})
+    if not teeth:
+        raise HTTPException(400, "Nothing has been cut yet; there are no "
+                                 "stages to export.")
+
+    total = max((t["staging"]["stages_required"] for t in teeth), default=0)
+    if total <= 0:
+        raise HTTPException(400,
+            "No movement has been prescribed, so every stage would be "
+            "identical to the scan. Move at least one tooth before exporting "
+            "stages.")
+    if total > req.max_stages:
+        binding = max(teeth, key=lambda t: t["staging"]["stages_required"])
+        raise HTTPException(422,
+            f"This plan needs {total} stages, past the {req.max_stages} this "
+            f"export will build. Tooth {binding['fdi'] or binding['tid']} is "
+            f"binding it at {binding['staging']['stages_required']} "
+            f"({binding['staging']['driver']}-driven).")
+
+    if float(req.print_compensation_mm or 0.0) != 0.0:
+        # Refused rather than ignored. The collar path applies it to a FUSED
+        # solid after a union; there is no union here and no fused solid to
+        # offset, and an offset of the deformed cast would move enamel the
+        # `moving_teeth_exact_rigid` gate requires to be bit-exact.
+        raise HTTPException(422, _jsonable({
+            "error": "print_compensation_mm is not available for "
+                     "construction='deformation'.",
+            "measured_value": float(req.print_compensation_mm),
+            "detail": ("The allowance is applied to the fused solid AFTER the "
+                       "union. This construction performs no union, and "
+                       "offsetting the deformed cast would move the enamel "
+                       "that `moving_teeth_exact_rigid` requires to be an "
+                       "exact rigid transform of the scan."),
+            "construction": "deformation"}))
+
+    # --- 2.3: the vertex sets, on the ORIGINAL scan ids -------------------
+    labels = STORE.get(sid, "labels")
+    labels = (np.asarray(labels).astype(np.int64).reshape(-1)
+              if labels is not None and len(labels) == len(v) else None)
+
+    moving_faces, static_faces = {}, {}
+    moving_source = {}
+    for t in teeth:
+        fm = t["rec"].get("face_mask")
+        if fm is not None and len(np.asarray(fm)) == len(f):
+            moving_faces[t["tid"]] = np.asarray(fm, bool)
+            moving_source[t["tid"]] = "cut face_mask"
+        elif labels is not None and t["fdi"]:
+            moving_faces[t["tid"]] = mfg2.tooth_faces_from_labels(
+                f, labels, int(t["fdi"]))
+            moving_source[t["tid"]] = f"segmentation label {t['fdi']}"
+        else:
+            raise HTTPException(422, _jsonable({
+                "error": f"Tooth {t['fdi'] or t['tid']} has neither a cut "
+                         f"face mask nor a usable segmentation label, so its "
+                         f"vertices cannot be identified on the scan.",
+                "construction": "deformation"}))
+
+    moving_fdis = {int(t["fdi"]) for t in teeth if t["fdi"]}
+    if labels is not None:
+        for fdi in sorted(set(int(x) for x in np.unique(labels)) - {0} - moving_fdis):
+            m = mfg2.tooth_faces_from_labels(f, labels, fdi)
+            if m.any():
+                static_faces[f"fdi{fdi}"] = m
+
+    sets = mfg2.tooth_vertex_sets(f, moving_faces, static_faces,
+                                  n_vertices=int(len(v)))
+
+    # --- 2.2: the case plan, solved once ----------------------------------
+    policy = mfg2.DeformationPolicy(
+        trim_margin_mm=float(req.trim_margin_mm),
+        base_thickness_mm=float(req.base_thickness_mm))
+    moving_spec = {t["tid"]: {"vertices": sets["moving"][t["tid"]],
+                              "frame": t["rec"]["frame"],
+                              "c_res": t["rec"]["c_res"],
+                              "clinical": t["clinical"]}
+                   for t in teeth}
+    try:
+        plan = mfg2.build_case_plan(v, f, af, moving_spec, sets["static"],
+                                    policy=policy)
+    except mfg2.CasePlanRefused as e:
+        # A NAMED refusal with its measured values, which is what the brief
+        # asks a refusal to be. 422, not 500: the request is well formed and
+        # the geometry is what refuses it.
+        raise HTTPException(422, _jsonable(
+            {"error": e.reason, "construction": "deformation", **e.detail}))
+    except ValueError as e:
+        raise HTTPException(422, _jsonable({
+            "error": "deformation_plan_refused", "detail": str(e),
+            "construction": "deformation",
+            "vertex_sets": sets["diagnostics"]}))
+
+    # --- the stages -------------------------------------------------------
+    prescribed_ipr = float(getattr(req, "prescribed_ipr_mm", 0.0) or 0.0)
+    blobs, stage_meta = {}, []
+    t_stages = time.perf_counter()
+    for k in range(1, total + 1):
+        matrices = mfg2.stage_matrices_for(plan, k, total)
+        out = mfg2.build_stage_v2(plan, matrices,
+                                  prescribed_ipr=prescribed_ipr,
+                                  stage=k, total_stages=total)
+        name = f"{arch}_Stage_{k:02d}.stl"
+        gate = out["gate"]
+        file_d = out["file"]
+        blob = out["blob"]
+
+        # --- 2.6: attachments, if any were placed -----------------------
+        # The union happens AFTER the gate that certified the cast, so the
+        # file-level and self-intersection gates are re-run on its output and
+        # the result is folded back into the verdict. A boolean that breaks a
+        # model the gate already passed must not ship as print ready on the
+        # strength of the earlier measurement.
+        try:
+            att = mfg2.union_attachments(out["verts"], out["faces"],
+                                         _v2_attachment_solids(teeth, matrices),
+                                         stage=k)
+        except mfg2.AttachmentUnionRefused as e:
+            raise HTTPException(422, _jsonable(
+                {"error": e.reason, "construction": "deformation", **e.detail}))
+        if att.get("applied"):
+            blob = att["blob"]
+            file_d = att["file"]
+            if not att["ok"]:
+                gate = dict(gate)
+                gate["print_ready"] = False
+                gate["verdict"] = "NOT PRINT READY"
+                gate["failed_gates"] = sorted(
+                    set(gate.get("failed_gates") or ()) |
+                    {"attachment_union_file_topology"})
+                gate["gates"] = dict(gate.get("gates") or {})
+                gate["gates"]["attachment_union_file_topology"] = {
+                    "ok": False, "file": att["file"],
+                    "self_intersection": att["self_intersection"],
+                    "note": ("the deformed cast passed its own gates; the "
+                             "attachment union did not.")}
+        blobs[name] = blob
+        stage_meta.append({
+            "stage": k, "file": name, "triangles": int(len(plan.F)),
+            "volume_mm3": file_d.get("volume"),
+            "components": file_d.get("components"),
+            "manufacturing_gate": gate,
+            # The same key `/export/final` reads on the collar path, carrying
+            # the file-level answer for THIS construction.
+            "stl_validation": {
+                "open_edges": int(file_d.get("open") or 0),
+                "nonmanifold_edges": int(file_d.get("nonmanifold") or 0),
+                "connected_components": int(file_d.get("components") or 0),
+                "winding_consistent": bool(file_d.get("winding_ok")),
+                "volume_mm3": file_d.get("volume"),
+                "verdict": ("PASS" if gate.get("gates", {})
+                            .get("written_file_topology", {}).get("ok")
+                            else "FAIL"),
+                "failed_gates": [g for g in (gate.get("failed_gates") or [])
+                                 if g == "written_file_topology"],
+            },
+            "self_intersection": out["self_intersection"],
+            "attachments": {k2: v2 for k2, v2 in att.items()
+                            if k2 not in ("verts", "faces", "blob")},
+            "report": out["report"],
+            "manifest": out["manifest"],
+            # The collar path carries these; a lab reading one manifest
+            # against the other should not have to wonder whether a missing
+            # key means "clear" or "not measured". s.14: NOT_CHECKED is not
+            # CLEAR.
+            "occlusal_interference": [],
+            "occlusal_interference_checked": False,
+        })
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nm, blob in blobs.items():
+            z.writestr(nm, blob)
+        z.writestr("manifest.json", "")      # replaced below, once complete
+    t_stages = time.perf_counter() - t_stages
+
+    manifest = {
+        "generator": "Clinical Micro-Planner",
+        "arch": arch,
+        "construction": mfg2.CONSTRUCTION_ID,
+        "kind": ("staged manufacturing models - ONE inherited index buffer, "
+                 "deformed per stage; no socket, no collar, no boolean"),
+        "stages": total,
+        "units": "mm",
+        "coordinate_space": "raw scanner coordinates - never re-centred or rescaled",
+        "socket_treatment": ("none - the T0 cast is built with the teeth still "
+                             "in its surface, so no socket is ever opened"),
+        "print_compensation_mm": 0.0,
+        "print_compensation_note": "true to anatomy; no allowance applied",
+        "base_construction": "trim_to_arch -> build_cast_base (never cap_and_close)",
+        "policy": policy.as_dict(),
+        "vertex_sets": sets["diagnostics"],
+        "vertex_set_sources": moving_source,
+        "case_plan": plan.diagnostics,
+        "t0_self_intersection": plan.t0_self_intersection,
+        "t0_file": plan.t0_file,
+        "teeth": [{"tooth_id": t["tid"], "fdi": t["fdi"],
+                   "prescription": t["clinical"],
+                   "stages_required": t["staging"]["stages_required"],
+                   "driver": t["staging"]["driver"],
+                   "binds_the_case": t["staging"]["stages_required"] == total,
+                   "root_length_mm": t["rec"].get("root_length_mm"),
+                   "moving_vertices": int(len(sets["moving"][t["tid"]]))}
+                  for t in teeth],
+        "stage_files": stage_meta,
+        "union_seconds": 0.0,
+        "phase_seconds": {
+            "case_plan": plan.diagnostics["seconds"]["total"],
+            "stages": round(t_stages, 3),
+            "total": round(time.perf_counter() - t0_bundle, 3)},
+        # The collar path's occlusion block, in its NOT_CHECKED state. The
+        # antagonist sweep is a property of the plan, not of the construction,
+        # and running it here would duplicate rather than share it.
+        "occlusion": {
+            "checked": False,
+            "threshold_mm": 0.1,
+            "stages_with_interference": [],
+            "worst_penetration_mm": 0.0,
+            "note": ("the antagonist check is not wired into this "
+                     "construction; `checked: false` is NOT a finding of "
+                     "clearance."),
+        },
+        "disclaimer": export_clinical_report.DISCLAIMER,
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nm, blob in blobs.items():
+            z.writestr(nm, blob)
+        z.writestr("manifest.json", json.dumps(_jsonable(manifest), indent=2))
+    buf.seek(0)
+
+    return {"buf": buf, "filename": f"{arch}_stages_deformation.zip",
+            "manifest": manifest, "stages": total,
+            "out_dir": None, "union_seconds": 0.0,
+            "blobs": blobs, "base_mesh": (plan.V0, plan.F)}
+
+
 @app.post("/api/session/{sid}/export/stages")
 def export_stages(sid: str, req: StageExportRequest):
     """Stream the staged manufacturing models as a ZIP."""
     try:
-        bundle = build_stage_bundle(sid, req)
+        bundle = (build_stage_bundle_v2(sid, req)
+                  if req.construction == "deformation"
+                  else build_stage_bundle(sid, req))
         return StreamingResponse(
             bundle["buf"], media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{bundle["filename"]}"',
@@ -4139,7 +4516,9 @@ def export_final(sid: str, req: FinalExportRequest):
         # one being printed. Gating the whole bundle here would refuse a
         # perfectly good stage 1 because stage 4 is not print ready, which
         # tells the clinician nothing useful about the file they asked for.
-        bundle = build_stage_bundle(sid, req, require_print_ready=False)
+        bundle = (build_stage_bundle_v2(sid, req)
+                  if req.construction == "deformation"
+                  else build_stage_bundle(sid, req, require_print_ready=False))
     except HTTPException:
         raise
     except Exception as e:
@@ -4204,7 +4583,9 @@ def export_final(sid: str, req: FinalExportRequest):
         # ABOUT. Each row names its evidence, so a claim cannot be made by a
         # row that measured nothing; a claim with missing evidence reads
         # false, never true by default.
-        "evidence_report": mfg.manufacturing_evidence_report(chosen),
+        "evidence_report": (_v2_evidence_report(gate)
+                            if req.construction == "deformation"
+                            else mfg.manufacturing_evidence_report(chosen)),
         "validation": chosen["stl_validation"],
         "interfaces": chosen.get("interfaces"),
         "volume_mm3": chosen.get("volume_mm3"),
@@ -4217,7 +4598,14 @@ def export_final(sid: str, req: FinalExportRequest):
             "reader_weld_merged_vertices": chosen.get("reader_weld_merged_vertices"),
         },
         "coordinate_space": "raw scanner coordinates — never re-centred or rescaled",
+        "construction": ("deformation" if req.construction == "deformation"
+                         else "collar"),
         "manufacturing_architecture": (
+            ("ONE T0 cast built with the teeth in its surface; per stage the "
+             "SAME index buffer, the moving crown carried by the rigid stage "
+             "matrix and the gingiva blended harmonically inside a geodesic "
+             "envelope. No socket, no cap, no collar, no boolean.")
+            if req.construction == "deformation" else
             "immutable cast -> local target-position interface -> subtract "
             "cavity -> add emergence ramp -> union rigid crown + bounded seat. "
             "No root-length plug participates."),

@@ -275,6 +275,54 @@ def build_case_plan(scan_v, scan_f, arch_frame, moving, static_teeth_vertices,
         })
 
 
+def gate_evidence(gate: dict, record: dict) -> dict:
+    """Each REQUIRED gate, with the measurement it was decided on.
+
+    `dc.aggregate_gate_v2` returns a verdict and the names that failed - not
+    the numbers behind them. That is the right shape for a gate (it has one
+    job and it is fail-closed) and the wrong shape for a manifest: a lab or a
+    reviewer reading "NOT PRINT READY: no_self_intersection" needs the count.
+
+    THE VERDICT IS NOT RECOMPUTED HERE. `ok` is read straight out of
+    `failed_gates`, so this cannot disagree with the gate, drift from it, or
+    quietly become a second implementation of it. All it adds is provenance:
+    which measured value each name was decided on.
+    """
+    failed = set(gate.get("failed_gates") or ())
+    sr = record.get("stage_report") or {}
+    pd = record.get("plan_diagnostics") or {}
+    sx = record.get("self_intersection") or {}
+    fi = record.get("file") or {}
+    ev = {
+        "index_buffer_unchanged": {
+            "face_array_is_the_T0_cast_s_own": record.get("index_buffer_unchanged")},
+        "weights_bounded": {k: pd.get(k) for k in
+                            ("weights_bounded", "weight_min", "weight_max",
+                             "weight_sum_max", "free_vertices")},
+        "moving_teeth_exact_rigid": {"per_tooth": sr.get("moving_teeth_exact_rigid")},
+        "untouched_vertices_bit_identical": {
+            "bit_identical": sr.get("untouched_vertices_bit_identical")},
+        "pinned_vertices_bit_identical": {
+            "bit_identical": sr.get("pinned_vertices_bit_identical")},
+        "no_inverted_triangles": {"inverted_triangles": sr.get("inverted_triangles")},
+        "no_degenerate_triangles": {"degenerate_triangles": sr.get("degenerate_triangles")},
+        "no_self_intersection": {k: sx.get(k) for k in
+                                 ("measured", "intersecting_pairs",
+                                  "faces_involved", "by_kind")},
+        "implicit_ipr_within_prescription": {
+            "implicit_ipr_mm": sr.get("implicit_ipr_mm"),
+            "prescribed_ipr_mm": record.get("prescribed_ipr_mm"),
+            "tolerance_mm": dc.IPR_TOLERANCE_MM,
+            "tolerance_provenance": ("clinical rule - at or below this a closure "
+                                     "is scanner noise and PDL tolerance, not "
+                                     "enamel"),
+        },
+        "written_file_topology": dict(fi),
+    }
+    return {name: {"ok": name not in failed, **(ev.get(name) or {})}
+            for name in dc.REQUIRED_GATES}
+
+
 # ---------------------------------------------------------------------------
 # 2.2  build_stage_v2
 # ---------------------------------------------------------------------------
@@ -340,7 +388,10 @@ def build_stage_v2(case_plan: CasePlan, stage_matrices: dict,
         "index_buffer_unchanged": bool(F is case_plan.F),
         "prescribed_ipr_mm": float(prescribed_ipr or 0.0),
     }
-    gate = dc.aggregate_gate_v2(record)
+    gate = dict(dc.aggregate_gate_v2(record))
+    # Provenance beside the verdict. `gate_evidence` reads `ok` out of
+    # `failed_gates` rather than re-deciding, so it can never disagree.
+    gate["gates"] = gate_evidence(gate, record)
 
     # 8. manifest
     manifest = {
@@ -354,7 +405,8 @@ def build_stage_v2(case_plan: CasePlan, stage_matrices: dict,
         "prescribed_ipr_mm": float(prescribed_ipr or 0.0),
         "gate": {"verdict": gate["verdict"],
                  "print_ready": gate["print_ready"],
-                 "failed_gates": gate["failed_gates"]},
+                 "failed_gates": gate["failed_gates"],
+                 "gates": gate["gates"]},
         "measured": {
             "stage_report": report,
             "self_intersection": sx,
@@ -520,3 +572,104 @@ def tooth_faces_from_labels(scan_faces, labels, fdi: int) -> np.ndarray:
         raise ValueError(f"{len(lab)} labels for a mesh of at least "
                          f"{int(F.max()) + 1} vertices")
     return (lab[F] == int(fdi)).all(axis=1)
+# ---------------------------------------------------------------------------
+# 2.6  attachments - the ONLY boolean in this construction
+# ---------------------------------------------------------------------------
+
+def union_attachments(verts, faces, solids, stage: int = 1) -> dict:
+    """Union `solids` onto the deformed cast, then re-measure the result.
+
+    THIS IS THE ONE BOOLEAN IN THE DEFORMATION PATH, and it is here because
+    an attachment is genuinely added material - a composite button bonded to
+    enamel, which no amount of blending the existing surface can produce. The
+    cast itself is never booleaned: its topology is inherited from T0 and that
+    is what keeps every stage's index buffer identical.
+
+    RE-MEASURED, NOT ASSUMED. `aggregate_gate_v2` decided on the deformed cast
+    BEFORE this union, and a boolean can break what it certified - s.23
+    measured a union producing coincident positions wherever a solid touches
+    itself, which binary STL cannot express and a reader's weld turns into a
+    non-manifold edge. So the file-level and self-intersection gates are run
+    again on the union's own output, and both answers are reported: what the
+    cast measured, and what the file a lab receives measures.
+
+    Refuses rather than repairs. One positive-volume body or nothing: more
+    than one means an attachment is floating clear of the tooth it is meant to
+    be bonded to, which is `fuse_to_crown`'s rule and the same rule s.16 sets
+    for a bonded attachment.
+    """
+    import manifold3d as m3
+
+    t0 = time.perf_counter()
+    V = np.asarray(verts, float)
+    F = np.asarray(faces, np.int64)
+    if not solids:
+        return {"applied": False, "verts": V, "faces": F,
+                "reason": "no attachments on any moving tooth"}
+
+    def _solid(v, f):
+        return m3.Manifold(m3.Mesh(
+            vert_properties=np.asarray(v, np.float32),
+            tri_verts=np.asarray(f, np.uint32)))
+
+    fused = _solid(V, F)
+    for s in solids:
+        fused = fused + _solid(s["verts"], s["faces"])
+
+    # A tangential boolean leaves the odd inside-out shell, whose volume is
+    # NEGATIVE - a void, not geometry. s.10 measured [27572.4, -1.9] mm3.
+    bodies = [b for b in fused.decompose() if b.volume() > 0]
+    crumbs = len(fused.decompose()) - len(bodies)
+    if len(bodies) != 1:
+        raise AttachmentUnionRefused(
+            "attachment_not_bonded",
+            {"reason": (f"the union produced {len(bodies)} positive-volume "
+                        f"bodies. More than one means an attachment is not "
+                        f"touching the tooth it is bonded to."),
+             "positive_bodies": len(bodies), "inverted_crumbs_discarded": crumbs,
+             "stage": int(stage),
+             "attachments": [{"tooth_id": s.get("tooth_id"),
+                              "attachment_id": s.get("attachment_id"),
+                              "shape": s.get("shape")} for s in solids]})
+
+    mesh = bodies[0].to_mesh()
+    uv = np.asarray(mesh.vert_properties[:, :3], float)
+    uf = np.asarray(mesh.tri_verts, np.int64)
+
+    # The gates again, on what the boolean actually produced.
+    uv32 = uv.astype(np.float32).astype(np.float64)
+    blob = cg.write_binary_stl_bytes(uv32, uf)
+    validation = mfg.validate_printable_stl(blob)
+    file_d = _file_dict(validation)
+    sx = si.self_intersection_report(uv32, uf)
+
+    ok = (file_d.get("open") == 0 and file_d.get("nonmanifold") == 0
+          and file_d.get("components") == 1 and file_d.get("winding_ok") is True
+          and isinstance(file_d.get("volume"), float) and file_d["volume"] > 0
+          and sx.get("measured") is True and sx.get("intersecting_pairs") == 0)
+
+    return {
+        "applied": True, "ok": bool(ok),
+        "verts": uv32, "faces": uf, "blob": blob,
+        "file": file_d, "self_intersection": sx,
+        "attachments": [{"tooth_id": s.get("tooth_id"),
+                         "attachment_id": s.get("attachment_id"),
+                         "shape": s.get("shape"),
+                         "volume_mm3": round(float(s.get("volume_mm3") or 0.0), 3)}
+                        for s in solids],
+        "positive_bodies": 1, "inverted_crumbs_discarded": int(crumbs),
+        "volume_mm3": round(float(bodies[0].volume()), 3),
+        "triangles": int(len(uf)),
+        "seconds": round(time.perf_counter() - t0, 3),
+        "note": ("the cast's own gate was decided BEFORE this union; these "
+                 "are the file-level and self-intersection gates re-run on "
+                 "the union's output."),
+    }
+
+
+class AttachmentUnionRefused(Exception):
+    """The attachment union did not produce one bonded solid."""
+
+    def __init__(self, reason: str, detail: dict):
+        super().__init__(reason)
+        self.reason, self.detail = reason, detail
