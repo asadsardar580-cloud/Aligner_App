@@ -146,10 +146,17 @@ def test_a_seam_vertex_is_in_no_rigid_set(case):
     print(f"PASS  {len(seam)} seam vertices, none in the rigid set")
 
 
-def test_labels_shorter_than_the_mesh_are_refused(case):
+@pytest.mark.parametrize("n_drop,name", [(5, "short"), (None, "empty")])
+def test_labels_that_do_not_cover_the_mesh_are_refused(case, n_drop, name):
+    """Refused, never indexed. An EMPTY array is the case the first version of
+    this guard let through - it tested `lab.max(initial=-1) >= 0` first, which
+    an empty array fails, so `lab[F]` raised IndexError instead: an opaque 500
+    about a correspondence problem the caller could have been told about."""
+    lab = case["labels"]
+    lab = lab[: -n_drop] if n_drop else lab[:0]
     with pytest.raises(ValueError, match="labels"):
-        v2.tooth_faces_from_labels(case["f"], case["labels"][:-5], 44)
-    print("PASS  a short label array is refused, not silently indexed")
+        v2.tooth_faces_from_labels(case["f"], lab, 44)
+    print(f"PASS  a {name} label array is refused, not silently indexed")
 
 
 # ---------------------------------------------------------------------------

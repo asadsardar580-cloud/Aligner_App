@@ -568,7 +568,11 @@ def tooth_faces_from_labels(scan_faces, labels, fdi: int) -> np.ndarray:
     lab = np.asarray(labels).astype(np.int64).reshape(-1)
     if not len(F):
         return np.zeros(0, bool)
-    if lab.max(initial=-1) >= 0 and len(lab) <= int(F.max()):
+    # A label array shorter than the mesh must be REFUSED, not indexed. The
+    # first version of this guard was `lab.max(initial=-1) >= 0 and ...`,
+    # which an EMPTY array skips - and `lab[F]` then raises IndexError, an
+    # opaque 500 about a correspondence problem the caller can act on.
+    if len(lab) <= int(F.max()):
         raise ValueError(f"{len(lab)} labels for a mesh of at least "
                          f"{int(F.max()) + 1} vertices")
     return (lab[F] == int(fdi)).all(axis=1)

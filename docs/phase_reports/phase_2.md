@@ -93,7 +93,7 @@ PASS  all 280 shared vertices went to moving, and were counted
 PASS  order-independent; resolved {'45': 280}
 PASS  planned: 419 free vertices, 280 rigid
 PASS  a wrong-length face mask is refused
-10 passed, 1 warning in 0.92s
+11 passed, 1 warning in 1.53s
 ```
 
 ### 2.4 / 2.5 / 2.6 — the flag, over HTTP
@@ -110,8 +110,23 @@ PASS  1 stage STL(s); occlusion checked=False and says so
 PASS  print_compensation_mm refused for the deformation path
 PASS  attachment unioned: 14112 tris, 28339.961 mm3, ok=True, 1 crumb(s) discarded
 PASS  1 stage(s), no boolean performed
-10 passed, 13 warnings in 34.71s
+12 passed, 13 warnings in 24.83s
 ```
+
+### All three export formats, on the deformation path
+
+2.4 asks for the same response shape. §24.6 already pins for the collar that a
+format is not a way around the gate; the same holds here.
+
+```
+zip       200  X-Print-Ready=true X-Export-Format=zip       346,338 bytes  application/zip
+stl       200  X-Print-Ready=true X-Export-Format=stl       705,684 bytes  model/stl
+manifest  200  X-Print-Ready=true X-Export-Format=manifest    6,789 bytes  application/json
+raw STL is byte-identical to the one inside the ZIP: True
+reread 7,058 verts / 14,112 faces
+```
+
+Pinned by `test_all_three_export_formats_go_through_the_same_gate`.
 
 ### The collar path, re-run on merit
 
@@ -120,6 +135,35 @@ $ .venv/Scripts/python.exe -m pytest test_staging_export.py \
       test_manufacturing_matrix.py test_manufacturing_interface.py -q
 87 passed, 3 warnings in 239.67s (0:03:59)
 ```
+
+### The canonical runner, on the final tree
+
+```
+$ .venv/Scripts/python.exe -u run_all_tests.py
+  PASS  self-intersection          6 passed, 1 warning in 7.74s
+  PASS  deformation construction   16 passed, 1 warning in 5.85s
+  PASS  stage matrix shared        46 passed, 2 warnings in 0.10s
+  PASS  deformation vertex sets    11 passed, 1 warning in 0.42s
+  PASS  deformation export API     12 passed, 13 warnings in 24.83s
+  PASS  real scan (local)          observed exit code  3
+==================================================================
+55 PASS / 0 SKIP / 0 FAIL
+ALL EXECUTED TESTS PASSED
+```
+
+52 entries before this phase, 55 after. `real scan (local)` still observes
+exit code 3 — Phase 0 pinned that as today's collar state and Phase 2 did not
+change it.
+
+### pytest, on the final tree
+
+```
+$ .venv/Scripts/python.exe -u -m pytest -q
+550 passed, 17 warnings in 631.81s (0:10:31)
+```
+
+545 before the hardening commit, 550 after (+5: format parity, the refusal
+status codes, and the split short/empty label guard).
 
 ### Structure, frontend and the cross-language pins
 

@@ -4337,8 +4337,21 @@ def build_stage_bundle_v2(sid: str, req: StageExportRequest) -> dict:
                     "note": ("the deformed cast passed its own gates; the "
                              "attachment union did not.")}
         blobs[name] = blob
+        # EVERY NUMBER HERE DESCRIBES THE BYTES IN `blob`, which is the
+        # attachment union's output when there was one and the deformed cast
+        # otherwise. Reporting `len(plan.F)` unconditionally would describe
+        # the cast while the file carried the union - the same class of
+        # mismatch as a volume recomputed on a pre-offset solid (s.20.4).
+        file_gate_ok = (att["ok"] if att.get("applied")
+                        else bool(gate.get("gates", {})
+                                  .get("written_file_topology", {}).get("ok")))
+        file_failed = [g for g in (gate.get("failed_gates") or [])
+                       if g in ("written_file_topology",
+                                "attachment_union_file_topology")]
         stage_meta.append({
-            "stage": k, "file": name, "triangles": int(len(plan.F)),
+            "stage": k, "file": name,
+            "triangles": int(att["triangles"] if att.get("applied")
+                             else len(plan.F)),
             "volume_mm3": file_d.get("volume"),
             "components": file_d.get("components"),
             "manufacturing_gate": gate,
@@ -4350,11 +4363,11 @@ def build_stage_bundle_v2(sid: str, req: StageExportRequest) -> dict:
                 "connected_components": int(file_d.get("components") or 0),
                 "winding_consistent": bool(file_d.get("winding_ok")),
                 "volume_mm3": file_d.get("volume"),
-                "verdict": ("PASS" if gate.get("gates", {})
-                            .get("written_file_topology", {}).get("ok")
-                            else "FAIL"),
-                "failed_gates": [g for g in (gate.get("failed_gates") or [])
-                                 if g == "written_file_topology"],
+                "verdict": "PASS" if file_gate_ok else "FAIL",
+                "failed_gates": file_failed,
+                "measured_on": ("the attachment union's output"
+                                if att.get("applied")
+                                else "the deformed cast"),
             },
             "self_intersection": out["self_intersection"],
             "attachments": {k2: v2 for k2, v2 in att.items()

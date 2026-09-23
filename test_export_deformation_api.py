@@ -303,9 +303,21 @@ def test_an_attachment_is_unioned_onto_the_deformed_cast_and_regated():
         assert "file" in att and "self_intersection" in att, att
         assert att["self_intersection"].get("measured") is True
         assert att["positive_bodies"] == 1
+
+        # EVERY REPORTED NUMBER MUST DESCRIBE THE BYTES SHIPPED. The union
+        # changes the triangle count, so a stage that reported `len(plan.F)`
+        # unconditionally would describe the cast while the file carried the
+        # union - the same class of mismatch as a volume recomputed on a
+        # pre-offset solid (s.20.4).
+        import stl_io
+        meta = man["stage_files"][0]
+        fv, ff = stl_io.parse_stl_bytes(z.read(meta["file"]))
+        assert meta["triangles"] == len(ff), (meta["triangles"], len(ff))
+        assert meta["stl_validation"]["measured_on"] ==             "the attachment union's output"
         print(f"PASS  attachment unioned: {att['triangles']} tris, "
               f"{att['volume_mm3']} mm3, ok={att['ok']}, "
-              f"{att['inverted_crumbs_discarded']} crumb(s) discarded")
+              f"{att['inverted_crumbs_discarded']} crumb(s) discarded; "
+              f"manifest triangles == file triangles ({len(ff)})")
     finally:
         _drop(sid)
 
@@ -330,6 +342,89 @@ def test_no_attachments_means_no_boolean_at_all():
         print(f"PASS  {len(man['stage_files'])} stage(s), no boolean performed")
     finally:
         _drop(sid)
+
+
+
+def test_all_three_export_formats_go_through_the_same_gate():
+    """2.4 asks for the SAME response shape, and s.24.6 already pins for the
+    collar that a format is not a way around the gate. The raw STL and the
+    one inside the ZIP must be byte-identical, or `fmt` would be a second
+    code path producing a second file."""
+    import io
+    import zipfile
+
+    sid, _ = _session(SPACED, dict(NO_MOVE, d_oa=0.15))
+    try:
+        got = {}
+        for fmt in ("zip", "stl", "manifest"):
+            r = client.post(f"/api/session/{sid}/export/final",
+                            json={"construction": "deformation", "fmt": fmt})
+            assert r.status_code == 200, (fmt, r.text[:600])
+            # The verdict is carried identically whatever the wrapper.
+            assert r.headers["X-Print-Ready"] == "true", (fmt, dict(r.headers))
+            assert r.headers["X-Export-Format"] == fmt
+            got[fmt] = r.content
+
+        z = zipfile.ZipFile(io.BytesIO(got["zip"]))
+        inner = [n for n in z.namelist() if n.endswith(".stl")]
+        assert len(inner) == 1, z.namelist()
+        assert z.read(inner[0]) == got["stl"],             "the bare STL differs from the one inside the ZIP"
+        assert json.loads(got["manifest"])["construction"].startswith(
+            "deformation")
+        print(f"PASS  zip {len(got['zip']):,}B / stl {len(got['stl']):,}B / "
+              f"manifest {len(got['manifest']):,}B; STL byte-identical")
+    finally:
+        _drop(sid)
+
+
+
+# ---------------------------------------------------------------------------
+# The refusal paths - the same status codes the collar path uses
+# ---------------------------------------------------------------------------
+
+def test_the_deformation_path_refuses_with_a_status_never_a_500():
+    """s.19 pins that every session endpoint 404s rather than 500s on an
+    expired session. A second construction must not be the one place that
+    contract stops holding - and each refusal has to be a DIFFERENT code, so
+    a client can tell "nothing cut" from "no occlusal plane"."""
+    seen = {}
+
+    sid, reqs, _ = arch_session(teeth=(-0.25, 0.25), n_s=120, n_t=32)
+    try:
+        r = client.post(f"/api/session/{sid}/export/stages",
+                        json={"construction": "deformation"})
+        seen["nothing cut"] = r.status_code
+        assert r.status_code == 400, r.text[:300]
+        assert "cut" in r.json()["detail"].lower()
+
+        client.post(f"/api/session/{sid}/cut",
+                    json=json.loads(reqs[0].json()))
+        r = client.post(f"/api/session/{sid}/export/stages",
+                        json={"construction": "deformation"})
+        seen["no movement"] = r.status_code
+        assert r.status_code == 400, r.text[:300]
+        assert "movement" in r.json()["detail"].lower()
+    finally:
+        _drop(sid)
+
+    sid2 = STORE.create("lower")
+    try:
+        STORE.put(sid2, "verts", np.zeros((3, 3)))
+        STORE.put(sid2, "faces", np.array([[0, 1, 2]]))
+        r = client.post(f"/api/session/{sid2}/export/stages",
+                        json={"construction": "deformation"})
+        seen["no occlusal plane"] = r.status_code
+        assert r.status_code == 409, r.text[:300]
+    finally:
+        _drop(sid2)
+
+    r = client.post("/api/session/deadbeef/export/stages",
+                    json={"construction": "deformation"})
+    seen["expired session"] = r.status_code
+    assert r.status_code == 404, r.text[:300]
+
+    assert 500 not in seen.values(), seen
+    print(f"PASS  {seen}")
 
 
 if __name__ == "__main__":
