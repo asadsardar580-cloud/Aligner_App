@@ -2,16 +2,21 @@
 #
 #   pip install -r requirements.txt -r requirements-dev.txt
 #
-# The canonical test runner remains `python run_all_tests.py` — it drives all
-# 36 entries as subprocesses and forces UTF-8 on the children, which matters:
+# The canonical test runner remains `python run_all_tests.py` - it drives all
+# 52 entries as subprocesses and forces UTF-8 on the children, which matters:
 # a test that printed "mm³" once died with UnicodeEncodeError on a cp1256
 # console AFTER every assertion in it had passed, reporting a green file as a
 # failure. pytest runs alongside it and both must pass; it is not a
 # replacement.
-pytest
+pytest==9.1.1
 
 # SAST gate. Run as a CI job, never as a pre-commit hook — see .semgrep.yml for
 # why. Installing it also pulls in the opentelemetry SDK as a transitive
 # dependency, which is how telemetry.py's OTel bridge comes to be exercised
 # locally; telemetry.py works identically without it.
-semgrep
+semgrep==1.177.0
+
+# 17 of the 52 canonical entries are pytest modules, so a virtualenv built
+# from requirements.txt ALONE cannot run the suite - verified on 2026-09-23:
+# 35 PASS / 17 FAIL, every failure "No module named pytest". Install both
+# files to reproduce the suite on a fresh machine.
