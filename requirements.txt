@@ -1,25 +1,30 @@
-# --- Desktop application (legacy app_ui.py) ---
-PyQt6
-pyvista
-pyvistaqt
-vtk
+# SERVER REQUIREMENTS. Every version here is the EXACT version this tree was
+# verified against, read from `pip freeze` in the project venv on 2026-09-23 -
+# not from any document. Pinned because manifold3d decides every boolean in
+# the manufacturing path and numpy 1 vs 2 changes array semantics, so an
+# unpinned install is a different product.
+#
+# The legacy PyQt6 desktop shell's dependencies moved to
+# requirements-desktop.txt: PyQt6, pyvista, pyvistaqt and vtk are needed only
+# by app_ui.py, which CLAUDE.md itself labels "not the product", and on a
+# headless server they are several hundred MB of unusable weight.
 
 # --- Core geometry engine (required by everything) ---
-numpy
-scipy
+numpy==2.5.2
+scipy==1.18.1
 
 # --- API backend (required for the current UI) ---
 # start_backend.bat runs: python -m uvicorn api_core:app --host 127.0.0.1 --port 8000 --reload
-fastapi
-uvicorn
-python-multipart
+fastapi==0.141.1
+uvicorn==0.52.4
+python-multipart==0.0.32
 
 # --- Boolean STL export (required by POST /api/session/{sid}/export/stages) ---
 # manifold3d was commented out while the whole file claimed to be installable.
 # It is not optional: api_core._to_manifold imports it and the staged
 # manufacturing export cannot build a fused solid without it, so three test
 # files (staging export, occlusal collision, cut endpoint) fail without it too.
-manifold3d
+manifold3d==3.5.2
 
 # --- AI segmentation, ToothGroupNetwork (required by POST .../segment) ---
 # All four are on the live inference path, verified by import, not assumed:
@@ -33,10 +38,10 @@ manifold3d
 # CPU-only by design: cpu_compat.py and pointops_cpu.py shim away the CUDA
 # assumptions in the vendored network. The default PyPI torch wheel is CPU;
 # only add the PyTorch CUDA index if you deliberately want GPU.
-torch
-scikit-learn
-trimesh
-open3d
+torch==2.13.0
+scikit-learn==1.9.0
+trimesh==5.1.0
+open3d==0.19.0
 
 # --- AI segmentation, CrossTooth (the second provider, ?provider=crosstooth) ---
 # einops is the ONLY package CrossTooth adds, and it is genuinely load-bearing:
@@ -64,16 +69,22 @@ open3d
 #               Verified by following the import chain, not by reading the
 #               requirements file (CLAUDE.md s.19 records getting that wrong
 #               the other way round for trimesh and open3d).
-einops
+einops==0.8.2
 
 # --- Encrypted local case files (opt-in treatment-state persistence) ---
 # Never hand-rolled: Fernet gives AES-128-CBC plus an HMAC-SHA256 tag, so a
 # tampered or truncated case file is REJECTED rather than silently decrypted
 # into a half-plan. Treatment state only - no scan geometry is ever written.
-cryptography
+cryptography==50.0.1
 
-# Versions this was last verified against (2026-09-15), for reference:
-#   numpy 2.5.2 · scipy 1.18.1 · fastapi 0.141.1 · uvicorn 0.52.4
-#   python-multipart 0.0.32 · manifold3d 3.5.2 · torch 2.13.0+cpu
-#   scikit-learn 1.9.0 · trimesh 5.1.0 · open3d 0.19.0 · Python 3.12.7
-#   einops 0.8.2 (added 2026-09-22 with the CrossTooth provider)
+# OPTIONAL, deliberately unpinned and unlisted:
+#   zstandard - scan_cache_manager imports it behind a guard and falls back to
+#               zlib, recording the codec per entry, so a cache written by one
+#               installation still reads on another. Install it for a smaller
+#               cache; nothing requires it.
+#   opentelemetry-* - telemetry.py has a builtin writer and uses the SDK only
+#               if it is already present. Absent by design: an OTel install is
+#               a data-egress path, and a semgrep rule fails the build on any
+#               network exporter.
+#
+# Verified on 2026-09-23 with Python 3.12.7 on Windows.

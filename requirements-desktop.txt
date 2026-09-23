@@ -1,0 +1,17 @@
+# DESKTOP SHELL ONLY - not needed to run the product.
+#
+# `app_ui.py` is a legacy PyQt6 shell over the same geometry engine. It runs,
+# and it is explicitly not the product: the shipped client is the React
+# frontend against `api_core:app`. These four packages are several hundred MB
+# and pull a GUI toolkit and VTK onto any machine that installs them, which on
+# a headless server is unusable weight and additional attack surface.
+#
+# Install only if you intend to run app_ui.py:
+#     .venv\Scripts\pip install -r requirements-desktop.txt
+#
+# Exact versions from `pip freeze` on 2026-09-23, Python 3.12.7.
+
+PyQt6==6.11.0
+pyvista==0.48.4
+pyvistaqt==0.12.0
+vtk==9.6.2
