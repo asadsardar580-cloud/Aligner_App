@@ -18,7 +18,7 @@ print-ready STLs.
 frontend/src/App.jsx          React 19 + three.js 0.185, built by Vite
         |   HTTP to 127.0.0.1:8000, CORS-locked to :5173
         v
-api_core.py                   THE live FastAPI app — 14 routes
+api_core.py                   THE live FastAPI app — 37 routes
         |
         +-- core_geometry.py      5,638 lines. Pure NumPy/SciPy. All geometry
         |                         and kinematics. No UI imports, fully headless.
@@ -54,7 +54,7 @@ runs, but it is not the product path.
    not a rotation; measured, it reaches 1.68e-2 orthogonality error against 4.44e-16 for the
    parameter path.
 
-Full detail, including the measured regressions behind each one, is in **`CLAUDE.md`** — the
+Full detail, including the measured regressions behind each one, is in **`docs/HISTORY_CLAUDE_2026-09.md`** — the
 authoritative architecture document.
 
 ---
@@ -111,8 +111,8 @@ sidebar's connection badge, or poll `/api/ai/status`.
 
 ```powershell
 python -m compileall .                  # syntax, whole tree
-python check_structure.py               # undefined names, without importing (101 files)
-python run_all_tests.py                 # canonical runner — 42 entries
+python check_structure.py               # undefined names, without importing (117 files)
+python run_all_tests.py                 # canonical runner — 52 entries; PASS / SKIP(77) / FAIL
 python verify_pointops.py               # the CPU pointops shim, against upstream
 python -m pytest -q                     # runs alongside; both must pass
 python benchmark_providers.py           # every segmentation model over one scan
@@ -148,7 +148,7 @@ every entry can fail.
   belong to the mesh at all — `segmentation_diagnostics` measures per-tooth bounding box, counts
   and disconnected components, because a label array read against the wrong vertex ordering scores
   perfectly on every accuracy metric including IoU. On the real scan that check moved the median
-  per-tooth box from 50.71 mm to 13.97 mm (CLAUDE.md §24.3).
+  per-tooth box from 50.71 mm to 13.97 mm (docs/HISTORY_CLAUDE_2026-09.md §24.3).
 - **Two models are installed and NEITHER is validated.** `benchmark_providers.py` measures
   geometry (a tooth is one connected lump of a plausible size) and inter-model agreement, and it
   deliberately reports no accuracy figure, because that needs an independent annotation this
@@ -157,13 +157,13 @@ every entry can fail.
   against 0.523, largest tooth box 17.8 mm against 51.0 mm — and **the default was not changed on
   that basis**, because "better geometry" is not "correct teeth". The two models agree on the
   quadrant convention (0.4884 as mapped against 0.0559 mirrored) and disagree by one tooth along
-  the 3x quadrant; which of them is the shifted one is not established (CLAUDE.md §25).
+  the 3x quadrant; which of them is the shifted one is not established (docs/HISTORY_CLAUDE_2026-09.md §25).
 - **Real-scan manufacturing is NOT VERIFIED end to end.** Seven real teeth now cut successfully,
   one of seven builds a complete local interface, and staging refuses by name with measured
-  numbers. No manufacturing gate result anywhere is based on the real scan (CLAUDE.md §24.7).
+  numbers. No manufacturing gate result anywhere is based on the real scan (docs/HISTORY_CLAUDE_2026-09.md §24.7).
 - **The workspace redesign is not done.** The FDI colour system, the tooth legend, the design
   tokens and the focus and reduced-motion rules shipped; the top bar, workflow rail and context
-  panel did not, and `App.jsx` is still one large file (CLAUDE.md §24.9).
+  panel did not, and `App.jsx` is still one large file (docs/HISTORY_CLAUDE_2026-09.md §24.9).
 - **Segmentation cannot be cancelled** — ~236 s on a real scan, and `asyncio.to_thread` gives no
   cancellation point inside the model.
 - **A browser refresh now restores the case**, since the hydration endpoints landed: crowns, poses,
@@ -207,7 +207,7 @@ filenames are stored nowhere, because filenames routinely carry patient names. E
 * The connector is a **bounded transition collar that ENCLOSES the crown's
   cervical crease**, with both rings placed by measured signed distance against
   the actual crown and the actual cast. That is what stops the fused solid
-  touching itself — see CLAUDE.md §23.
+  touching itself — see docs/HISTORY_CLAUDE_2026-09.md §23.
 * The **final STL is validated after write and readback**, simulating a
   downstream reader's weld.
 * **TWO VERDICTS, and they are not the same claim.**

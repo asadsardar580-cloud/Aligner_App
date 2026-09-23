@@ -27,6 +27,10 @@ import sys
 
 SKIP_DIRS = {
     ".venv", "node_modules", "__pycache__", ".git", "dist", "ssr_out", "ssr_out2",
+    ".venv_check",            # the throwaway venv the fresh-install check
+                              # builds; skipped so coverage of the real
+                              # tree is not diluted by site-packages.
+    ".pytest_cache", ".ruff_cache",
     "_archive",               # dead code, kept for reference only
     "Aligner_App_AI_Export",  # generated duplicate of the whole tree
     "ToothGroupNetwork",      # vendored third party — never edited, never linted
