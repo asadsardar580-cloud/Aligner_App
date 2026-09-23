@@ -66,6 +66,15 @@ import core_geometry as cg
 #: the radial profile could not be sampled. None must fail a gate, not pass it.
 KEY_LOOKS_LIKE_A_LEDGE = "looks_like_a_ledge"
 
+#: Set on any dict produced from a distance measurement that could not be
+#: taken. Its presence is the reason; its absence means the measurement ran.
+KEY_DISTANCE_FAILURE = "distance_measurement_failed"
+
+#: The last exception `_point_to_surface` swallowed, or None. Module-level so
+#: a caller can surface the REASON into its manifest without every signature
+#: growing an out-parameter. Read it immediately after the call.
+LAST_DISTANCE_FAILURE = None
+
 
 # ---------------------------------------------------------------------------
 # Policy
@@ -1452,19 +1461,49 @@ def _point_to_surface(pts, verts, faces, candidates=24):
     it was quietly failing the unaffected-cast fidelity gate.
 
     `RaycastingScene.compute_distance` is exact and is already a dependency.
+
+    THERE IS NO LONGER A SILENT FALLBACK (AGENT_BRIEF B13, A1 rule 6). This
+    function used to catch EVERY exception and drop through to the candidate
+    search below - the approximation the docstring above spends two paragraphs
+    explaining is wrong. A transient Open3D failure would therefore have every
+    manufacturing gate evaluated on a method measured at 13.3% correct on a
+    steep cervical wall, with nothing recorded anywhere. A measurement that
+    cannot be taken returns NaN and fails; it does not answer with a method
+    known to be wrong, because a wrong answer is worse than no answer.
+
+    The approximation survives as `_point_to_surface_approximate`, which
+    nothing calls automatically.
     """
-    from scipy.spatial import cKDTree
+    global LAST_DISTANCE_FAILURE
+    n = len(np.atleast_2d(np.asarray(pts, float)))
     try:
         import open3d as o3d
         _sc = o3d.t.geometry.RaycastingScene()
         _sc.add_triangles(
             o3d.core.Tensor(np.asarray(verts, np.float32), o3d.core.float32),
             o3d.core.Tensor(np.asarray(faces, np.uint32), o3d.core.uint32))
-        return _sc.compute_distance(
+        out = _sc.compute_distance(
             o3d.core.Tensor(np.atleast_2d(np.asarray(pts, np.float32)),
                             o3d.core.float32)).numpy().astype(float)
-    except Exception:                                     # noqa: BLE001
-        pass
+        LAST_DISTANCE_FAILURE = None
+        return out
+    except Exception as e:                                # noqa: BLE001
+        LAST_DISTANCE_FAILURE = (
+            f"exact point-to-triangle distance unavailable: "
+            f"{type(e).__name__}: {e}")
+        return np.full(n, np.nan)
+
+
+def _point_to_surface_approximate(pts, verts, faces, candidates=24):
+    """THE APPROXIMATION. Kept, named, and called by nothing automatically.
+
+    It shortlists the `candidates` triangles whose CENTROIDS are nearest, so
+    on a cast underside where a triangle can be 20mm across it can miss the
+    triangle the point actually sits on: measured, 793 of 4710 vertices
+    reported exactly 9.0000mm. Use it only where that is acceptable and say so
+    at the call site.
+    """
+    from scipy.spatial import cKDTree
     pts = np.atleast_2d(np.asarray(pts, float))
     verts = np.asarray(verts, float)
     faces = np.asarray(faces, np.int64)
@@ -1543,8 +1582,24 @@ def surface_deviation(ref_verts, ref_faces, test_verts, test_faces,
                 "note": "every sampled point fell inside the excluded region"}
 
     d = _point_to_surface(pts, ref_verts, np.asarray(ref_faces, np.int64))
+    # A MEASUREMENT THAT COULD NOT BE TAKEN IS NOT A ZERO. Reporting 0.0 here
+    # would read as a perfectly reproduced cast, which is the most dangerous
+    # possible value for this particular dict.
+    if not np.all(np.isfinite(d)):
+        return {
+            "compared_points": int(len(pts)),
+            "measured": False,
+            KEY_DISTANCE_FAILURE: (LAST_DISTANCE_FAILURE
+                                   or "non-finite distances"),
+            "max_mm": float("nan"), "mean_mm": float("nan"),
+            "rms_mm": float("nan"), "p95_mm": float("nan"),
+            "p99_mm": float("nan"),
+            "non_finite_points": int((~np.isfinite(d)).sum()),
+            "measure": "point-to-TRIANGLE distance, test -> ref surface",
+        }
     return {
         "compared_points": int(len(pts)),
+        "measured": True,
         "max_mm": round(float(d.max()), 6),
         "mean_mm": round(float(d.mean()), 6),
         "rms_mm": round(float(np.sqrt((d ** 2).mean())), 6),
@@ -2008,6 +2063,14 @@ def old_site_quality(original_verts, original_faces,
     cell = grid_mm * grid_mm
     # Distance from the final surface over the site to the ORIGINAL cast.
     d_site = _point_to_surface(p3 + h_fin[:, None] * n, orig, of)
+    # `nan > tol` is False, so a failed distance would report a site that
+    # nothing had touched - a pristine old socket. Refuse to assess instead.
+    if not np.all(np.isfinite(d_site)):
+        return {"measured": False,
+                KEY_DISTANCE_FAILURE: (LAST_DISTANCE_FAILURE
+                                       or "non-finite distances"),
+                "reason": "the distance from the restored site to the "
+                          "original cast could not be measured"}
     moved = d_site > tol_mm
     flat = np.abs(h_fin - np.median(h_fin)) <= tol_mm
 
@@ -2183,12 +2246,26 @@ def aggregate_print_gate(stage: dict, policy=None) -> dict:
     fid = stage.get("cast_fidelity") or {}
     fwd = fid.get("original_to_final") or {}
     rev = fid.get("final_to_original") or {}
-    ok_fid = (fwd.get("max_mm") is not None and rev.get("max_mm") is not None
-              and max(fwd["max_mm"], rev["max_mm"])
-              <= pol.max_unaffected_deviation_mm)
+    # FINITENESS IS ITS OWN CHECK, AND IT COMES FIRST. `max(0.001, nan)`
+    # returns 0.001 in Python - `nan > 0.001` is False, so `max` keeps the
+    # first argument - so a NaN in the SECOND direction used to sail through
+    # `max(...) <= threshold` and pass this gate. Measured before the fix:
+    # {"original_to_final": 0.001, "final_to_original": nan} -> passed True.
+    # This is CLAUDE.md s.14's rule in a fourth place: every comparison
+    # against NaN is False, so an `x <= t` test is never exhaustive on its own.
+    _fwd_max, _rev_max = fwd.get("max_mm"), rev.get("max_mm")
+    _both_measured = (
+        _fwd_max is not None and _rev_max is not None
+        and np.isfinite(_fwd_max) and np.isfinite(_rev_max)
+        and fwd.get("measured", True) and rev.get("measured", True))
+    ok_fid = bool(_both_measured
+                  and max(_fwd_max, _rev_max) <= pol.max_unaffected_deviation_mm)
     gate("unaffected_cast_fidelity_two_sided", ok_fid,
          {"original_to_final_max_mm": fwd.get("max_mm"),
-          "final_to_original_max_mm": rev.get("max_mm")},
+          "final_to_original_max_mm": rev.get("max_mm"),
+          "both_directions_measured": bool(_both_measured),
+          KEY_DISTANCE_FAILURE: (fwd.get(KEY_DISTANCE_FAILURE)
+                                 or rev.get(KEY_DISTANCE_FAILURE))},
          "point-to-TRIANGLE distance in BOTH directions, outside the allowed "
          "reconstruction envelope")
 
