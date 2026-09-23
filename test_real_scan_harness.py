@@ -159,6 +159,52 @@ def test_transition_quality_really_emits_that_key():
 
 
 # ---------------------------------------------------------------------------
+# Pinning the PROCESS exit code, for a refusal that never reaches a gate
+# ---------------------------------------------------------------------------
+
+def test_no_expectation_passes_the_natural_code_through():
+    for code in (0, 1, 2, 3, 77):
+        assert rsr.exit_code_for_process(code) == code
+    print("PASS  without --expect-exit the natural code is untouched")
+
+
+def test_a_matching_exit_code_passes():
+    assert rsr.exit_code_for_process(3, 3) == 0
+    print("PASS  natural 3 against expect-exit 3 -> 0")
+
+
+def test_a_mismatch_in_EITHER_direction_fails():
+    """Including an improvement. 0 means the run started succeeding, which
+    invalidates the pinned expectation and must be looked at, not absorbed."""
+    for natural in (0, 1, 2, 4):
+        assert rsr.exit_code_for_process(natural, 3) == 1, natural
+    print("PASS  0, 1, 2 and 4 against expect-exit 3 all -> 1")
+
+
+def test_SKIP_survives_the_pin():
+    """77 means the scan is not on this machine, which is normal.
+
+    Mapping it to a mismatch would turn "not verified here" into a failure
+    and destroy the distinction the suite's SKIP state exists to preserve.
+    """
+    import run_all_tests
+    assert rsr.SKIP_EXIT_CODE == run_all_tests.SKIP_EXIT_CODE == 77
+    assert rsr.exit_code_for_process(77, 3) == 77
+    assert rsr.exit_code_for_process(77, 0) == 77
+    print("PASS  an absent scan still SKIPs, whatever exit code is pinned")
+
+
+def test_the_suite_entry_pins_the_measured_exit_code():
+    import run_all_tests
+    row = next(r for r in run_all_tests.TESTS
+               if run_all_tests._entry(r)[1] == "real_scan_regression.py")
+    _n, _p, args = run_all_tests._entry(row)
+    assert "--expect-exit" in args, args
+    assert args[args.index("--expect-exit") + 1] == "3", args
+    print(f"PASS  real-scan entry pins: {args}")
+
+
+# ---------------------------------------------------------------------------
 # An absent scan is a SKIP signal, not a pass and not a failure
 # ---------------------------------------------------------------------------
 

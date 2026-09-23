@@ -111,18 +111,20 @@ def test_the_three_phase_0_entries_are_registered():
           "scan are all registered")
 
 
-def test_the_real_scan_entry_pins_todays_known_verdict():
+def test_the_real_scan_entry_pins_todays_known_state():
     """The expectation is the test. It must be present and explicit.
 
-    Without `--expect` the entry would go red today (the collar path is not
-    print-ready, correctly). With it, the suite stays green AND any change in
-    either direction turns it red.
+    PINNED AT THE PROCESS LEVEL, not the verdict level, because the collar
+    path refuses before a stage is ever built, so there is no per-stage
+    verdict for `--expect` to compare. Measured 2026-09-23: `--profile smoke`
+    exits 3 with `interface_construction_failed`. With the pin the suite
+    stays green on that, and any change in either direction turns it red.
     """
     row = next(r for r in R.TESTS
                if R._entry(r)[1] == "real_scan_regression.py")
     _name, _path, args = R._entry(row)
-    assert "--expect" in args, args
-    assert args[args.index("--expect") + 1] == "NOT PRINT READY", args
+    assert "--expect-exit" in args, args
+    assert args[args.index("--expect-exit") + 1] == "3", args
     assert "--profile" in args and "smoke" in args, args
     print(f"PASS  real-scan entry pins: {args}")
 

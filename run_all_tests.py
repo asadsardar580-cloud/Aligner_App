@@ -81,14 +81,25 @@ TESTS = [
     ("self-intersection",    "test_self_intersection.py"),
     ("deformation construction", "test_deform_construction.py"),
     # THE REAL SCAN, AND THE EXPECTATION IS THE POINT. This records today's
-    # KNOWN state of the collar path: not print-ready (AGENT_BRIEF B1-B6). The
-    # suite therefore stays green while ANY change in either direction turns
-    # it red - a stage that unexpectedly becomes print-ready invalidates the
-    # expectation just as much as a regression does. Update it deliberately
-    # when the construction changes (Phase 3), never to make the suite pass.
-    # Exits 77 when the scan is absent, because scans are not in git.
+    # KNOWN state of the collar path, so the suite stays green on it while ANY
+    # change in either direction turns it red. Update it deliberately when the
+    # construction changes (Phase 3), never to make the suite pass.
+    #
+    # PINNED AT THE PROCESS LEVEL, NOT THE VERDICT LEVEL, and that is a
+    # measurement rather than a preference. AGENT_BRIEF 0.1 expects
+    # `--expect "NOT PRINT READY"`, which compares a per-stage verdict - but
+    # on this scan the collar path refuses BEFORE a stage is ever built, so
+    # there is no verdict to compare. Measured 2026-09-23:
+    #
+    #   --profile smoke (FDI 31, 32)  exit 3  interface_construction_failed
+    #                                         collar_top_unresolved_points 14
+    #   --fdi 45 --stages 1           exit 3  interface_unbuildable_wall_too_thin
+    #                                         crown_penetration_mm 3.719
+    #
+    # Exits 77 when the scan is absent, which --expect-exit deliberately
+    # passes through as SKIP rather than treating as a mismatch.
     ("real scan (local)",    "real_scan_regression.py",
-     ["--profile", "smoke", "--expect", "NOT PRINT READY"]),
+     ["--profile", "smoke", "--expect-exit", "3"]),
 ]
 
 

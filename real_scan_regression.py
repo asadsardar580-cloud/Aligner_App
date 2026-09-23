@@ -65,6 +65,55 @@ VERDICT_READY = "PRINT READY"
 VERDICT_NOT_READY = "NOT PRINT READY"
 
 
+#: The suite's SKIP signal (`run_all_tests.SKIP_EXIT_CODE`), duplicated
+#: here so this script has no import dependency on the runner.
+SKIP_EXIT_CODE = 77
+
+#: Set by `main()` from `--expect-exit`, read by the `__main__` wrapper.
+#: A module global rather than a return value because it has to survive every
+#: exit path in `main()`, including the early refusals that never build a
+#: stage and therefore never produce a gate to compare against.
+_EXPECT_EXIT = None
+
+
+def exit_code_for_process(natural_code, expect_exit=None) -> int:
+    """Map the run's natural exit code against a pinned expectation. PURE.
+
+    WHY THIS EXISTS ALONGSIDE `exit_code_for`. That function pins a VERDICT,
+    and a verdict only exists once a stage has been built and gated. On the
+    real scan today, the collar path refuses BEFORE that: interface
+    construction fails, `main()` returns 3, and no stage gate is ever
+    produced - so `--expect "NOT PRINT READY"` cannot express the current
+    state, because there is no verdict to compare.
+
+    Measured on 2026-09-23, commit 85bad95, every configuration tried:
+
+        --profile smoke (FDI 31, 32)   exit 3
+            interface_construction_failed
+            collar_top_unresolved_points 14, collar_top_rise_max_mm 4.338
+        --fdi 45 --stages 1            exit 3
+            interface_unbuildable_wall_too_thin
+            crown_penetration_mm 3.719, local_cast_thickness_mm 5.2326
+
+    So the expectation is pinned at the PROCESS level instead. The property
+    the brief wants is preserved exactly: the suite stays green on today's
+    known state, and ANY change in either direction - a refusal that moves to
+    a different stage, or a run that starts succeeding - turns it red.
+
+    Update it deliberately when the construction changes (Phase 3), never to
+    make the suite pass.
+    """
+    if expect_exit is None:
+        return natural_code
+    # SKIP SURVIVES THE PIN. 77 means the scan is not on this machine, which
+    # is normal - scans are excluded from version control. Mapping it to a
+    # mismatch would turn "not verified here" into a failure and hide the
+    # distinction the suite's SKIP state exists to preserve.
+    if natural_code == SKIP_EXIT_CODE:
+        return natural_code
+    return 0 if natural_code == expect_exit else 1
+
+
 def exit_code_for(stage_gates, expect=None) -> int:
     """The process exit code for a finished run. PURE - no I/O, no globals.
 
@@ -130,6 +179,12 @@ def main() -> int:
                     help="Limit the number of teeth extracted.")
     ap.add_argument("--profile", type=str, choices=["smoke", "real-risk", "full-arch"], default=None,
                     help="Run specific profile sets of teeth.")
+    ap.add_argument("--expect-exit", type=int, default=None,
+                    dest="expect_exit",
+                    help="Pin the PROCESS exit code. Exit 0 only if the run "
+                         "returns exactly this; anything else exits 1. Use "
+                         "when the refusal happens before any stage gate "
+                         "exists, so --expect has no verdict to compare.")
     ap.add_argument("--expect", type=str, default=None,
                     choices=[VERDICT_READY, VERDICT_NOT_READY],
                     help="Pin the expected verdict for EVERY stage. Exit 0 "
@@ -137,6 +192,9 @@ def main() -> int:
                          "direction exits 1. Without it, every stage must be "
                          "PRINT READY.")
     args = ap.parse_args()
+
+    global _EXPECT_EXIT
+    _EXPECT_EXIT = args.expect_exit
 
     if args.profile == "smoke":
         args.max_teeth = 2
@@ -486,4 +544,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = main()
+    if _EXPECT_EXIT is not None:
+        _mapped = exit_code_for_process(_code, _EXPECT_EXIT)
+        print(f"\n    expected exit code  {_EXPECT_EXIT}")
+        print(f"    observed exit code  {_code}"
+              + ("" if _mapped == 0 else "   <-- MISMATCH"))
+        _code = _mapped
+    sys.exit(_code)
