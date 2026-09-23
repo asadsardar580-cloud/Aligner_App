@@ -51,6 +51,23 @@ import core_geometry as cg
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic keys
+#
+# A KEY READ BY A GATE OR A HARNESS IS A CONSTANT IN THE MODULE THAT PRODUCES
+# IT. This is not tidiness. `real_scan_regression.py` read
+# `collar_has_ledge` for weeks while `transition_quality` wrote
+# `looks_like_a_ledge`, so the real-scan report printed `ledge None` on every
+# run whatever the geometry did - and `None` is also the honest value for "the
+# measurement could not be taken", so the blind column was indistinguishable
+# from a legitimate unmeasurable. A producer/consumer test pins the pair.
+# ---------------------------------------------------------------------------
+
+#: `transition_quality()[KEY_LOOKS_LIKE_A_LEDGE]` - True, False, or None when
+#: the radial profile could not be sampled. None must fail a gate, not pass it.
+KEY_LOOKS_LIKE_A_LEDGE = "looks_like_a_ledge"
+
+
+# ---------------------------------------------------------------------------
 # Policy
 # ---------------------------------------------------------------------------
 
@@ -1766,7 +1783,7 @@ def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
     scene = _raycast_scene(verts, faces)
     if scene is None:
         return {"measured": False,
-                "looks_like_a_ledge": None,
+                KEY_LOOKS_LIKE_A_LEDGE: None,
                 "reason": "no ray-casting backend; the nearest-vertex "
                           "profile it replaced is not used as a fallback "
                           "because it is known to be wrong",
@@ -1797,7 +1814,7 @@ def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
     worst_hit = float(min(hit_fracs)) if hit_fracs else 0.0
     if not np.all(np.isfinite(heights)) or worst_hit < 0.5:
         return {"measured": False,
-                "looks_like_a_ledge": None,
+                KEY_LOOKS_LIKE_A_LEDGE: None,
                 "ring_offsets_mm": [round(float(x), 3) for x in offsets],
                 "ray_hit_fraction_min": round(worst_hit, 4),
                 "reason": "the transition band is not reachable by a ray "
@@ -1829,7 +1846,7 @@ def transition_quality(final_verts, final_faces, rim_k, u_oa_k,
         # THRESHOLD for this prototype, chosen from the collar bug this check
         # was written to catch - not a clinical tolerance. UNCHANGED when the
         # sampling was corrected: the fix was the measurement, not the bar.
-        "looks_like_a_ledge": bool(step_share > 0.75 and path > 0.2),
+        KEY_LOOKS_LIKE_A_LEDGE: bool(step_share > 0.75 and path > 0.2),
         "threshold_note": THRESHOLD_NOTE,
     }
 
@@ -2193,7 +2210,7 @@ def aggregate_print_gate(stage: dict, policy=None) -> dict:
          "the reconstructed band must close around the rim, not be islands")
     gate("no_transition_ledge",
          bool(rows) and all(
-             (r.get("transition") or {}).get("looks_like_a_ledge") is False
+             (r.get("transition") or {}).get(KEY_LOOKS_LIKE_A_LEDGE) is False
              for r in rows),
          [(r.get("transition") or {}).get("largest_step_share") for r in rows],
          "a cylindrical collar is watertight and still wrong; the shape is "

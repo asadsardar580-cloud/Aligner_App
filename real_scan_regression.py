@@ -58,6 +58,47 @@ def _fail(msg):
     return False
 
 
+#: The verdict strings `mfg.aggregate_print_gate` produces. Compared as data,
+#: never re-derived here - the harness must not be able to disagree with the
+#: gate about what the gate said.
+VERDICT_READY = "PRINT READY"
+VERDICT_NOT_READY = "NOT PRINT READY"
+
+
+def exit_code_for(stage_gates, expect=None) -> int:
+    """The process exit code for a finished run. PURE - no I/O, no globals.
+
+    WHY THIS IS EXTRACTED AND TESTED. Until Phase 0 this script printed the
+    failed gates as a NOTE and returned 0, because `ok` was only ever cleared
+    by open or non-manifold edges. A stage that was topologically clean and
+    failed eight of sixteen manufacturing gates exited 0 and printed the
+    success banner - so the one harness that drives real anatomy could not
+    fail, and any CI job adopting it would have gone green on a model the
+    system itself refuses to print.
+
+    Two modes:
+
+    * `expect=None` - the honest default. Every stage must be PRINT READY.
+      An EMPTY list is a failure, not a pass: a run that produced no stage
+      measured nothing, and "nothing to check" must never read as "clean".
+    * `expect="<verdict>"` - a pinned expectation, used by the suite so that
+      today's known state stays green while a change in EITHER direction turns
+      it red. A stage that unexpectedly becomes PRINT READY is just as much a
+      mismatch as one that regresses, because the expectation is the claim
+      being tested.
+    """
+    verdicts = [
+        (g or {}).get("verdict",
+                      VERDICT_READY if (g or {}).get("print_ready") else VERDICT_NOT_READY)
+        for g in (stage_gates or [])
+    ]
+    if not verdicts:
+        return 1
+    if expect is None:
+        return 0 if all(v == VERDICT_READY for v in verdicts) else 1
+    return 0 if all(v == expect for v in verdicts) else 1
+
+
 def pick_seed_points(verts, labels, want_fdi=None):
     """One click point per labelled tooth, at that label's own centroid.
 
@@ -68,7 +109,7 @@ def pick_seed_points(verts, labels, want_fdi=None):
     labels = np.asarray(labels, np.int64)
     out = []
     for fdi in sorted(set(int(x) for x in np.unique(labels)) - {0}):
-        if want_fdi is not None and fdi != want_fdi:
+        if want_fdi is not None and fdi not in want_fdi:
             continue
         idx = np.where(labels == fdi)[0]
         if len(idx) < 200:
@@ -83,10 +124,32 @@ def pick_seed_points(verts, labels, want_fdi=None):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--stages", type=int, default=3)
-    ap.add_argument("--fdi", type=int, default=None)
-    ap.add_argument("--max-teeth", type=int, default=2)
+    ap.add_argument("--fdi", type=int, nargs="*", default=None,
+                    help="Run only these specific teeth (e.g. --fdi 45 46).")
+    ap.add_argument("--max-teeth", type=int, default=None,
+                    help="Limit the number of teeth extracted.")
+    ap.add_argument("--profile", type=str, choices=["smoke", "real-risk", "full-arch"], default=None,
+                    help="Run specific profile sets of teeth.")
+    ap.add_argument("--expect", type=str, default=None,
+                    choices=[VERDICT_READY, VERDICT_NOT_READY],
+                    help="Pin the expected verdict for EVERY stage. Exit 0 "
+                         "only if every stage matches; a mismatch in either "
+                         "direction exits 1. Without it, every stage must be "
+                         "PRINT READY.")
     args = ap.parse_args()
 
+    if args.profile == "smoke":
+        args.max_teeth = 2
+        args.fdi = None
+    elif args.profile == "real-risk":
+        args.max_teeth = 4
+        args.fdi = [31, 32, 45, 46]
+    elif args.profile == "full-arch":
+        args.max_teeth = 32
+        args.fdi = None
+    elif args.max_teeth is None:
+        args.max_teeth = 2
+        
     print("=" * 74)
     print("REAL-SCAN MANUFACTURING REGRESSION")
     print("=" * 74)
@@ -96,7 +159,9 @@ def main() -> int:
         print(f"  reason: {SCAN} is not present in this working copy.")
         print(f"  Scans are excluded from version control by design; nothing "
               f"here is fabricated in its absence.")
-        return 2
+        # 77 is the suite's SKIP signal (run_all_tests.py). It is deliberately
+        # NOT 0: a regression nobody ran must never report PASS.
+        return 77
 
     raw = open(SCAN, "rb").read()
     print(f"\n[1] INPUT")
@@ -139,6 +204,10 @@ def main() -> int:
         # three-click picker asks a clinician for.
         t0 = time.perf_counter()
         centroid = v.mean(axis=0)
+        # 31 is the primary failure (undercut/overhang wall).
+        # 32 is a tipped neighbor.
+        # 45, 46 are contacting teeth (Blocker B).
+        fdi_list = [31, 32, 45, 46]
         d = v - centroid
         _, _, vt = np.linalg.svd(d[::37], full_matrices=False)
         occ_axis = vt[2]
@@ -284,10 +353,18 @@ def main() -> int:
 
         # --- movement ----------------------------------------------------
         print(f"\n[5] MOVEMENT")
-        presc = [dict(d_oa=0.6, tip_deg=2.0), dict(d_md=0.4)]
-        for (fdi, tid), p in zip(cut_ok, presc):
-            api_core.kinematics(sid, tid, api_core.KinematicsRequest(**p))
-            print(f"    FDI {fdi:>2}  {p}")
+        plan = {
+            31: {"d_oa": 0.6, "tip_deg": 2.0},
+            32: {"d_md": 0.4},
+            45: {"d_md": 0.2},
+            46: {"d_md": -0.2},
+        }
+        tooth_map = dict(cut_ok)
+        for fdi, move in plan.items():
+            if fdi in tooth_map:
+                tid = tooth_map[fdi]
+                api_core.kinematics(sid, tid, api_core.KinematicsRequest(**move))
+                print(f"    FDI {fdi:>2}  {move}")
 
         # --- staging + manufacturing -------------------------------------
         print(f"\n[6] STAGING + MANUFACTURING RECONSTRUCTION")
@@ -332,12 +409,14 @@ def main() -> int:
         # --- final STL + reread + all gates ------------------------------
         print(f"\n[7] FINAL STL, REREAD, ALL GATES")
         zf = zipfile.ZipFile(bundle["buf"])
+        stage_gates = []
         for meta in man["stage_files"]:
             blob = bundle["blobs"][meta["file"]]
             rv, rf = stl_io.parse_stl_bytes(blob)
             wv, wf, merged = cg.weld_vertices(rv, rf)
             rr = cg.manifold_report(wf)
             gate = meta["manufacturing_gate"]
+            stage_gates.append(gate)
             print(f"    stage {meta['stage']:>2}  {meta['file']}")
             print(f"        sha256          {sha256(blob)}")
             print(f"        bytes/tris      {len(blob):,} / {meta['triangles']:,}")
@@ -370,8 +449,9 @@ def main() -> int:
                 print(f"        FDI {row.get('fdi')}  mode "
                       f"{row.get('interface_mode')}, "
                       f"connector {row.get('connector_volume_mm3')}mm3, "
+                      f"rim_separation {row.get('rim_separation_max_mm')}mm, "
                       f"continuity {(row.get('continuity') or {}).get('covered_fraction')}, "
-                      f"ledge {tq.get('looks_like_a_ledge')}, "
+                      f"ledge {tq.get(mfg.KEY_LOOKS_LIKE_A_LEDGE)}, "
                       f"old-site assessable {o.get('assessable')}")
             if rr["open_edges"] or rr["nonmanifold_edges"]:
                 ok = _fail(f"stage {meta['stage']} rereads with "
@@ -380,13 +460,27 @@ def main() -> int:
             if not gate["print_ready"]:
                 print(f"        NOTE: stage {meta['stage']} is NOT PRINT READY "
                       f"- {gate['failed_gates']}")
+                # AND IT FAILS THE RUN. The NOTE used to be the whole response.
+                ok = _fail(f"stage {meta['stage']} is NOT PRINT READY "
+                           f"- {gate['failed_gates']}")
 
         print(f"\n    manifest entries    {len(zf.namelist())}")
+
+        code = exit_code_for(stage_gates, expect=args.expect)
+        if args.expect:
+            print(f"\n    expectation         every stage == {args.expect!r}")
+            print(f"    observed            "
+                  f"{[g.get('verdict') for g in stage_gates]}")
+        # A topology failure recorded by `_fail` above must still be able to
+        # fail the run even when the verdicts match the expectation.
+        if not ok and code == 0 and args.expect is None:
+            code = 1
         print("=" * 74)
         print("REAL-SCAN MANUFACTURING REGRESSION = EXECUTED"
-              if ok else "REAL-SCAN MANUFACTURING REGRESSION = EXECUTED, FAILURES ABOVE")
+              if code == 0 else
+              "REAL-SCAN MANUFACTURING REGRESSION = EXECUTED, FAILURES ABOVE")
         print("=" * 74)
-        return 0 if ok else 1
+        return code
     finally:
         api_core.close_session(sid)
 
