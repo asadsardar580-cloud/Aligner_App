@@ -2596,32 +2596,70 @@ def _provenance_labels(mesh, sources: dict, old_site_pts=None,
     return lab
 
 
+#: Manifest keys for what `_solid_bodies` measured. Constants because a gate
+#: and a harness both read them (AGENT_BRIEF A2 rule 13).
+KEY_INTERNAL_VOIDS = "internal_voids"
+KEY_INTERNAL_VOIDS_FILLED = "internal_voids_filled_mm3"
+#: Retained for one release so an older manifest reader keeps working. It
+#: always equals `internal_voids`, under a name that described the wrong thing.
+KEY_CRUMBS_ALIAS = "inverted_crumbs_discarded"
+
+
 def _solid_bodies(solid):
-    """Drop inverted crumbs. Returns (solid, bodies, crumbs_discarded).
+    """Bodies AFTER the re-union, and enclosed voids named as what they are.
 
-    A tangential boolean — which every one of these is, the crown going back
-    into the hole it was cut from — leaves manifold3d emitting the odd tiny
-    inside-out shell. Measured on one stage, decompose() returned
-    [27572.4, -1.9] mm3: a 1.9mm3 fragment with NEGATIVE volume. That is a void,
-    not geometry, and it made a perfectly fused model read as two solids.
+    Returns `(solid, bodies, info)`.
 
-    Applied at EVERY boolean, not just the last one, because the count
-    compounds: crown+plug alone produced 2 raw bodies (1 crumb) on one tooth and
-    10 raw (7 crumbs) on another, and those crumbs then went into the stage
-    union and were counted again — 16 raw bodies at the end where 5 were real.
+    TWO DEFECTS, ONE LINE APART (AGENT_BRIEF B5).
 
-    `bodies` is the number of genuine positive-volume solids. More than one is
-    a real fracture and the caller decides what to do about it.
+    1. THE COUNT WAS TAKEN BEFORE THE RE-UNION. This counted the positive
+       parts of `decompose()` and returned that number, then unioned them and
+       returned the union - so `bodies` described the INPUT to the last
+       boolean, not the solid that is actually exported. Measured on the
+       control below: `cube(10) - cube(6) + cube(2)` decomposes to
+       `[1000.0, -216.0, 8.0]`, which the old rule reported as 2 bodies, while
+       the re-unioned solid decomposes to `[1000.0]` - ONE body, and the
+       written STL has one connected component. That is exactly the shape of
+       the real-scan failure: `single_positive_manifold_body` passed while
+       `body_count_agrees_with_stl` failed, on both recorded runs.
+
+    2. A NEGATIVE-VOLUME PART IS AN ENCLOSED VOID, NOT A CRUMB. The old name
+       came from a real observation - `[27572.4, -1.9]` mm3, where the -1.9
+       genuinely was a sliver left by a tangential boolean - and then
+       generalised it to every negative part. A cavity fully inside the solid
+       decomposes to a negative part too, and dropping it FILLS the cavity.
+       That may be the right thing for a printable cast, but it is a change to
+       the geometry and it was happening silently. It is now measured and
+       reported: how many, and how much material was added by filling them.
+
+    `bodies` > 1 is a real fracture and the caller decides what to do.
     """
     import manifold3d as m3
     parts = solid.decompose()
-    keep = [c for c in parts if c.volume() > 0]
-    crumbs = len(parts) - len(keep)
+    vols = [float(c.volume()) for c in parts]
+    keep = [c for c, v in zip(parts, vols) if v > 0]
+    voids = [v for v in vols if v <= 0]
+
+    info = {
+        KEY_INTERNAL_VOIDS: len(voids),
+        KEY_INTERNAL_VOIDS_FILLED: round(float(sum(abs(v) for v in voids)), 6),
+        # The alias keeps one release of manifest compatibility.
+        KEY_CRUMBS_ALIAS: len(voids),
+        "raw_part_volumes_mm3": [round(v, 6) for v in vols],
+    }
+
     if not keep:
-        return solid, 0, crumbs
-    if len(keep) == 1:
-        return keep[0], 1, crumbs
-    return m3.Manifold.batch_boolean(keep, m3.OpType.Add), len(keep), crumbs
+        info["bodies_before_reunion"] = 0
+        return solid, 0, info
+
+    fused = keep[0] if len(keep) == 1 else m3.Manifold.batch_boolean(
+        keep, m3.OpType.Add)
+
+    # THE COUNT THAT MATTERS: decompose the solid that is actually returned.
+    after = [float(c.volume()) for c in fused.decompose()]
+    info["bodies_before_reunion"] = len(keep)
+    info["reunion_part_volumes_mm3"] = [round(v, 6) for v in after]
+    return fused, sum(1 for v in after if v > 0), info
 
 
 def _manufacturing_tooth(rec: dict, verts: np.ndarray):
@@ -2649,7 +2687,7 @@ def _manufacturing_tooth(rec: dict, verts: np.ndarray):
     it now gets it from a cavity cut at the NEW rim rather than from a column
     hanging off the old one.
 
-    Returns (solid, bodies, crumbs). `bodies` > 1 still means the crown itself
+    Returns (solid, bodies, void_info). `bodies` > 1 still means the crown
     fractures — a shell rather than a tooth — which is what the export screen
     acts on. The plug used to serve double duty as that probe; the crown's own
     decomposition answers it directly and without inventing anatomy.
@@ -2665,7 +2703,7 @@ SHELL_REFUSAL = ("Cannot export raw shell geometry. Crown must be fully extracte
 def _screen_crowns_for_manufacturing(teeth: list, verts: np.ndarray):
     """Refuse the export unless every crown is a solid a boolean can fuse.
 
-    Mutates each entry with `solid`, `bodies`, `crumbs` and `screen`, so the
+    Mutates each entry with `solid`, `bodies`, `voids` and `screen`, so the
     manufacturing solids are built exactly once.
 
     TWO CHECKS, AND THE SECOND IS THE ONE THAT MATTERS.
@@ -2694,11 +2732,11 @@ def _screen_crowns_for_manufacturing(teeth: list, verts: np.ndarray):
         t["screen"] = screen
         if not screen["ok"]:
             failures.append(f"{who}: {screen['reason']}")
-            t["solid"], t["bodies"], t["crumbs"] = None, 0, 0
+            t["solid"], t["bodies"], t["voids"] = None, 0, {}
             continue
 
-        solid, bodies, crumbs = _manufacturing_tooth(rec, verts)
-        t["solid"], t["bodies"], t["crumbs"] = solid, bodies, crumbs
+        solid, bodies, void_info = _manufacturing_tooth(rec, verts)
+        t["solid"], t["bodies"], t["voids"] = solid, bodies, void_info
         if bodies != 1:
             failures.append(
                 f"{who}: watertight and Euler-2 at {screen['volume_mm3']:.1f}mm3, but it "
@@ -3267,7 +3305,7 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
                     "result": f"{type(direct_err).__name__}: {direct_err}"})
             mesh = solid.to_mesh()
         # Same crumb purge as every other boolean here — see _solid_bodies.
-        solid, n_bodies, crumbs = _solid_bodies(solid)
+        solid, n_bodies, void_info = _solid_bodies(solid)
         mesh = solid.to_mesh()
         t_union += time.perf_counter() - t0
         sv = np.asarray(mesh.vert_properties, float)[:, :3]
@@ -3684,7 +3722,13 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
             "stage": k, "file": name, "triangles": int(len(sf)),
             "volume_mm3": round(stage_volume, 3),
             "components": int(n_comp),
-            "inverted_crumbs_discarded": int(crumbs),
+            # `inverted_crumbs_discarded` is kept as an alias for one release;
+            # it always equals `internal_voids`. See `_solid_bodies`.
+            KEY_INTERNAL_VOIDS: int(void_info[KEY_INTERNAL_VOIDS]),
+            KEY_INTERNAL_VOIDS_FILLED: float(
+                void_info[KEY_INTERNAL_VOIDS_FILLED]),
+            KEY_CRUMBS_ALIAS: int(void_info[KEY_CRUMBS_ALIAS]),
+            "solid_decomposition": void_info,
             # "none" on the ordinary path. Anything else means the boolean
             # failed on the meshes as built and this stage was printed from
             # repaired geometry — which the lab is entitled to know.
