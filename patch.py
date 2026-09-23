@@ -1,0 +1,5 @@
+with open('core_geometry.py', 'r') as f: orig = f.read()
+orig = orig.replace('bad_faces.add(a)', 'bad_faces.add(a); print(\'scan_wall\')')
+orig = orig.replace('bad_faces.add(b)', 'bad_faces.add(b); print(\'wall_scan\')')
+orig = orig.replace('raise ValueError(f"Undercut fix cannot converge without entering the protected band at iteration {iteration}")', 'print(\'Protected faces hit:\', [face_hash[tuple(sorted(out_f[idx]))] for idx in bad_faces if protected_faces[face_hash[tuple(sorted(out_f[idx]))]]]); raise ValueError("hit band")')
+with open('core_geometry.py', 'w') as f: f.write(orig)

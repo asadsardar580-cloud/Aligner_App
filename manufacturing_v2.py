@@ -194,9 +194,9 @@ def build_case_plan(scan_v, scan_f, arch_frame, moving, static_teeth_vertices,
                                         margin_mm=policy.trim_margin_mm,
                                         curve=arch_curve)
     n_trimmed = len(tv)
-    V0, F, base_info = cg.build_cast_base(
+    tv, tf, rim, uinfo = cg.clear_undercut_periphery(tv, tf, arch_frame, trim_info["rim_loop"]); V0, F, base_info = cg.build_cast_base(
         tv, tf, arch_frame, base_thickness_mm=policy.base_thickness_mm,
-        rim=trim_info.get("rim_loop"))
+        rim=rim)
     t_cast = time.perf_counter() - t0
 
     # --- pinned: the trim rim and everything appended below it ----------

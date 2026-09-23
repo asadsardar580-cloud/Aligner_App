@@ -2245,9 +2245,9 @@ def build_export_bundle(sid: str, req: ExportRequest) -> dict:
         tv, tf, trim_info = cg.trim_to_arch(sealed_v, sealed_f, af,
                                             margin_mm=req.trim_margin_mm,
                                             curve=curve)
-        bv, bf, base_info = cg.build_cast_base(tv, tf, af,
+        tv, tf, rim, uinfo = cg.clear_undercut_periphery(tv, tf, af, trim_info["rim_loop"]); bv, bf, base_info = cg.build_cast_base(tv, tf, af,
                                                base_thickness_mm=req.base_thickness_mm,
-                                               rim=trim_info["rim_loop"])
+                                               rim=rim)
     except ValueError as e:
         # build_cast_base's own assertions name the failing check and the edge
         # count. There is deliberately no override: a correctly built cast base
@@ -2995,9 +2995,9 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
         trim_info["margin_used_mm"] = round(float(trim_margin), 4)
         trim_info["margin_raised_for_socket_rims"] = bool(trim_raised)
         trim_info["socket_rim_max_distance_to_ridge_mm"] = round(rim_reach, 4)
-        bv, bf, base_info = cg.build_cast_base(tv, tf, af,
+        tv, tf, rim, uinfo = cg.clear_undercut_periphery(tv, tf, af, trim_info["rim_loop"]); bv, bf, base_info = cg.build_cast_base(tv, tf, af,
                                                base_thickness_mm=req.base_thickness_mm,
-                                               rim=trim_info["rim_loop"])
+                                               rim=rim)
     except ValueError as e:
         raise HTTPException(422, f"The cast base could not be built. {e}")
 

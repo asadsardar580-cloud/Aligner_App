@@ -1,0 +1,18 @@
+{
+  "scan-scan": 0,
+  "scan-wall": 0,
+  "scan-floor": 0,
+  "wall-wall": 0,
+  "wall-floor": 0,
+  "floor-floor": 0,
+  "scan(tooth) / wall": 2210,
+  "scan(gingiva inside band) / wall": 262,
+  "scan(periphery) / wall": 23,
+  "scan(tooth-tooth contact) / wall": 870,
+  "scan(tooth) / scan(tooth-tooth contact)": 38,
+  "scan(gingiva inside band) / scan(tooth-tooth contact)": 3,
+  "scan(tooth) / scan(tooth)": 93,
+  "scan(gingiva inside band) / scan(tooth)": 24,
+  "scan(gingiva inside band) / scan(gingiva inside band)": 1,
+  "wall / wall": 67
+}

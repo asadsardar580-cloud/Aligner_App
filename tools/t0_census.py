@@ -50,7 +50,23 @@ def main():
     print("Building T0 cast...")
     t0_build = time.perf_counter()
     tv, tf, tinfo = cg.trim_to_arch(verts, faces, frame, margin_mm=cg.ARCH_TRIM_MARGIN_MM)
-    cv, cf, cinfo = cg.build_cast_base(tv, tf, frame, base_thickness_mm=cg.CAST_BASE_THICKNESS_MM)
+
+    graph = cg.build_edge_graph(tv, tf, np.zeros(len(tv)))
+    import scipy.sparse.csgraph
+    tooth_v = np.zeros(len(tv), dtype=bool)
+    with open(LABELS, 'r') as lf: case = json.load(lf)
+    if 'labels' in case:
+        labels = case['labels']
+        tooth_v = np.array(labels[:len(tv)]) > 0
+    tooth_idx = np.where(tooth_v)[0]
+    protected_faces = np.zeros(len(tf), dtype=bool)
+    if len(tooth_idx) > 0:
+        dist = scipy.sparse.csgraph.dijkstra(graph, directed=False, indices=tooth_idx, min_only=True)
+        protected_v = dist <= 3.0
+        protected_faces = protected_v[tf].any(axis=1)
+
+    tv, tf, rim, uinfo = cg.clear_undercut_periphery(tv, tf, frame, tinfo["rim_loop"], protected_mask=protected_faces); cv, cf, cinfo = cg.build_cast_base(tv, tf, frame, base_thickness_mm=cg.CAST_BASE_THICKNESS_MM, rim=rim)
+
     t_build = time.perf_counter() - t0_build
     
     # record metrics

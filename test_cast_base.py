@@ -603,3 +603,24 @@ if __name__ == "__main__":
     test_rigid_transforms_give_congruent_bases()
     test_refuses_rather_than_shipping_a_broken_base()
     print("\nALL CAST BASE TESTS PASSED")
+
+def test_undercut_wall_crosses_scan():
+    import self_intersection as si
+    v, f = horseshoe_shell(band_w=10.0, band_h=10.0, theta_max=2.5)
+    af = frame_for(v)
+    tv, tf, ti = cg.trim_to_arch(v, f, af, margin_mm=22.0)
+    tv, tf, rim, uinfo = cg.clear_undercut_periphery(tv, tf, af, ti["rim_loop"])
+    cv, cf, ci = cg.build_cast_base(tv, tf, af, rim=rim)
+    pairs = si.candidate_pairs(cv, cf)
+    if len(pairs):
+        hit, _ = si._pairs_intersect(cv, cf, pairs, 1e-6)
+        assert hit.sum() == 0, "Expected undercut fix to remove intersections"
+
+def test_undercut_protects_band():
+    import pytest
+    v, f = horseshoe_shell(band_w=10.0, band_h=10.0, theta_max=2.5)
+    af = frame_for(v)
+    tv, tf, ti = cg.trim_to_arch(v, f, af, margin_mm=22.0)
+    protected = np.ones(len(tf), dtype=bool)
+    tv2, tf2, rim, uinfo = cg.clear_undercut_periphery(tv, tf, af, ti["rim_loop"], protected_mask=protected)
+    assert len(tf2) == len(tf), "Protected band was touched"
