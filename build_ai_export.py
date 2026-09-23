@@ -31,13 +31,21 @@ Run:  python build_ai_export.py
 """
 from __future__ import annotations
 
+import datetime
+import json
 import os
+import subprocess
 import sys
 import time
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(ROOT, "Aligner_App_AI_Export.zip")
+
+#: Packages whose version changes what the archive's code actually DOES.
+#: manifold3d decides every boolean; numpy 1 vs 2 changes array semantics.
+BUILD_INFO_PACKAGES = ("numpy", "scipy", "manifold3d", "open3d", "trimesh",
+                       "torch", "scikit-learn", "fastapi", "pydantic")
 
 # Directories never descended into.
 SKIP_DIRS = {
@@ -129,7 +137,105 @@ def walk():
             yield full, rel
 
 
-def build() -> dict:
+def git_state():
+    """(commit, dirty_paths). A build from a dirty tree is not reproducible."""
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True,
+                              text=True, encoding="utf-8",
+                              errors="replace").stdout.strip()
+    return git("rev-parse", "HEAD"), [
+        ln for ln in git("status", "--porcelain").splitlines() if ln.strip()]
+
+
+def build_info(commit):
+    """What produced this archive, recorded INSIDE it.
+
+    B8. The shipped archive was built from a dirty tree and carried a
+    `manufacturing.py` matching no commit - a mid-experiment variant whose
+    seat criterion was looser than both the committed and the latest code.
+    Nothing in the archive said so, so it read as a release. Versions come
+    from THIS interpreter rather than a requirements file, because the file
+    records an intent and the interpreter records a fact.
+    """
+    import importlib.metadata as md
+    versions = {}
+    for name in BUILD_INFO_PACKAGES:
+        try:
+            versions[name] = md.version(name)
+        except Exception:                                 # noqa: BLE001
+            versions[name] = "NOT INSTALLED"
+    return {
+        "git_commit": commit,
+        "built_utc": datetime.datetime.now(
+            datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "built_from_clean_tree": True,
+        "python": sys.version.split()[0],
+        "python_executable": os.path.basename(sys.executable),
+        "packages": versions,
+        "note": ("Built by build_ai_export.py from a clean working tree. "
+                 "Every entry was re-read and CRC-checked after writing."),
+    }
+
+
+def verify(path) -> dict:
+    """Re-open the finished archive and check every entry.
+
+    Z1. Eight zero-byte entries were recorded STORED with `compress_size 2`,
+    which Info-ZIP reports as a bad CRC while Python's `testzip()` passes -
+    so the archive was broken in a way the obvious check could not see. Two
+    invariants are asserted here rather than hoped for:
+
+      * every entry reads back in full, which is what validates its CRC;
+      * a STORED entry has `compress_size == file_size`, by definition.
+    """
+    problems, stored, total = [], 0, 0
+    try:
+        zf = zipfile.ZipFile(path)
+    except Exception as e:                                # noqa: BLE001
+        # An archive that will not even open is the worst outcome, and it
+        # must be a reported problem rather than a traceback out of build().
+        return {"entries_verified": 0, "stored_entries": 0,
+                "problems": [f"the archive will not open: "
+                             f"{type(e).__name__}: {e}"]}
+    with zf as z:
+        bad = z.testzip()
+        if bad is not None:
+            problems.append(f"testzip() reports a bad entry: {bad}")
+        for zi in z.infolist():
+            total += 1
+            try:
+                data = z.read(zi.filename)           # full read = CRC check
+            except Exception as e:                        # noqa: BLE001
+                problems.append(f"{zi.filename}: unreadable ({type(e).__name__}: {e})")
+                continue
+            if len(data) != zi.file_size:
+                problems.append(
+                    f"{zi.filename}: read {len(data)} bytes, header says "
+                    f"{zi.file_size}")
+            if zi.compress_type == zipfile.ZIP_STORED:
+                stored += 1
+                if zi.compress_size != zi.file_size:
+                    problems.append(
+                        f"{zi.filename}: STORED but compress_size "
+                        f"{zi.compress_size} != file_size {zi.file_size}")
+    return {"entries_verified": total, "stored_entries": stored,
+            "problems": problems}
+
+
+def build(require_clean=True) -> dict:
+    commit, dirty = git_state()
+    if require_clean and dirty:
+        print("REFUSING to build the export archive: the working tree is "
+              "dirty.", file=sys.stderr)
+        print("An archive built from a dirty tree matches no commit and "
+              "cannot be reproduced. This has happened: the shipped ZIP "
+              "carried a manufacturing.py from no commit, with a looser "
+              "seat criterion than either the committed or the latest code.",
+              file=sys.stderr)
+        for line in dirty:
+            print(f"    {line}", file=sys.stderr)
+        raise SystemExit(2)
+
     files = list(walk())
 
     # A final assertion rather than a comment. The exclusion rules above are
@@ -142,13 +248,41 @@ def build() -> dict:
         raise SystemExit(f"REFUSING to build: patient-derived files matched: {leaked}")
 
     tmp = OUT + ".tmp"
+    empties = 0
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for full, rel in files:
-            z.write(full, rel)
+            # ZERO-BYTE FILES ARE WRITTEN STORED, EXPLICITLY (Z1). Deflating
+            # an empty member produced a 2-byte payload recorded as STORED in
+            # eight entries of a previous archive - Info-ZIP called that a bad
+            # CRC, Python's testzip() did not notice. Not reproduced on this
+            # interpreter, so it is environment-specific; writing empties
+            # STORED and then asserting `compress_size == file_size` in
+            # `verify()` makes the invariant hold regardless.
+            if os.path.getsize(full) == 0:
+                zi = zipfile.ZipInfo(rel, date_time=time.localtime(
+                    os.path.getmtime(full))[:6])
+                zi.compress_type = zipfile.ZIP_STORED
+                zi.external_attr = 0o644 << 16
+                z.writestr(zi, b"")
+                empties += 1
+            else:
+                z.write(full, rel)
         # Written into the ARCHIVE rather than kept in the tree: it is only
         # true of the snapshot, and a file in the project root saying "do not
         # run the app from here" would be false exactly where it sits.
         z.writestr("DO_NOT_RUN_FROM_HERE.txt", DO_NOT_RUN)
+        z.writestr("BUILD_INFO.json",
+                   json.dumps(build_info(commit), indent=2) + "\n")
+
+    report = verify(tmp)
+    if report["problems"]:
+        os.remove(tmp)
+        print("REFUSING to ship the archive: post-build verification failed.",
+              file=sys.stderr)
+        for p in report["problems"]:
+            print(f"    {p}", file=sys.stderr)
+        raise SystemExit(3)
+
     os.replace(tmp, OUT)
 
     by_top: dict[str, int] = {}
@@ -156,9 +290,11 @@ def build() -> dict:
         top = rel.split("/")[0] if "/" in rel else "(root)"
         by_top[top] = by_top.get(top, 0) + 1
 
-    by_top["(root)"] = by_top.get("(root)", 0) + 1   # DO_NOT_RUN_FROM_HERE
-    return {"entries": len(files) + 1, "bytes": os.path.getsize(OUT),
-            "by_top": by_top, "launchers_excluded": sorted(LAUNCHERS)}
+    by_top["(root)"] = by_top.get("(root)", 0) + 2   # DO_NOT_RUN + BUILD_INFO
+    return {"entries": len(files) + 2, "bytes": os.path.getsize(OUT),
+            "by_top": by_top, "launchers_excluded": sorted(LAUNCHERS),
+            "commit": commit, "empty_files_stored": empties,
+            "verification": report}
 
 
 if __name__ == "__main__":
@@ -168,6 +304,11 @@ if __name__ == "__main__":
           f"{info['bytes'] / 1e6:.2f} MB, {time.perf_counter() - t0:.1f}s")
     for top, n in sorted(info["by_top"].items(), key=lambda kv: -kv[1]):
         print(f"  {n:4d}  {top}")
+    print(f"\n  commit           {info['commit']}")
+    print(f"  empty files      {info['empty_files_stored']} written STORED")
+    print(f"  verified         {info['verification']['entries_verified']} "
+          f"entries re-read and CRC-checked, "
+          f"{info['verification']['stored_entries']} STORED")
     print("\nNo .stl / .obj / .ply, no storage/, no key file — asserted, not assumed.")
     print(f"Launchers withheld so the snapshot cannot be started by "
           f"accident: {', '.join(info['launchers_excluded'])}")
