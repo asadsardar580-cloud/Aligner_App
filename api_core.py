@@ -4369,11 +4369,6 @@ def build_stage_bundle_v2(sid: str, req: StageExportRequest) -> dict:
             "occlusal_interference_checked": False,
         })
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for nm, blob in blobs.items():
-            z.writestr(nm, blob)
-        z.writestr("manifest.json", "")      # replaced below, once complete
     t_stages = time.perf_counter() - t_stages
 
     manifest = {
