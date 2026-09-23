@@ -1,7 +1,33 @@
 #!/usr/bin/env python3
-"""Runs every headless test. Needs only numpy + scipy - no display, no Qt."""
-import subprocess, sys, os
+"""The canonical suite. Needs only numpy + scipy - no display, no Qt.
 
+WHAT CHANGED IN PHASE 0.2, AND WHY. This runner decided PASS from an exit code
+alone, and a missing entry file printed SKIP while the suite still reported
+success. Three separate ways to report a pass for something that never ran:
+
+  * a missing file -> SKIP, suite green. A deleted or renamed test disappeared
+    silently.
+  * any exit code of 0 -> PASS, including a file that executed no assertion at
+    all. A pytest-style module without a `__main__` block runs as a script,
+    does nothing, and exits 0.
+  * a script that printed its own failures and returned 0 anyway - which is
+    exactly what `real_scan_regression.py` did until 0.1.
+
+So: a missing entry is a FAIL. SKIP is a deliberate signal, exit code 77, and
+prints as "SKIP (NOT VERIFIED)" because a skip is an absence of evidence, not
+evidence of absence. And every entry is statically checked for something that
+can actually fail before it is run at all.
+"""
+import ast
+import os
+import subprocess
+import sys
+
+#: An entry that could not verify anything - the real scan without the scan
+#: file, for instance. Deliberately not 0, and deliberately not a failure.
+SKIP_EXIT_CODE = 77
+
+#: (name, path) or (name, path, [args])
 TESTS = [
     ("core geometry",        "test_core_geometry.py"),
     ("kinematics frame",     "test_kinematics_frame.py"),
@@ -45,7 +71,69 @@ TESTS = [
     ("clinical segmentation","test_clinical_segmentation.py"),
     ("md caliper",           "test_caliper.py"),
     ("constrained merge",    "test_constrained_merge.py"),
+    ("real-scan harness",    "test_real_scan_harness.py"),
+    ("suite runner",         "test_suite_runner.py"),
+    ("self-intersection",    "test_self_intersection.py"),
+    ("deformation construction", "test_deform_construction.py"),
+    # THE REAL SCAN, AND THE EXPECTATION IS THE POINT. This records today's
+    # KNOWN state of the collar path: not print-ready (AGENT_BRIEF B1-B6). The
+    # suite therefore stays green while ANY change in either direction turns
+    # it red - a stage that unexpectedly becomes print-ready invalidates the
+    # expectation just as much as a regression does. Update it deliberately
+    # when the construction changes (Phase 3), never to make the suite pass.
+    # Exits 77 when the scan is absent, because scans are not in git.
+    ("real scan (local)",    "real_scan_regression.py",
+     ["--profile", "smoke", "--expect", "NOT PRINT READY"]),
 ]
+
+
+def _entry(row):
+    """(name, path, args) from a 2- or 3-tuple."""
+    if len(row) == 3:
+        return row[0], row[1], list(row[2])
+    return row[0], row[1], []
+
+
+def can_fail(path):
+    """Can running this file as a script actually assert anything?
+
+    Returns (ok, reason). A pytest-style module with no `__main__` block runs
+    as a script, collects nothing, executes nothing and exits 0 - which this
+    runner would have reported as PASS. Checked statically so that a file
+    added in the future cannot quietly join the suite without teeth.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+    except (OSError, SyntaxError) as e:
+        return False, f"cannot parse: {type(e).__name__}: {e}"
+
+    for node in tree.body:
+        if isinstance(node, ast.If):
+            # if __name__ == "__main__":
+            src = ast.dump(node.test)
+            if "__name__" in src and "__main__" in src:
+                return True, "__main__ block"
+
+    # A module-level assert counts whether it sits at the top level or inside a
+    # top-level `for` / `if` / `with` / `try` - all of those execute when the
+    # file is run as a script. `test_precompute.py` asserts inside a top-level
+    # loop and is a real test. What does NOT count is an assert inside a `def`
+    # or a `class`: pytest would call it, running the file as a script would
+    # not, and that is precisely the toothless case this guard exists for.
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Assert):
+            return True, "module-level assert"
+        stack.extend(ast.iter_child_nodes(node))
+
+    return False, ("no __main__ block and no assert that runs at module level "
+                   "- executing this file as a script would run no test and "
+                   "exit 0")
+
 
 def main():
     print("=" * 66)
@@ -54,32 +142,57 @@ def main():
 
     # Force UTF-8 on the children. A Windows console here reports cp1256, and a
     # test that printed "z-bar" or "mm^3" died with UnicodeEncodeError AFTER
-    # every assertion in it had passed — a green test file reported as a
+    # every assertion in it had passed - a green test file reported as a
     # failure, which is worse than either outcome on its own. The suite must not
     # depend on the operator's codepage.
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 
-    failed = []
-    for name, path in TESTS:
+    passed, skipped, failed = [], [], []
+    for row in TESTS:
+        name, path, args = _entry(row)
+
         if not os.path.exists(path):
-            print(f"  SKIP  {name:<22} ({path} missing)"); continue
-        r = subprocess.run([sys.executable, path], capture_output=True, text=True,
+            print(f"  FAIL  {name:<26} ({path} missing)")
+            failed.append(name)
+            continue
+
+        ok, reason = can_fail(path)
+        if not ok:
+            print(f"  FAIL  {name:<26} (toothless entry)")
+            print(f"        {reason}")
+            failed.append(name)
+            continue
+
+        r = subprocess.run([sys.executable, path, *args],
+                           capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
+        tail = [l for l in r.stdout.strip().splitlines() if l.strip()]
+
         if r.returncode == 0:
-            last = [l for l in r.stdout.strip().splitlines() if l.strip()]
-            print(f"  PASS  {name:<22} {last[-1][:60] if last else ''}")
+            print(f"  PASS  {name:<26} {tail[-1][:56] if tail else ''}")
+            passed.append(name)
+        elif r.returncode == SKIP_EXIT_CODE:
+            print(f"  SKIP (NOT VERIFIED)  {name:<26}")
+            for line in tail[-2:]:
+                print(f"        {line[:90]}")
+            skipped.append(name)
         else:
-            print(f"  FAIL  {name:<22}")
-            print("        " + (r.stderr.strip().splitlines() or ["?"])[-1][:100])
+            print(f"  FAIL  {name:<26} (exit {r.returncode})")
+            err = (r.stderr.strip().splitlines() or tail or ["?"])[-1]
+            print(f"        {err[:100]}")
             failed.append(name)
 
     print("=" * 66)
+    print(f"{len(passed)} PASS / {len(skipped)} SKIP / {len(failed)} FAIL")
+    if skipped:
+        print(f"  NOT VERIFIED: {', '.join(skipped)}")
     if failed:
-        print(f"{len(failed)} FAILED: {', '.join(failed)}")
+        print(f"  FAILED: {', '.join(failed)}")
         sys.exit(1)
-    print("ALL TESTS PASSED")
-    print("\nGeometry verified. app_ui.py needs a real scan to exercise -")
-    print("run:  python app_ui.py")
+    print("ALL EXECUTED TESTS PASSED")
+    print("\nGeometry verified. The production UI is the React frontend.")
+    print("Run: start_frontend.bat")
+
 
 if __name__ == "__main__":
     main()

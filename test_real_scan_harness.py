@@ -158,6 +158,31 @@ def test_transition_quality_really_emits_that_key():
           f"{out.get('reason', '')[:60]}")
 
 
+# ---------------------------------------------------------------------------
+# An absent scan is a SKIP signal, not a pass and not a failure
+# ---------------------------------------------------------------------------
+
+def test_an_absent_scan_exits_77_not_0(monkeypatch, capsys):
+    """Scans are excluded from version control, so absence is normal.
+
+    It must NOT be 0: a regression nobody ran is the exact thing this suite
+    exists to stop reporting as a pass. 77 is `run_all_tests.SKIP_EXIT_CODE`,
+    printed as "SKIP (NOT VERIFIED)".
+    """
+    import run_all_tests
+
+    monkeypatch.setattr(rsr.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(rsr.sys, "argv", ["real_scan_regression.py"])
+
+    code = rsr.main()
+    out = capsys.readouterr().out
+
+    assert code == run_all_tests.SKIP_EXIT_CODE == 77, code
+    assert "NOT EXECUTED" in out
+    assert "nothing here is fabricated" in out.replace("\n", " ")
+    print(f"PASS  an absent scan exits {code} (SKIP), not 0")
+
+
 if __name__ == "__main__":
     import sys
 
