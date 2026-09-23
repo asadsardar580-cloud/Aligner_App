@@ -38,6 +38,7 @@ import audit
 import telemetry
 import manufacturing as mfg
 import self_intersection as si_mod
+import stage_matrix
 
 
 # One trail per SESSION, because a session is what a clinician is working in and
@@ -2820,13 +2821,16 @@ def _screen_crowns_for_manufacturing(teeth: list, verts: np.ndarray):
 
 
 def _stage_clinical(clinical: dict, k: int, n: int) -> dict:
-    """The six channels at stage k of n — the Python mirror of the client's
-    clinicalAtStage. Absolute from T0, never an interpolation of the 4x4: the
-    3x3 block of (1-t)I + tR is not orthonormal for any t in between, so a
-    matrix lerp shears the crown at every intermediate stage."""
-    f = (k / n) if n > 0 else 0.0
-    return {key: float(clinical.get(key, 0.0) or 0.0) * f
-            for key in ("tip_deg", "torque_deg", "rotation_deg", "d_md", "d_bl", "d_oa")}
+    """The six channels at stage k of n.
+
+    DELEGATES to `stage_matrix.stage_clinical`, which is now the single source
+    for both constructions (AGENT_BRIEF 2.2). The collar path and the
+    deformation path must not be able to derive different matrices for the
+    same prescription - they would be posed almost identically, every
+    topology gate would pass, and the two paths would be quietly
+    incomparable. `test_stage_matrix_shared.py` pins them at 0 ULP.
+    """
+    return stage_matrix.stage_clinical(clinical, k, n)
 
 
 def build_stage_bundle(sid: str, req: StageExportRequest,

@@ -80,6 +80,7 @@ TESTS = [
     ("export archive build",  "test_build_export.py"),
     ("self-intersection",    "test_self_intersection.py"),
     ("deformation construction", "test_deform_construction.py"),
+    ("stage matrix shared",  "test_stage_matrix_shared.py"),
     # THE REAL SCAN, AND THE EXPECTATION IS THE POINT. This records today's
     # KNOWN state of the collar path, so the suite stays green on it while ANY
     # change in either direction turns it red. Update it deliberately when the
