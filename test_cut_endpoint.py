@@ -280,10 +280,19 @@ def test_the_displayed_socket_cup_is_the_one_that_gets_printed():
         cup = np.asarray(out["socket_cap"]["vertices"], float)
         assert len(cup) > 0
 
-        with tempfile.TemporaryDirectory() as tmp:
+        # `out_dir` is confined to <repo>/exports since Phase 0.6 (B10), so a
+        # writable directory has to be requested INSIDE it. That is the
+        # capability under test here - keep_local writing the files - not the
+        # removed one of writing anywhere on the filesystem.
+        import shutil
+        rel = f"_test_{sid[:8]}"
+        tmp = os.path.join(api_core.EXPORTS_ROOT, rel)
+        try:
             res = api_core.build_export_bundle(
-                sid, api_core.ExportRequest(out_dir=tmp, keep_local=True))
+                sid, api_core.ExportRequest(out_dir=rel, keep_local=True))
             assert os.path.exists(os.path.join(tmp, "manifest.json")), "keep_local wrote nothing"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
         base = [x for x in res["files"] if x["role"] == "base"][0]
         blob = zipfile.ZipFile(res["buf"]).read(base["name"])

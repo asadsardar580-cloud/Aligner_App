@@ -80,6 +80,54 @@ def _structured(result):
 
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+#: Everything a client may ask the server to WRITE lands under here. Nothing
+#: outside it is reachable through the API (see `_confined_out_dir`).
+EXPORTS_ROOT = os.path.join(CURRENT_DIR, "exports")
+
+#: Upload ceiling. A real mandibular scan is 9.4 MB; 200 MB is generous for a
+#: dense full-arch capture and still bounds a single request. The body used to
+#: be read with one unbounded `await file.read()`, so a 9 GB POST became 9 GB
+#: of process memory on an API with no authentication in front of it.
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+def _confined_out_dir(requested):
+    """Resolve a client-supplied export directory INSIDE `EXPORTS_ROOT`.
+
+    B10. `out_dir` went straight from the request body into
+    `os.makedirs(...)` and `open(..., "wb")` with no validation at all, gated
+    only by a `keep_local` boolean the same client sets. That is an arbitrary
+    directory-creation and file-write primitive on an API with no
+    authentication - latent on a localhost desktop binding, fatal anywhere
+    else.
+
+    Confined rather than deleted, because `keep_local` is a real workflow: a
+    clinician asking for the files to stay on this machine. `Path.resolve()`
+    first, so `..`, a symlink and an absolute path are all normalised before
+    the check, and `is_relative_to` decides. Anything outside is a 422 that
+    names the root - not a silent redirect, which would write somewhere the
+    caller did not ask for.
+    """
+    from pathlib import Path
+    root = Path(EXPORTS_ROOT).resolve()
+    if requested is None:
+        return root
+    try:
+        target = Path(requested).expanduser()
+        if not target.is_absolute():
+            target = root / target
+        target = target.resolve()
+    except (OSError, ValueError) as e:
+        raise HTTPException(422, f"out_dir is not a usable path: {e}")
+    if not target.is_relative_to(root):
+        raise HTTPException(
+            422,
+            f"out_dir must be inside {root}. Exports are confined to that "
+            f"directory so a request cannot write anywhere on the server's "
+            f"filesystem.")
+    return target
 CKPT_FPS = os.path.join(CURRENT_DIR, "ToothGroupNetwork", "ckpts", "0707_cosannealing_val.h5")
 CKPT_BDL = CKPT_FPS
 
@@ -356,7 +404,26 @@ async def create_session(arch: str = Form(...), file: UploadFile = File(...)):
         sid = STORE.create(arch)          
     except ValueError as e:
         raise HTTPException(400, str(e))
-    raw = await file.read()               
+    # CHUNKED AND CAPPED (B15). This was one unbounded `await file.read()`,
+    # so the whole body became process memory before anything looked at it.
+    # Reading in chunks lets the ceiling be enforced on the way in rather than
+    # after the damage, and the session is released so a refused upload does
+    # not also evict a real case from the four-session store.
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            STORE.drop(sid)
+            raise HTTPException(
+                413,
+                f"The uploaded scan exceeds {MAX_UPLOAD_BYTES // (1024*1024)} "
+                f"MB. A full-arch intraoral scan is typically under 20 MB; if "
+                f"this file is genuinely larger, decimate it before upload.")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
     _t_up = time.perf_counter()
     verts, faces = stl_io.parse_stl_bytes(raw)
     # Content-addressable cache, keyed by the hash of the RAW upload so it
@@ -2279,7 +2346,8 @@ def build_export_bundle(sid: str, req: ExportRequest) -> dict:
 
     out_dir = None
     if req.keep_local:
-        out_dir = req.out_dir or os.path.join(CURRENT_DIR, "exports", sid[:8])
+        out_dir = str(_confined_out_dir(req.out_dir or os.path.join(
+            EXPORTS_ROOT, sid[:8])))
         os.makedirs(out_dir, exist_ok=True)
         for name, blob in blobs.items():
             with open(os.path.join(out_dir, name), "wb") as fh:
@@ -3937,7 +4005,8 @@ def build_stage_bundle(sid: str, req: StageExportRequest,
 
     out_dir = None
     if req.keep_local:
-        out_dir = req.out_dir or os.path.join(CURRENT_DIR, "exports", sid[:8], "stages")
+        out_dir = str(_confined_out_dir(req.out_dir or os.path.join(
+            EXPORTS_ROOT, sid[:8], "stages")))
         os.makedirs(out_dir, exist_ok=True)
         for name, blob in blobs.items():
             with open(os.path.join(out_dir, name), "wb") as fh:
