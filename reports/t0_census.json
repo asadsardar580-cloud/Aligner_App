@@ -1,0 +1,250 @@
+{
+  "t0_cast": {
+    "vertices": 96835,
+    "faces": 130186,
+    "open_edges": 0,
+    "nonmanifold_edges": 0,
+    "components": 1,
+    "winding": "consistent",
+    "volume": 15661.2533,
+    "float32_val": {
+      "reread_vertices": 65087,
+      "reread_faces": 130186,
+      "edges_post_read_before_weld": {
+        "open": 0,
+        "nonmanifold": 0,
+        "total": 195279
+      },
+      "reader_weld_merged_vertices": 0,
+      "welded_vertices": 65087,
+      "welded_faces": 130186,
+      "open_edges": 0,
+      "nonmanifold_edges": 0,
+      "total_edges": 195279,
+      "volume_mm3": 15661.2533,
+      "connected_components": 1,
+      "gates": [
+        {
+          "gate": "finite_coordinates",
+          "passed": true,
+          "measured": 0,
+          "detail": "no NaN or Inf in the written file"
+        },
+        {
+          "gate": "zero_open_edges",
+          "passed": true,
+          "measured": 0,
+          "detail": "an open edge is a hole; the model is not a solid"
+        },
+        {
+          "gate": "zero_nonmanifold_edges",
+          "passed": true,
+          "measured": 0,
+          "detail": "measured AFTER the reader weld - the gate the old export reported but did not enforce"
+        },
+        {
+          "gate": "positive_volume",
+          "passed": true,
+          "measured": 15661.2533,
+          "detail": "zero or negative volume is an inside-out or empty solid"
+        },
+        {
+          "gate": "single_component",
+          "passed": true,
+          "measured": 1,
+          "detail": "expected 1 physical body"
+        },
+        {
+          "gate": "consistent_winding",
+          "passed": true,
+          "measured": true,
+          "detail": "every directed edge traversed exactly once"
+        }
+      ],
+      "failed_gates": [],
+      "print_ready": true,
+      "verdict": "PASSES BOOLEAN/TOPOLOGY REGRESSION",
+      "gate_scope": {
+        "covers": [
+          "finite_coordinates",
+          "zero_open_edges",
+          "zero_nonmanifold_edges",
+          "positive_volume",
+          "single_component",
+          "consistent_winding",
+          "stl_round_trip_and_reader_weld"
+        ],
+        "does_not_cover": [
+          "transition_quality",
+          "interface_continuity",
+          "old_site_quality",
+          "two_sided_cast_fidelity",
+          "roi_compliance",
+          "seat_ramp_exposure",
+          "crown_rigidity",
+          "prescription_consistency"
+        ],
+        "note": "this is NOT the aggregate PRINT READY verdict. It is the boolean/topology half of it, measured on the actual written STL after a downstream reader's weld."
+      },
+      "wording_note": "manufacturing geometry validated against engineering gates. NOT a claim of clinical validation, and NOT the full manufacturing gate."
+    }
+  },
+  "self_intersection": {
+    "count": 3591,
+    "by_kind": {
+      "cross_or_touch": 3516,
+      "folded_edge": 5,
+      "shared_vertex_overlap": 70
+    },
+    "examples": [
+      {
+        "faces": [
+          992,
+          124324
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.7815,
+          -24.6793,
+          4.314
+        ]
+      },
+      {
+        "faces": [
+          992,
+          124326
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.7815,
+          -24.6793,
+          4.314
+        ]
+      },
+      {
+        "faces": [
+          992,
+          124327
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.7815,
+          -24.6793,
+          4.314
+        ]
+      },
+      {
+        "faces": [
+          993,
+          124326
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.8164,
+          -24.8442,
+          4.3256
+        ]
+      },
+      {
+        "faces": [
+          993,
+          124328
+        ],
+        "kind": "shared_vertex_overlap",
+        "where": [
+          18.8164,
+          -24.8442,
+          4.3256
+        ]
+      },
+      {
+        "faces": [
+          993,
+          124329
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.8164,
+          -24.8442,
+          4.3256
+        ]
+      },
+      {
+        "faces": [
+          1008,
+          124324
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.7816,
+          -24.628,
+          4.4049
+        ]
+      },
+      {
+        "faces": [
+          1011,
+          124322
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.8261,
+          -24.7038,
+          4.5828
+        ]
+      },
+      {
+        "faces": [
+          1011,
+          124324
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.8261,
+          -24.7038,
+          4.5828
+        ]
+      },
+      {
+        "faces": [
+          1011,
+          124325
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.8261,
+          -24.7038,
+          4.5828
+        ]
+      },
+      {
+        "faces": [
+          1012,
+          124322
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          18.8146,
+          -24.5617,
+          4.6469
+        ]
+      },
+      {
+        "faces": [
+          1492,
+          124284
+        ],
+        "kind": "cross_or_touch",
+        "where": [
+          19.486,
+          -22.3505,
+          6.541
+        ]
+      }
+    ]
+  },
+  "timings": {
+    "build_cast": 1.9741797000169754,
+    "self_intersection": 17.1310797999613
+  }
+}

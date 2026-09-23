@@ -51,7 +51,9 @@ def candidate_pairs(verts, faces, active=None, cell=None, pad=DEFAULT_TOUCH_TOL_
     hi = tri.max(axis=1) + pad
     if cell is None:
         ext = (hi - lo).max(axis=1)
-        cell = max(float(np.median(ext)) * 1.5, 1e-6)
+        # Floor triangles can be huge (50mm). Using median (0.2mm) causes them to 
+        # span millions of cells, taking gigabytes of RAM. Use a larger cell size.
+        cell = max(float(np.mean(ext)) * 2.0, 1.5)
 
     origin = lo.min(axis=0)
     ilo = np.floor((lo - origin) / cell).astype(np.int64)
@@ -89,21 +91,33 @@ def candidate_pairs(verts, faces, active=None, cell=None, pad=DEFAULT_TOUCH_TOL_
             if not len(members):
                 continue
         iu, ju = np.triu_indices(g, k=1)
-        a = members[:, iu].ravel()
-        b = members[:, ju].ravel()
-        out.append(np.column_stack([np.minimum(a, b), np.maximum(a, b)]))
+        num_pairs_per_cell = len(iu)
+        chunk_size = max(1, 50000 // num_pairs_per_cell)
+        for i in range(0, len(members), chunk_size):
+            chunk = members[i:i+chunk_size]
+            a = chunk[:, iu].ravel()
+            b = chunk[:, ju].ravel()
+            
+            # Filter locally to save memory
+            mask = a != b
+            if active is not None:
+                mask &= (active[a] | active[b])
+            a = a[mask]
+            b = b[mask]
+            
+            ov = np.all((lo[a] <= hi[b]) & (lo[b] <= hi[a]), axis=1)
+            a = a[ov]
+            b = b[ov]
+            
+            if len(a) > 0:
+                out.append(np.column_stack([np.minimum(a, b), np.maximum(a, b)]))
+                
     if not out:
         return np.zeros((0, 2), np.int64)
     pairs = np.vstack(out)
-    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
     n = np.int64(len(F))
     uniq = np.unique(pairs[:, 0] * n + pairs[:, 1])
-    pairs = np.column_stack([uniq // n, uniq % n])
-    if active is not None:
-        pairs = pairs[active[pairs[:, 0]] | active[pairs[:, 1]]]
-    # Exact AABB overlap filter: a shared cell is necessary, not sufficient.
-    ov = np.all((lo[pairs[:, 0]] <= hi[pairs[:, 1]]) & (lo[pairs[:, 1]] <= hi[pairs[:, 0]]), axis=1)
-    return pairs[ov]
+    return np.column_stack([uniq // n, uniq % n])
 
 
 # ---------------------------------------------------------------------------
