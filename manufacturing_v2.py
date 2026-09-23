@@ -398,3 +398,125 @@ def stage_matrices_for(case_plan: CasePlan, k: int, n: int) -> dict:
     return {t: stage_matrix.stage_matrix(rec["frame"], rec["c_res"],
                                          rec["clinical"], k, n)
             for t, rec in case_plan.tooth_records.items()}
+# ---------------------------------------------------------------------------
+# 2.3  the tooth vertex sets, on the ORIGINAL scan ids
+# ---------------------------------------------------------------------------
+
+def tooth_vertex_sets(scan_faces, moving_faces: dict, static_faces: dict,
+                      n_vertices: int | None = None) -> dict:
+    """Which scan vertices are a moving tooth, and which are anchorage enamel.
+
+    THE IDS ARE THE SCAN'S OWN, AND THEY STAY THE SCAN'S OWN, all the way to
+    the cast. `trim_to_arch` deletes faces and appends hole-fill centroids
+    without moving or renumbering a vertex, and `build_cast_base` keeps the
+    array it is given as a PREFIX and only appends the floor (AGENT_BRIEF
+    A1.2). So scan id i IS cast id i, and no remap exists to get wrong. That
+    is the whole reason the sets are derived here, from `/cut`'s own face
+    masks and `/segment`'s own labels, rather than by re-finding the teeth on
+    the cast - re-finding them is where a correspondence bug would live, and
+    CLAUDE.md s.24.3 records what one costs when four loaders each invent
+    their own vertex order and every count check still passes.
+
+    A SET IS THE VERTICES OF FACES, NOT THE VERTICES OF A LABEL, and the
+    difference is what keeps the rigid gate satisfiable. A triangle whose
+    three vertices carry three different owners spans two bodies in relative
+    motion: it MUST shear, so it cannot be inside a set that
+    `moving_teeth_exact_rigid` then requires to be rigid. Taking the vertices
+    of the faces a tooth wholly owns drops those seam triangles and leaves
+    their vertices free to blend - which is exactly what the envelope is for.
+    A vertex is only dropped when EVERY incident face straddles, i.e. when it
+    sits on the seam itself.
+
+    `moving_faces` / `static_faces`   {tooth_id: bool mask or face ids over
+                                       the ORIGINAL scan faces}
+
+    Returns the two sets plus the census the brief asks for. Overlaps resolve
+    to MOVING in both directions:
+
+      * moving vs static - two labels meeting at a contact point the scanner
+        never saw. Reported here, and `dc.plan_deformation` independently
+        reports its own count, so the two can be compared.
+      * moving vs moving - the kit REFUSES an overlap ("assign each shared
+        contact vertex to exactly one tooth before planning") rather than
+        picking for us, because a vertex owned by two rigid bodies has no
+        correct position. Resolved by lowest tooth id so the answer does not
+        depend on dict ordering, and reported per pair.
+    """
+    F = np.asarray(scan_faces, np.int64)
+    n = int(n_vertices) if n_vertices is not None else int(F.max()) + 1
+
+    def _mask(spec):
+        m = np.zeros(len(F), bool)
+        a = np.asarray(spec)
+        if a.dtype == bool:
+            if len(a) != len(F):
+                raise ValueError(
+                    f"face mask is {len(a)} long for {len(F)} faces")
+            m |= a
+        else:
+            m[a.astype(np.int64)] = True
+        return m
+
+    def _verts(spec):
+        return np.unique(F[_mask(spec)]) if len(F) else np.zeros(0, np.int64)
+
+    moving = {t: _verts(spec) for t, spec in (moving_faces or {}).items()}
+    static_by_tooth = {t: _verts(spec) for t, spec in (static_faces or {}).items()}
+
+    # --- moving vs moving: the kit will not choose, so choose here -------
+    order = sorted(moving, key=lambda t: str(t))
+    claimed = np.zeros(n, bool)
+    moving_overlaps, disjoint = {}, {}
+    for t in order:
+        ids = moving[t]
+        clash = ids[claimed[ids]] if len(ids) else ids
+        if len(clash):
+            moving_overlaps[str(t)] = int(len(clash))
+        keep = ids[~claimed[ids]] if len(ids) else ids
+        claimed[keep] = True
+        disjoint[t] = keep
+
+    # --- moving vs static: static yields ---------------------------------
+    static_all = (np.unique(np.concatenate(list(static_by_tooth.values())))
+                  if static_by_tooth else np.zeros(0, np.int64))
+    shared = int(claimed[static_all].sum()) if len(static_all) else 0
+    static_ids = static_all[~claimed[static_all]] if len(static_all) else static_all
+
+    return {
+        "moving": disjoint,
+        "static": static_ids,
+        "diagnostics": {
+            "source": "original scan face ids",
+            "n_scan_vertices": n,
+            "n_scan_faces": int(len(F)),
+            "moving_vertices": {str(t): int(len(v)) for t, v in disjoint.items()},
+            "moving_faces": {str(t): int(_mask(s).sum())
+                             for t, s in (moving_faces or {}).items()},
+            "static_vertices": int(len(static_ids)),
+            "static_teeth": sorted(str(t) for t in static_by_tooth),
+            "shared_contact_vertices_assigned_to_moving": shared,
+            "moving_moving_overlaps_resolved": moving_overlaps,
+            "note": ("a vertex claimed by both a moving tooth and a static "
+                     "one is MOVING; the static set is what remains."),
+        },
+    }
+
+
+def tooth_faces_from_labels(scan_faces, labels, fdi: int) -> np.ndarray:
+    """The faces one FDI wholly owns: all three vertices carry that label.
+
+    ALL THREE, not any. A face with one vertex on the neighbour spans two
+    teeth, and if those teeth move differently it must shear - putting it in
+    either tooth's rigid set makes `moving_teeth_exact_rigid` unsatisfiable by
+    construction. Used when a tooth is labelled but was never cut; a cut tooth
+    has `/cut`'s own `face_mask`, which is the better source because it is the
+    selection the clinician actually approved.
+    """
+    F = np.asarray(scan_faces, np.int64)
+    lab = np.asarray(labels).astype(np.int64).reshape(-1)
+    if not len(F):
+        return np.zeros(0, bool)
+    if lab.max(initial=-1) >= 0 and len(lab) <= int(F.max()):
+        raise ValueError(f"{len(lab)} labels for a mesh of at least "
+                         f"{int(F.max()) + 1} vertices")
+    return (lab[F] == int(fdi)).all(axis=1)
