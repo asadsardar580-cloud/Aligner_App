@@ -49,7 +49,8 @@ BUILD_INFO_PACKAGES = ("numpy", "scipy", "manifold3d", "open3d", "trimesh",
 
 # Directories never descended into.
 SKIP_DIRS = {
-    ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+    ".git", ".venv", ".venv_check", "venv", "node_modules", "__pycache__",
+    ".pytest_cache",
     ".ruff_cache", "dist", "ssr_out", "ssr_out2", "test-results",
     "playwright-report", "blob-report", "exports", "segmented", "scratch",
     "Aligner_App_AI_Export",          # never nest the archive inside itself
