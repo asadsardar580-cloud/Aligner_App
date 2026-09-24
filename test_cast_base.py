@@ -35,7 +35,7 @@ ARCH_W, ARCH_D, SPAN, BAND_W, BAND_H = 26.0, 20.0, 2.35, 9.6, 16.0
 def horseshoe_shell(n_s=150, n_t=44, arch_w=ARCH_W, arch_d=ARCH_D, band_w=BAND_W,
                     band_h=BAND_H, theta_max=1.95, span=SPAN, cusps=7,
                     jitter=0.0, seed=0, teeth=(), tooth_h=2.6, tooth_d=1.1,
-                    return_apices=False):
+                    return_apices=False, tooth_w=0.13):
     """A scan-shaped open shell: a horseshoe band with steep, undercut walls.
 
     Cross-section is (band_w*sin(theta), band_h*cos(theta)) for theta running
@@ -84,7 +84,7 @@ def horseshoe_shell(n_s=150, n_t=44, arch_w=ARCH_W, arch_d=ARCH_D, band_w=BAND_W
         w = (th / theta_max)[None, :]
         rad = np.stack([np.sin(th), np.cos(th)], axis=1)      # (lateral, height)
         for pos in teeth:
-            r = np.sqrt(((u - pos) / 0.13) ** 2 + (w / 0.30) ** 2)
+            r = np.sqrt(((u - pos) / tooth_w) ** 2 + (w / 0.30) ** 2)
             disp = tooth_h * np.exp(-(r ** 2) / (2 * 0.6 ** 2))
             disp = disp - tooth_d * np.exp(-((r - 1.0) ** 2) / (2 * 0.22 ** 2))
             V[:, :, :2] += norm[:, None, :] * (disp * rad[None, :, 0])[:, :, None]

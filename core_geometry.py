@@ -5859,13 +5859,123 @@ def carve_socket(base_verts, base_faces, tool_verts, tool_faces,
     return out_v, out_f, dict(faces_removed=int(drop.sum()), carved=True,
                               watertight=bool(is_edge_manifold_closed(out_f)))
 
+def _depth_behind_patch(points, surf_v, surf_f):
+    """Per point: (depth BEHIND an oriented surface patch, unsigned distance).
+
+    EXACT POINT-TO-TRIANGLE (Open3D BVH), never nearest-vertex (CLAUDE.md
+    lessons). A point is behind the patch when (p - q) . n < 0, with q its
+    closest point and n that triangle's outward normal - the scan's own
+    winding, which is outward on the closed cast.
+
+    AN OPEN PATCH HAS NO INSIDE PAST ITS EDGE. A tooth's surface patch ends at
+    its cervical line and at the contact the scanner never saw; a point whose
+    closest point lies ON that boundary is beyond what was observed, and the
+    sign there says nothing. Such points get depth 0, never a guess.
+
+    Returns (depth >= 0, distance >= 0), both float64; raises on Open3D
+    failure so the caller can record it and return None - never 0.0.
+    """
+    import open3d as o3d
+    P = np.atleast_2d(np.asarray(points, float))
+    V = np.asarray(surf_v, float)
+    Fc = np.asarray(surf_f, np.int64)
+    if not len(P):
+        return np.zeros(0), np.zeros(0)
+    if not len(Fc):
+        raise ValueError("the surface patch has no faces")
+    sc = o3d.t.geometry.RaycastingScene()
+    sc.add_triangles(o3d.core.Tensor(V.astype(np.float32)),
+                     o3d.core.Tensor(Fc.astype(np.uint32)))
+    ans = sc.compute_closest_points(o3d.core.Tensor(P.astype(np.float32)))
+    tri = ans["primitive_ids"].numpy().astype(np.int64)
+    uv = ans["primitive_uvs"].numpy().astype(float)
+    # q from the float64 triangle, not Open3D's float32 point, so a point ON
+    # the surface measures ~1e-15, not ~1e-7.
+    w = np.column_stack([1.0 - uv[:, 0] - uv[:, 1], uv[:, 0], uv[:, 1]])
+    T = V[Fc[tri]]
+    q = np.einsum("ij,ijk->ik", w, T)
+    n = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])
+    n /= np.maximum(np.linalg.norm(n, axis=1), 1e-30)[:, None]
+    d = P - q
+    signed = np.einsum("ij,ij->i", d, n)
+    dist = np.linalg.norm(d, axis=1)
+
+    # Boundary of the patch: edges used once, and their vertices.
+    E = np.sort(np.vstack([Fc[:, [1, 2]], Fc[:, [2, 0]], Fc[:, [0, 1]]]), axis=1)
+    key = E[:, 0] * (int(Fc.max()) + 1) + E[:, 1]
+    uniq, cnt = np.unique(key, return_counts=True)
+    open_key = set(uniq[cnt == 1].tolist())
+    bverts = set(E[np.isin(key, uniq[cnt == 1])].ravel().tolist())
+    n_f = len(Fc)
+    # Edge i of a triangle is the one OPPOSITE vertex i: (b,c), (c,a), (a,b).
+    edge_open = np.isin(key, list(open_key)).reshape(3, n_f).T
+    eps = 1e-5
+    on_open_edge = ((w < eps) & edge_open[tri]).any(axis=1)
+    at_vertex = (w > 1.0 - eps)
+    vid = Fc[tri]
+    on_open_vertex = (at_vertex & np.isin(vid, list(bverts))).any(axis=1)
+    beyond = on_open_edge | on_open_vertex
+    depth = np.where((signed < 0.0) & ~beyond, -signed, 0.0)
+    return depth, dist
+
+
 def measure_interproximal_penetration(
     crown_verts_t0, crown_verts_t1, crown_faces,
     base_verts, base_faces, mesiodistal_axis,
     threshold_mm: float = 0.05, contact_mm: float = 0.30,
-    socket_exclusion_mm: float = 1.5,
+    socket_exclusion_mm: float = 1.5, measure_penetration: bool = False,
 ):
+    """Interproximal CLOSURE and, when asked, true PENETRATION.
+
+    WHAT THE ORIGINAL KEYS MEASURE - AND WHAT THEY DO NOT. `max_closure_mm` is
+    how much the vertex-to-vertex gap on the mesial / distal third SHRANK
+    (g0 - g1). It is a closure: a crown moved 1.0 mm into a 1.5 mm space
+    reports 1.0 mm while touching nothing, and a crown driven INTO its
+    neighbour cannot report more than the gap it started with, because an
+    unsigned distance cannot go below zero. Every existing caller uses it as
+    a closure, and it is unchanged.
+
+    `measure_penetration=True` (Task 2 step 5) adds what the name promises:
+    how far the MOVED crown lies behind the neighbour's enamel surface -
+    signed, exact point-to-triangle (`_depth_behind_patch`), measured on every
+    crown vertex against `base_verts`/`base_faces` as given (pass the
+    neighbour's own patch). No socket exclusion applies to it. Keys:
+
+      penetration_mm      deepest moved-crown vertex behind the surface
+      penetration_t0_mm   the same at T0 - what the scan already showed
+      penetration_vertices  moved-crown vertices deeper than `threshold_mm`
+      penetration_at      where the deepest one is
+      gap_t0_mm / gap_mm  exact minimum distance, crown to surface
+      penetration_failure None, or why it could not be measured - in which
+                          case every value above is None, never 0.0.
+    """
     from scipy.spatial import cKDTree
+    extra = {}
+    if measure_penetration:
+        try:
+            d0, g0v = _depth_behind_patch(crown_verts_t0, base_verts, base_faces)
+            d1, g1v = _depth_behind_patch(crown_verts_t1, base_verts, base_faces)
+            if not (np.isfinite(d0).all() and np.isfinite(d1).all()
+                    and len(d1)):
+                raise ValueError("non-finite or empty penetration measurement")
+            k = int(np.argmax(d1))
+            extra = dict(
+                penetration_mm=float(d1.max()),
+                penetration_t0_mm=float(d0.max()),
+                penetration_vertices=int((d1 > threshold_mm).sum()),
+                penetration_at=[float(x) for x in
+                                np.atleast_2d(np.asarray(crown_verts_t1, float))[k]],
+                gap_t0_mm=float(g0v.min()), gap_mm=float(g1v.min()),
+                penetration_method=("signed exact point-to-triangle (Open3D), "
+                                    "outward = the scan's winding; points "
+                                    "beyond the patch boundary excluded"),
+                penetration_failure=None)
+        except Exception as e:                            # noqa: BLE001
+            extra = dict(penetration_mm=None, penetration_t0_mm=None,
+                         penetration_vertices=None, penetration_at=None,
+                         gap_t0_mm=None, gap_mm=None,
+                         penetration_method=None,
+                         penetration_failure=f"{type(e).__name__}: {e}")
     axis = np.asarray(mesiodistal_axis, dtype=float)
     axis = axis / np.linalg.norm(axis)
     t0 = np.asarray(crown_verts_t0, dtype=float)
@@ -5882,7 +5992,8 @@ def measure_interproximal_penetration(
     if not np.any(far_from_socket):
         return dict(max_closure_mm=0.0, min_clearance_mm=None, over_threshold=False,
                     noise_floor_mm=threshold_mm, contact_threshold_mm=contact_mm,
-                    threshold_mm=threshold_mm, contact_mm=contact_mm, per_side={})
+                    threshold_mm=threshold_mm, contact_mm=contact_mm, per_side={},
+                    **extra)
     tree = cKDTree(base[far_from_socket])
     out = {}
     worst = 0.0
@@ -5914,7 +6025,8 @@ def measure_interproximal_penetration(
                 over_threshold=bool(tightest is not None and tightest <= contact_mm),
                 contact_threshold_mm=contact_mm,
                 noise_floor_mm=threshold_mm,
-                threshold_mm=threshold_mm, contact_mm=contact_mm, per_side=out)
+                threshold_mm=threshold_mm, contact_mm=contact_mm, per_side=out,
+                **extra)
 
 def sweep_interproximal_stages(
     crown_verts_t0, crown_faces, base_verts, base_faces, mesiodistal_axis,

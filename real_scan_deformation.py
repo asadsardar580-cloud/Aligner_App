@@ -1,13 +1,11 @@
 """The real mandible, FDI 45, 0.25mm extrusion, through construction=deformation.
 
 AGENT_BRIEF Phase 2 acceptance. The run must end in PRINT READY **or a NAMED
-refusal with measured values**, with timing - and on this scan the expected
-outcome is the second: `docs/phase_reports/phase_1.md` measured 3591
-self-intersecting pairs in the T0 cast before any tooth is moved, and every
-stage inherits T0's geometry. `build_case_plan` refuses on exactly that, with
-the census attached, rather than building N stages that could never be print
-ready and refusing each one separately for a reason that does not name the
-cause.
+refusal with measured values**, with timing. In Phase 2 the expected outcome
+was the refusal `t0_cast_self_intersects` (the T0 cast crosses itself before
+any tooth moves). TASK 2 REMOVED THAT REFUSAL: the shipped file is now the
+voxel-solidified model, gated on its own re-read bytes, so this run now ends
+in the solid's verdict. `real_scan_print_v3.py` runs the four Task 2 cases.
 
 THE PATH IS THE PRODUCT'S OWN, not a shortcut: upload -> occlusal plane ->
 CrossTooth segmentation -> click-to-select -> cut -> commit the prescription
