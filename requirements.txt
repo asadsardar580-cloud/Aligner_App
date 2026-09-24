@@ -26,6 +26,16 @@ python-multipart==0.0.32
 # files (staging export, occlusal collision, cut endpoint) fail without it too.
 manifold3d==3.5.2
 
+# --- The printable model (required by construction="deformation" exports) ---
+# print_solid.py voxel-solidifies the closed cast (OpenVDB sign detection,
+# 0.05mm voxels, then decimation) so the STL a lab receives is watertight and
+# free of self-intersections even where the raw cast crosses itself.
+# LICENCE: MeshLib is free for NON-COMMERCIAL / EDUCATIONAL use only; commercial
+# use needs a paid licence. It is the one dependency outside the MIT / BSD /
+# Apache-2.0 / MPL-2.0 rule (AGENT_BRIEF A2.14), added as an explicit exception
+# by the clinical owner. See README.md.
+meshlib==3.1.4.297
+
 # --- AI segmentation, ToothGroupNetwork (required by POST .../segment) ---
 # All four are on the live inference path, verified by import, not assumed:
 #   inference_pipelines/inference_pipeline_tgn.py imports gen_utils and open3d,

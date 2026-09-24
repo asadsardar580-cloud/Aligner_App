@@ -74,6 +74,13 @@ npm install
 Python 3.12 is what this is developed against; 3.10 is the floor (bare PEP-604 unions are used
 without `from __future__ import annotations`).
 
+> **MeshLib licence — read before any commercial use.** `meshlib` (pinned in `requirements.txt`)
+> makes the printable model: `print_solid.py` voxel-solidifies the closed cast so the exported STL
+> is watertight and free of self-intersections. MeshLib is **free for non-commercial and
+> educational use only**; commercial use needs a paid licence from its vendor. It is the one
+> dependency outside the project's MIT / BSD / Apache-2.0 / MPL-2.0 rule, added as an explicit
+> exception by the clinical owner. Settle the licence before this app is used commercially.
+
 ## Run
 
 Two terminals, or double-click each script:
