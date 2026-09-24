@@ -18,7 +18,7 @@ Benchmarks: Deltaface, 3Shape Ortho System. This is a clinical tool, not an anim
 | API | `api_core.py` — `uvicorn api_core:app` (launched by `start_backend.bat`) |
 | Client | `frontend/src/App.jsx` — `npm run dev` |
 | Engine | `core_geometry.py` — pure NumPy/SciPy, headless |
-| Manufacturing, current | `deform_construction.py` + `manufacturing_v2.py` ("deform, don't cut") |
+| Manufacturing, current | `deform_construction.py` + `manufacturing_v2.py` ("deform, don't cut") → `print_solid.py` (voxel solid, MeshLib: non-commercial licence) |
 | Manufacturing, legacy | `manufacturing.py` (collar) — **frozen**, retired in Phase 5 |
 | Geometric validator | `self_intersection.py` |
 | Segmentation | `segmentation_providers.py` (ToothGroupNetwork default, CrossTooth selectable) |
@@ -66,7 +66,8 @@ cd frontend && npm run lint && npm run build && npm run smoke
    - gingiva within the envelope → harmonic blend (clamped-cotan M-matrix, so 0 ≤ w ≤ 1);
    - everything else → untouched.
 3. Topology is inherited from T0: no socket, cap, collar or boolean.
-4. The gates measure only what can still fail: inverted triangles, degenerate triangles, self-intersection on float32 positions, and implicit IPR at contacts.
+4. The planned surface may cross itself (the real T0 cast does, at the rim). It is **voxel-solidified** (`print_solid.solidify`, MeshLib, 0.05 mm, OpenVDB sign) and the SOLID is what ships. Decision of record (Task 2) — do not re-evaluate.
+5. `manufacturing_v2.aggregate_gate_v3`: the kit's deformation gates on the planned surface (inversion, degeneracy, rigidity, implicit IPR, ...); contact penetration per neighbour (≤ 0.05 mm or IPR prescribed for THAT contact); and the solid's gates on the **re-read bytes** — manifold3d status/1 body/volume, MeshLib self-collision, open/non-manifold edges, 1 component, winding, crown fidelity p95 ≤ 0.03 / max ≤ 0.10 mm. Height > 19 mm is a warning only.
 
 ## Lessons that must not be relearned
 - Nearest-vertex distance is not nearest-surface distance. Use point-to-triangle distance (Open3D BVH).
@@ -91,9 +92,10 @@ cd frontend && npm run lint && npm run build && npm run smoke
 - The code is frozen; only Phase 0 bookkeeping fixes are allowed.
 
 **Deformation path**
-- The reference implementation is verified on synthetic fixtures through the project's real functions: 22 tests, and 7/7 seam movements print-ready.
-- Contacts are gated by implicit IPR.
-- It has not yet run on the real scan.
+- Verified on synthetic fixtures through the real API: seam movement and T0 export PRINT READY at 0.05 mm (crown p95 0.004 mm).
+- Contacts: signed point-to-triangle penetration per neighbour, plus the kit's implicit-IPR band.
+- Solidification is NOT guaranteed intersection-free: a creased synthetic crossing left MeshLib micro-folds (gated, refused).
+- It has not yet run on the real scan: `real_scan_print_v3.py` (cases a–d) is written and smoke-tested on a synthetic arch only.
 
 **Data and validation**
 - One real scan (mandible, `case_lower.stl`).
