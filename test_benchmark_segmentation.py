@@ -189,25 +189,134 @@ def test_a_split_label_is_flagged_and_routed_off_tier_one():
           f"-> {row['tier']}, {row['status']}")
 
 
-def test_geodesic_recovery_repairs_a_split_label_when_a_graph_exists():
+def test_a_split_label_with_no_sulcus_plateau_is_REFUSED_not_flooded():
+    """THE REPLACEMENT FOR `test_geodesic_recovery_repairs_a_split_label...`,
+    which asserted the defect.
+
+    That test required tier 2 to REPAIR this fixture, and it passed - on
+    `auto_tolerance`'s own 25mm SEARCH CEILING. Measured on this very
+    fixture: `plateau_found=False`, tolerance 25.00mm, 5,671 of 28,900
+    vertices re-grown (20% of the mesh) spanning 35.1mm. s.17 records that
+    5,671 as a successful repair; it is a flood.
+
+    On the real scan the same ceiling painted the gingiva with tooth numbers:
+    the gingival band went from 100.0% gum before the hybrid step to 77.1%
+    after it, and FDI 42 and 43 were left holding ONE vertex each because the
+    next tooth's `labels[labels == fdi] = gingiva` cleared what the previous
+    flood had already swallowed.
+
+    CLAUDE.md rule 6: a measurement that cannot be taken fails. It does not
+    fall back to a method known to be wrong.
+    """
     v, f, r, rr = _arch()
     edges = cg.directed_edges(f)
     conc = cg.boundary_field(v, f, edges=edges)
     graph = cg.build_barrier_graph(v, f, conc, edges=edges)
 
     labels = np.where((rr < r * 0.40) | ((rr > r * 0.75) & (rr < r * 0.95)), 36, 0)
-    out = sf.run(labels, v, f, "lower", graph=graph, concavity=conc)
+    out = sf.run(labels.copy(), v, f, "lower", graph=graph, concavity=conc)
     row = out["teeth"][0]
 
-    assert row["tier"] == sf.TIER_GEODESIC, f"expected geodesic recovery, got {row['tier']}"
-    assert row["status"] == sf.STATUS_REVIEW, \
-        "a repaired region must be REVIEW_REQUIRED — a repair is not a confirmation"
-    assert out["repaired_count"] == 1
-    assert row["recovered_vertices"] > 10
-    # The FDI is kept from the model: the flood cannot name a tooth.
-    assert set(np.unique(out["labels"])) <= {0, 36}
-    print(f"PASS  geodesic recovery: {row['recovered_vertices']} verts re-grown, "
-          f"FDI 36 kept, marked {row['status']}")
+    assert row["tier"] == sf.TIER_MANUAL, \
+        f"a flood with no measured stopping distance must not repaint; got {row['tier']}"
+    assert row["status"] == sf.STATUS_REVIEW
+    assert out["repaired_count"] == 0
+
+    # The refusal must carry the MEASUREMENT, not just a verdict (s.14).
+    g = row["geodesic"]
+    assert g["tolerance_is_a_ceiling_not_a_measurement"] is True
+    assert g["plateau_found"] is False
+    assert g["tolerance_mm"] == 25.0
+    assert "search ceiling" in row["reason"]
+
+    # AND TIER 1'S LABELS SURVIVE UNTOUCHED. That is the whole point of
+    # refusing: the model's tooth/gum boundary was good and the repair was
+    # destroying it.
+    assert np.array_equal(np.asarray(out["labels"]).reshape(-1), labels), \
+        "a refused repair must leave the model's own labels alone"
+    print(f"PASS  refused by name: ceiling {g['tolerance_mm']}mm would have taken "
+          f"{g['grown_fraction_of_mesh'] * 100:.0f}% of the mesh "
+          f"({g['box_diagonal_mm']:.1f}mm across); tier 1 preserved")
+
+
+def test_the_repair_machinery_still_works_when_a_tolerance_IS_measured():
+    """The refusal above is about the TOLERANCE, not about the flood.
+
+    Given a stopping distance, `geodesic_recover` still returns one connected
+    region bounded by the curvature barrier - which is the property tier 1
+    loses and the reason the repair exists. Exercised through the explicit
+    `tolerance=` parameter, because nothing in this repository can currently
+    produce a measured one (see the test below).
+    """
+    v, f, r, rr = _arch()
+    edges = cg.directed_edges(f)
+    conc = cg.boundary_field(v, f, edges=edges)
+    graph = cg.build_barrier_graph(v, f, conc, edges=edges)
+    labels = np.where((rr < r * 0.40) | ((rr > r * 0.75) & (rr < r * 0.95)), 36, 0)
+
+    mask = sf._region_face_mask(labels, f, 36, 0)
+    ids = np.unique(f[cg.largest_face_component(f, mask)])
+    c = v[ids].mean(axis=0)
+    seed = int(ids[np.argmin(np.linalg.norm(v[ids] - c, axis=1))])
+
+    grown, info = sf.geodesic_recover(v, f, graph, conc, seed, tolerance=4.0)
+    assert info["tolerance_supplied"] is True
+    assert "tolerance_is_a_ceiling_not_a_measurement" not in info
+    assert len(grown) > 10
+    assert info["grown_fraction_of_mesh"] < 0.5
+    print(f"PASS  with a supplied 4.0mm tolerance: {len(grown):,} verts, "
+          f"{info['box_diagonal_mm']:.1f}mm across")
+
+
+def test_auto_tolerance_finds_no_plateau_on_ANY_fixture_in_this_repo():
+    """A finding, pinned so it cannot quietly stop being true.
+
+    `cut_guard.auto_tolerance` scans 1-25mm for the plateau where the flood
+    stops growing. It has NEVER returned one here - not on the flat synthetic
+    arch, not on the horseshoe shell that carries a real cervical sulcus at
+    any tooth height, and s.26.5 measured the ceiling coming back for all
+    sixteen teeth on the real scan. So the plateau branch of that function is
+    unreached code in this repository, and every consumer of it has only ever
+    been handed a search bound.
+
+    This test does NOT assert that a plateau is impossible - it asserts what
+    is measured today. If a future change makes one appear, this fails and
+    the finding gets revisited on purpose rather than by accident.
+    """
+    import cut_guard
+
+    from test_cast_base import horseshoe_shell
+
+    seen = []
+    v, f, r, rr = _arch()
+    edges = cg.directed_edges(f)
+    conc = cg.boundary_field(v, f, edges=edges)
+    graph = cg.build_barrier_graph(v, f, conc, edges=edges)
+    labels = np.where(rr < r * 0.40, 36, 0)
+    ids = np.unique(f[cg.largest_face_component(
+        f, sf._region_face_mask(labels, f, 36, 0))])
+    c = v[ids].mean(axis=0)
+    seed = int(ids[np.argmin(np.linalg.norm(v[ids] - c, axis=1))])
+    a = cut_guard.auto_tolerance(cg.geodesic_from_seed(graph, v, seed))
+    seen.append(("flat arch", a["plateau_found"], a["tolerance"]))
+
+    hv, hf, apices = horseshoe_shell(n_s=240, n_t=60, teeth=(-0.25, 0.0, 0.25),
+                                     tooth_h=4.0, return_apices=True)
+    he = cg.directed_edges(hf)
+    hc = cg.boundary_field(hv, hf, edges=he)
+    hg = cg.build_barrier_graph(hv, hf, hc, edges=he)
+    a2 = cut_guard.auto_tolerance(
+        cg.geodesic_from_seed(hg, hv, int(apices[0])))
+    seen.append(("horseshoe + sulcus", a2["plateau_found"], a2["tolerance"]))
+
+    for name, found, tol in seen:
+        assert found is False, (
+            f"{name} now finds a plateau at {tol}mm - the finding that tier 2 "
+            f"has never run on a measured tolerance no longer holds, and the "
+            f"refusal in segmentation_fallback should be revisited")
+        assert tol == 25.0, (name, tol)
+    print("PASS  no plateau anywhere: " +
+          ", ".join(f"{n} -> ceiling {t}mm" for n, _, t in seen))
 
 
 def test_the_threshold_says_it_is_not_an_miou():
@@ -229,6 +338,8 @@ if __name__ == "__main__":
     test_confidence_breakdown_never_claims_to_be_accuracy()
     test_a_clean_segmentation_stays_on_tier_one()
     test_a_split_label_is_flagged_and_routed_off_tier_one()
-    test_geodesic_recovery_repairs_a_split_label_when_a_graph_exists()
+    test_a_split_label_with_no_sulcus_plateau_is_REFUSED_not_flooded()
+    test_the_repair_machinery_still_works_when_a_tolerance_IS_measured()
+    test_auto_tolerance_finds_no_plateau_on_ANY_fixture_in_this_repo()
     test_the_threshold_says_it_is_not_an_miou()
     print("\nALL BENCHMARK + FALLBACK TESTS PASSED")

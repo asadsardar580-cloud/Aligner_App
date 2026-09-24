@@ -137,7 +137,7 @@ def main() -> int:
     # --- the occlusal frame, with its SIGN MEASURED ----------------------
     # NOT the bare `vt[2]` construction this script first used: SVD does not
     # promise a sign, so that picked landmarks off the TISSUE end and every
-    # depth came out upside down. See band_sanity_helpers.
+    # depth came out upside down. See segmentation_diagnostics.occlusal_axis.
     centroid = v.mean(axis=0)
     u_occ, _axis_evidence = occlusal_axis(v, f)
     frame = {"u_occ": u_occ}
