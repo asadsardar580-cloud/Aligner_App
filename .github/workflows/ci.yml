@@ -24,12 +24,19 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          # Everything the headless suite actually touches. Verified by
-          # inspection: no test file imports torch, open3d or PyQt6 at module
-          # level, so the ~200MB AI wheels are not pulled for a fast gate.
-          # manifold3d and trimesh ARE required — the staged manufacturing
-          # export booleans through them, and three test files exercise it.
+          # Everything the headless suite actually touches. No test file
+          # imports torch or PyQt6 at module level, so the ~200MB AI wheels
+          # are not pulled for a fast gate. manifold3d and trimesh ARE
+          # required — the staged manufacturing export booleans through them,
+          # and three test files exercise it. open3d is pulled below.
           pip install numpy scipy fastapi uvicorn python-multipart manifold3d trimesh
+          # The printable model (construction="deformation"): meshlib makes
+          # the voxel solid, and open3d gives the exact point-to-triangle
+          # distances its gates measure - crown fidelity and interproximal
+          # penetration. Without them those gates can only return NaN and
+          # FAIL, which is what they must do; so the suite needs both, pinned
+          # to requirements.txt. MeshLib: non-commercial licence (README).
+          pip install open3d==0.19.0 meshlib==3.1.4.297
           pip install -r requirements-dev.txt
 
       - name: Syntax — every file must compile
