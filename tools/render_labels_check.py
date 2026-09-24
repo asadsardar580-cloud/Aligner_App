@@ -108,6 +108,49 @@ def render(v, f, colours, eye, up, w=W, h=H):
     return img
 
 
+def arch_axes(v, u_occ):
+    """(u_tra, u_sag, posterior width, anterior width), with +u_sag pointing
+    ANTERIORLY.
+
+    ANTERIOR is the NARROW end: an arch is widest between the molars and
+    narrowest at the incisors, for every human arch (s.20.1). The first
+    version of this flipped u_sag when the -u_sag end was the WIDER one -
+    i.e. exactly when +u_sag already pointed anteriorly - so +u_sag came out
+    POSTERIOR and the two panels' cheek / tongue titles were swapped (Task 2
+    step 7; measured on the synthetic horseshoe, whose anterior is +y).
+    """
+    v = np.asarray(v, float)
+    u_occ = np.asarray(u_occ, float)
+    d = v - v.mean(axis=0)
+    inplane = d - np.outer(d @ u_occ, u_occ)
+    _, _, vt = np.linalg.svd(inplane[::37], full_matrices=False)
+    u_tra, u_sag = vt[0], vt[1]           # across the arch, along the arch
+    s = d @ u_sag
+    w_lo = np.ptp(d[s < np.percentile(s, 25)] @ u_tra)   # the -u_sag end
+    w_hi = np.ptp(d[s > np.percentile(s, 75)] @ u_tra)   # the +u_sag end
+    if w_hi > w_lo:
+        u_sag = -u_sag                    # the +u_sag end was the wide one
+    return u_tra, u_sag, max(w_lo, w_hi), min(w_lo, w_hi)
+
+
+def label_views(u_sag, u_occ):
+    """The two panels, (title, eye). `render` puts the camera on the +eye
+    side, so an eye along +u_sag (anterior) looks at the arch from OUTSIDE -
+    the cheek and lip side - and one along -u_sag looks from inside it, the
+    tongue side.
+
+    LOW ELEVATION ON PURPOSE. A near-occlusal view shows the chewing surfaces
+    and hides the one place the labelling is hard to get right - the cervical
+    margin, where gum meets enamel all the way round. These sit just above
+    the occlusal plane so the margin band is visible along its whole length
+    on each side.
+    """
+    u_sag = np.asarray(u_sag, float)
+    u_occ = np.asarray(u_occ, float)
+    return [("cheek side (buccal)", u_sag * 0.96 + u_occ * 0.28),
+            ("tongue side (lingual)", -u_sag * 0.96 + u_occ * 0.28)]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", default=None)
@@ -143,32 +186,12 @@ def main() -> int:
           f"{int((~agree).sum()):,} straddling the boundary")
 
     u_occ = np.asarray(band["u_occ"], float)
-    centroid = v.mean(axis=0)
-    d = v - centroid
-    # The two in-plane axes, from the arch itself.
-    inplane = d - np.outer(d @ u_occ, u_occ)
-    _, _, vt = np.linalg.svd(inplane[::37], full_matrices=False)
-    u_tra, u_sag = vt[0], vt[1]           # across the arch, along the arch
-
-    # ANTERIOR is the NARROW end: an arch is widest between the molars and
-    # narrowest at the incisors, for every human arch (s.20.1). That is what
-    # makes "cheek side" and "tongue side" the right way round rather than a
-    # coin flip.
-    s = d @ u_sag
-    w_lo = np.ptp((d[s < np.percentile(s, 25)] @ u_tra))
-    w_hi = np.ptp((d[s > np.percentile(s, 75)] @ u_tra))
-    if w_lo > w_hi:
-        u_sag = -u_sag                     # make +u_sag point anteriorly
-    print(f"arch width: posterior {max(w_lo, w_hi):.1f}mm vs anterior "
-          f"{min(w_lo, w_hi):.1f}mm (ratio {max(w_lo, w_hi) / max(min(w_lo, w_hi), 1e-9):.2f})")
-
-    # LOW ELEVATION ON PURPOSE. A near-occlusal view shows the chewing
-    # surfaces and hides the one place the labelling is hard to get right -
-    # the cervical margin, where gum meets enamel all the way round. These sit
-    # just above the occlusal plane so the margin band is visible along its
-    # whole length on each side.
-    views = [("cheek side (buccal)", u_sag * 0.96 + u_occ * 0.28),
-             ("tongue side (lingual)", -u_sag * 0.96 + u_occ * 0.28)]
+    # "cheek side" and "tongue side" the right way round, derived from the
+    # arch rather than a coin flip - see arch_axes.
+    _, u_sag, w_post, w_ant = arch_axes(v, u_occ)
+    print(f"arch width: posterior {w_post:.1f}mm vs anterior "
+          f"{w_ant:.1f}mm (ratio {w_post / max(w_ant, 1e-9):.2f})")
+    views = label_views(u_sag, u_occ)
 
     import matplotlib
     matplotlib.use("Agg")
