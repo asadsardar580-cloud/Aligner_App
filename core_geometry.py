@@ -5173,7 +5173,7 @@ def trim_to_arch(verts: np.ndarray, faces: np.ndarray, arch_frame: dict,
             raise ValueError(f"margin_mm must be positive, got {margin_mm}.")
         is_scalar_margin = True
     else:
-        margin_mm = np.asarray(margin_mm, float)
+        margin_mm = margin_mm if isinstance(margin_mm, dict) else np.asarray(margin_mm, float)
         is_scalar_margin = False
 
     # The arch curve is a property of the CASE, not of the current extraction
@@ -5198,7 +5198,8 @@ def trim_to_arch(verts: np.ndarray, faces: np.ndarray, arch_frame: dict,
     if is_scalar_margin:
         keep = dist < margin_mm
     elif isinstance(margin_mm, dict):
-        is_lingual = np.linalg.norm(centroids2d - cinfo["centre"], axis=1) < np.linalg.norm(samples[idx] - cinfo["centre"], axis=1)
+        center_pt = cinfo.get("centre", np.mean(samples, axis=0))
+        is_lingual = np.linalg.norm(centroids2d - center_pt, axis=1) < np.linalg.norm(samples[idx] - center_pt, axis=1)
         mb = margin_mm["buccal"][idx]
         ml = margin_mm["lingual"][idx]
         keep = dist < np.where(is_lingual, ml, mb)

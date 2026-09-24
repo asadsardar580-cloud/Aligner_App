@@ -1,27 +1,27 @@
 {
   "t0_cast": {
-    "vertices": 96868,
-    "faces": 130180,
+    "vertices": 96835,
+    "faces": 130186,
     "open_edges": 0,
     "nonmanifold_edges": 0,
     "components": 1,
     "winding": "consistent",
-    "volume": 15653.1457,
+    "volume": 15661.2533,
     "float32_val": {
-      "reread_vertices": 65084,
-      "reread_faces": 130180,
+      "reread_vertices": 65087,
+      "reread_faces": 130186,
       "edges_post_read_before_weld": {
         "open": 0,
         "nonmanifold": 0,
-        "total": 195270
+        "total": 195279
       },
       "reader_weld_merged_vertices": 0,
-      "welded_vertices": 65084,
-      "welded_faces": 130180,
+      "welded_vertices": 65087,
+      "welded_faces": 130186,
       "open_edges": 0,
       "nonmanifold_edges": 0,
-      "total_edges": 195270,
-      "volume_mm3": 15653.1457,
+      "total_edges": 195279,
+      "volume_mm3": 15661.2533,
       "connected_components": 1,
       "gates": [
         {
@@ -45,7 +45,7 @@
         {
           "gate": "positive_volume",
           "passed": true,
-          "measured": 15653.1457,
+          "measured": 15661.2533,
           "detail": "zero or negative volume is an inside-out or empty solid"
         },
         {
@@ -90,112 +90,162 @@
     }
   },
   "self_intersection": {
-    "count": 8,
+    "count": 583,
     "by_kind": {
-      "cross_or_touch": 5,
+      "cross_or_touch": 452,
+      "duplicate_face": 126,
+      "folded_edge": 2,
       "shared_vertex_overlap": 3
     },
     "examples": [
       {
         "faces": [
-          9574,
-          123865
+          -16286,
+          113900
         ],
-        "kind": "shared_vertex_overlap",
+        "kind": "duplicate_face",
         "where": [
-          17.2162,
-          -12.9677,
-          2.6744
+          -25.1457,
+          -24.6732,
+          14.9858
         ]
       },
       {
         "faces": [
-          9574,
-          123893
+          -16073,
+          114113
         ],
-        "kind": "cross_or_touch",
+        "kind": "duplicate_face",
         "where": [
-          17.2162,
-          -12.9677,
-          2.6744
+          -26.2497,
+          -23.8036,
+          14.4135
         ]
       },
       {
         "faces": [
-          9577,
-          123865
+          -16072,
+          114114
         ],
-        "kind": "shared_vertex_overlap",
+        "kind": "duplicate_face",
         "where": [
-          17.2163,
-          -12.8605,
-          2.7173
+          -26.194,
+          -23.936,
+          14.7648
         ]
       },
       {
         "faces": [
-          9577,
-          123893
+          -15604,
+          114582
         ],
-        "kind": "cross_or_touch",
+        "kind": "duplicate_face",
         "where": [
-          17.2163,
-          -12.8605,
-          2.7173
+          -26.8964,
+          -22.6073,
+          13.8774
         ]
       },
       {
         "faces": [
-          10512,
-          123957
+          -7108,
+          123078
         ],
-        "kind": "cross_or_touch",
+        "kind": "duplicate_face",
         "where": [
-          16.7862,
-          -9.3282,
-          3.6173
+          -27.3752,
+          -20.9602,
+          13.2448
         ]
       },
       {
         "faces": [
-          10512,
-          123958
+          -7106,
+          123080
         ],
-        "kind": "cross_or_touch",
+        "kind": "duplicate_face",
         "where": [
-          16.7862,
-          -9.3282,
-          3.6173
+          -27.5537,
+          -20.9201,
+          13.3168
         ]
       },
       {
         "faces": [
-          15088,
-          124027
+          -7102,
+          123084
         ],
-        "kind": "shared_vertex_overlap",
+        "kind": "duplicate_face",
         "where": [
-          15.8669,
-          -5.67,
-          2.1343
+          -27.4066,
+          -20.8987,
+          13.259
         ]
       },
       {
         "faces": [
-          15088,
-          124028
+          -7101,
+          123085
         ],
-        "kind": "cross_or_touch",
+        "kind": "duplicate_face",
         "where": [
-          15.8669,
-          -5.67,
-          2.1343
+          -28.1861,
+          -21.1544,
+          14.0346
+        ]
+      },
+      {
+        "faces": [
+          -7100,
+          123086
+        ],
+        "kind": "duplicate_face",
+        "where": [
+          -27.293,
+          -20.8563,
+          13.2345
+        ]
+      },
+      {
+        "faces": [
+          -7099,
+          123087
+        ],
+        "kind": "duplicate_face",
+        "where": [
+          -27.1836,
+          -20.9123,
+          13.1834
+        ]
+      },
+      {
+        "faces": [
+          -7098,
+          123088
+        ],
+        "kind": "duplicate_face",
+        "where": [
+          -27.2672,
+          -20.8988,
+          13.2157
+        ]
+      },
+      {
+        "faces": [
+          -7089,
+          123097
+        ],
+        "kind": "duplicate_face",
+        "where": [
+          -26.8139,
+          -20.2197,
+          13.237
         ]
       }
     ]
   },
   "timings": {
-    "build_cast": 93.69622919999529,
-    "self_intersection": 12.72354059992358
+    "build_cast": 790.8175286999904,
+    "self_intersection": 14.962847099988721
   }
 }
