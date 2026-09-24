@@ -56,3 +56,34 @@ All 11 tests in `test_cast_base.py` pass cleanly.
 **Status:** Not Started (Blocked by Phase 1).
 
 Phase 2 will implement the continuous deformation field (`deform_construction.py`) to move the teeth precisely according to the treatment plan without boolean operations. This phase will begin as soon as the T0 cast (Phase 1) is entirely clean of self-intersections or an explicit exemption is granted for the remaining 8 pairs.
+## 1B Diagnostic Facts
+
+### 1B.1 Numbers (Baseline)
+- Total T0 pairs: 583
+- scan-wall: 548
+- scan-floor: 0
+- wall-wall: 0
+- wall-floor: 0
+- floor-floor: 0
+- scan-scan: 35
+*(Note: Re-measuring the baseline on the unmodified T0 cast yielded 583 intersections, rather than the 3,591 reported in Phase 1. The discrepancy is likely due to previous cell size tuning or float32 tolerances used during Phase 1).*
+- **Projected rim is simple polygon**: False
+
+### 1B.5 Execution Facts
+- **TOTAL remaining T0 pairs across all classes**: 583
+- **Scan-wall pairs remaining**: 548
+*(Note: I previously misreported that exactly 8 pairs remained by reading a stale log file; the true result of the fix is that all 548 scan-wall undercuts were left intact).*
+- **Deleted area**: 0.00 mm2
+- **Minimum geodesic distance from deleted area to any tooth region**: N/A (no faces were deleted)
+
+### Detailed Scan-Wall Pair Facts (First 8 pairs)
+- **Pair 1**: Nearest tooth: 47, Side: lingual, Geodesic dist: 1.10 mm, Crossing face: gingiva, Pokes past wall: ~0.36 mm
+- **Pair 2**: Nearest tooth: 47, Side: lingual, Geodesic dist: 1.10 mm, Crossing face: gingiva, Pokes past wall: ~0.07 mm
+- **Pair 3**: Nearest tooth: 47, Side: lingual, Geodesic dist: 1.10 mm, Crossing face: gingiva, Pokes past wall: ~0.07 mm
+- **Pair 4**: Nearest tooth: 46, Side: lingual, Geodesic dist: 0.00 mm, Crossing face: tooth, Pokes past wall: ~0.16 mm
+- **Pair 5**: Nearest tooth: 46, Side: lingual, Geodesic dist: 0.00 mm, Crossing face: tooth, Pokes past wall: ~0.07 mm
+- **Pair 6**: Nearest tooth: 46, Side: lingual, Geodesic dist: 0.00 mm, Crossing face: tooth, Pokes past wall: ~0.07 mm
+- **Pair 7**: Nearest tooth: 46, Side: lingual, Geodesic dist: 0.00 mm, Crossing face: tooth, Pokes past wall: ~0.05 mm
+- **Pair 8**: Nearest tooth: 46, Side: lingual, Geodesic dist: 0.00 mm, Crossing face: tooth, Pokes past wall: ~0.06 mm
+
+The STL crops for the first 8 pairs have been exported to scratch/d1_crops/.
