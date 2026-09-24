@@ -210,3 +210,56 @@ if __name__ == "__main__":
     import sys
     import pytest
     sys.exit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))
+
+def test_giant_floor():
+    import numpy as np
+    import self_intersection as si
+    rng = np.random.default_rng(42)
+    V = rng.uniform(0, 10, (100, 3))
+    V[0] = [-1000, -1000, -1]
+    V[1] = [1000, -1000, -1]
+    V[2] = [0, 1000, -1]
+    V[3] = [0, 0, -2]
+    V[4] = [1, 0, 1]
+    V[5] = [0, 1, 1]
+    F = np.arange(99).reshape(-1, 3)
+    c = count(V, F)
+    assert c > 0
+
+def test_subset_property():
+    import numpy as np
+    import self_intersection as si
+    rng = np.random.default_rng(8)
+    n = 300
+    V = rng.uniform(0, 50, (n * 3, 3))
+    F = np.arange(n * 3).reshape(-1, 3)
+    V[0:3] = V[3:6] + [0.1, 0, 0]
+    V[9:12] = V[12:15] + [0, 0.1, 0]
+    rep = si.self_intersection_report(V, F)
+    total_pairs = rep['intersecting_pairs']
+    for _ in range(5):
+        mask = rng.uniform(0, 1, n) > 0.5
+        subset_F = F[mask]
+        subset_rep = si.self_intersection_report(V, subset_F)
+        assert subset_rep['intersecting_pairs'] <= total_pairs
+        
+        # Test exact subset agreement
+        # Every pair in subset MUST exist in full mesh
+        pairs_subset = si.candidate_pairs(V, subset_F)
+        if len(pairs_subset) > 0:
+            hit, _ = si._pairs_intersect(V, subset_F, pairs_subset, si.DEFAULT_TOUCH_TOL_MM)
+            sub_pairs = pairs_subset[hit]
+            
+            pairs_full = si.candidate_pairs(V, F)
+            hit_full, _ = si._pairs_intersect(V, F, pairs_full, si.DEFAULT_TOUCH_TOL_MM)
+            full_pairs = pairs_full[hit_full]
+            
+            # Map subset pairs to full mesh indices
+            # subset_F[p] maps to original F indices
+            orig_indices = np.where(mask)[0]
+            
+            full_set = set((min(fp[0], fp[1]), max(fp[0], fp[1])) for fp in full_pairs)
+            for p in sub_pairs:
+                a, b = orig_indices[p[0]], orig_indices[p[1]]
+                a, b = min(a, b), max(a, b)
+                assert (a, b) in full_set, f'Pair {a},{b} found in subset but not in full mesh'
