@@ -87,6 +87,7 @@ TESTS = [
     ("print solid (voxel)",  "test_print_solid.py"),
     ("print solid gate",     "test_solid_gate.py"),
     ("print gate v3",        "test_print_gate_v3.py"),
+    ("contacts / IPR gate",  "test_contact_gate.py"),
     # THE REAL SCAN, AND THE EXPECTATION IS THE POINT. This records today's
     # KNOWN state of the collar path, so the suite stays green on it while ANY
     # change in either direction turns it red. Update it deliberately when the

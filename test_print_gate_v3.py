@@ -48,8 +48,13 @@ def good_kit_record():
     }
 
 
-def moved(solid, kit=None, att=None):
+GOOD_CONTACTS = {"measured": True, "tolerance_mm": 0.05, "contacts": [
+    {"contact": "44-45", "penetration_mm": 0.0, "prescribed_ipr_mm": 0.0}]}
+
+
+def moved(solid, kit=None, att=None, contacts=None):
     return {mfg2.R_STAGE_KIND: mfg2.STAGE_KIND_MOVED, mfg2.R_MOVING_TEETH: 1,
+            mfg2.R_CONTACTS: contacts if contacts is not None else GOOD_CONTACTS,
             mfg2.R_DEFORMATION: kit if kit is not None else good_kit_record(),
             mfg2.R_ATTACHMENTS: att if att is not None else {"placed": 0,
                                                              "inside": []},
@@ -61,6 +66,7 @@ def test_the_vocabulary():
                                              "written_file_topology"}
     assert set(mfg2.DEFORMATION_GATES) == set(dc.REQUIRED_GATES) - \
         set(mfg2.SUPERSEDED_BY_SOLID)
+    assert mfg2.CONTACT_GATE in mfg2.STAGE_GATES
     assert mfg2.STAGE_GATES[-len(ps.SOLID_GATES):] == ps.SOLID_GATES
     assert mfg2.T0_GATES == (mfg2.T0_GATE,) + ps.SOLID_GATES
     print(f"PASS  moved stage: {len(mfg2.STAGE_GATES)} gates; T0: "
@@ -109,6 +115,19 @@ def test_each_deformation_gate_still_refuses(good_solid, mutate, gate):
     g = mfg2.aggregate_gate_v3(moved(good_solid, kit=kit))
     assert g["failed_gates"] == [gate], g["failed_gates"]
     print(f"PASS  {gate} refuses")
+
+
+def test_a_penetrating_contact_refuses_by_name(good_solid):
+    bad = {"measured": True, "tolerance_mm": 0.05, "contacts": [
+        {"contact": "43-44", "penetration_mm": 0.3, "prescribed_ipr_mm": 0.0}]}
+    g = mfg2.aggregate_gate_v3(moved(good_solid, contacts=bad))
+    assert g["failed_gates"] == [mfg2.CONTACT_GATE], g["failed_gates"]
+    line = mfg2.describe_failures(g)[0]
+    assert "43-44: 0.300 mm penetration with no IPR prescribed" in line, line
+    missing = moved(good_solid)
+    missing.pop(mfg2.R_CONTACTS)
+    assert mfg2.CONTACT_GATE in mfg2.aggregate_gate_v3(missing)["failed_gates"]
+    print(f"PASS  {line[:120]}; a missing contact record also refuses")
 
 
 def test_a_bad_solid_refuses_a_good_deformation():
@@ -194,8 +213,11 @@ def test_the_builders_write_every_key_the_gate_reads(monkeypatch):
         for key in (mfg2.R_STAGE_KIND, mfg2.R_MOVING_TEETH, mfg2.R_SOLID):
             assert key in rec, key
         assert mfg2.aggregate_gate_v3(rec) == out["gate"]
-    for key in (mfg2.R_DEFORMATION, mfg2.R_ATTACHMENTS):
+    for key in (mfg2.R_DEFORMATION, mfg2.R_ATTACHMENTS, mfg2.R_CONTACTS):
         assert key in out1["record"], key
+    # Built without labels, so no neighbour could be named: the contact gate
+    # must say NOT MEASURED, never pass on "none found".
+    assert mfg2.CONTACT_GATE in out1["gate"]["failed_gates"]
     assert out0["gate"]["stage_kind"] == mfg2.STAGE_KIND_T0
     assert out1["gate"]["stage_kind"] == mfg2.STAGE_KIND_MOVED
     print(f"PASS  T0 {out0['gate']['verdict']} / moved {out1['gate']['verdict']}"

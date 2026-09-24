@@ -72,6 +72,8 @@ SUPERSEDED_BY_SOLID = ("no_self_intersection", "written_file_topology")
 #: The kit's gates on the planned surface's deformation - all still required.
 DEFORMATION_GATES = tuple(g for g in dc.REQUIRED_GATES
                           if g not in SUPERSEDED_BY_SOLID)
+#: Every moved tooth's contacts: penetration <= max(0.05 mm, prescribed IPR).
+CONTACT_GATE = "interproximal_contacts_within_prescription"
 #: Every attachment placed on a moving tooth is inside the shipped solid.
 ATTACHMENT_GATE = "attachments_in_solid"
 #: A T0 export carries no movement at all.
@@ -87,10 +89,12 @@ R_STAGE_KIND = "stage_kind"
 R_MOVING_TEETH = "moving_teeth"
 R_DEFORMATION = "deformation"
 R_ATTACHMENTS = "attachments"
+R_CONTACTS = "contacts"
 R_SOLID = "solid"
 
 #: Required, in report order, for a stage with movement ...
-STAGE_GATES = DEFORMATION_GATES + (ATTACHMENT_GATE,) + ps.SOLID_GATES
+STAGE_GATES = DEFORMATION_GATES + (CONTACT_GATE, ATTACHMENT_GATE) + \
+    ps.SOLID_GATES
 #: ... and for the T0 export.
 T0_GATES = (T0_GATE,) + ps.SOLID_GATES
 
@@ -299,6 +303,178 @@ def build_case_plan(scan_v, scan_f, arch_frame, moving, static_teeth_vertices,
 
 
 # ---------------------------------------------------------------------------
+# Step 5 - interproximal contacts, measured BEFORE solidifying
+# ---------------------------------------------------------------------------
+
+#: FDI order along each arch, distal-right to distal-left. A tooth's
+#: neighbours are the nearest PRESENT teeth either side in this order - so
+#: across an extraction space the neighbour is the next tooth that exists.
+_ARCH_ORDER = {
+    "upper": [18, 17, 16, 15, 14, 13, 12, 11, 21, 22, 23, 24, 25, 26, 27, 28],
+    "lower": [48, 47, 46, 45, 44, 43, 42, 41, 31, 32, 33, 34, 35, 36, 37, 38],
+    "upper_primary": [55, 54, 53, 52, 51, 61, 62, 63, 64, 65],
+    "lower_primary": [85, 84, 83, 82, 81, 71, 72, 73, 74, 75],
+}
+
+
+def arch_neighbours(fdi: int, present) -> list:
+    """The present teeth either side of `fdi` along its arch (0, 1 or 2)."""
+    fdi = int(fdi)
+    present = {int(x) for x in present}
+    for order in _ARCH_ORDER.values():
+        if fdi in order:
+            i = order.index(fdi)
+            out = []
+            for step in (-1, 1):
+                j = i + step
+                while 0 <= j < len(order) and order[j] not in present:
+                    j += step
+                if 0 <= j < len(order):
+                    out.append(order[j])
+            return out
+    return []
+
+
+def contact_key(a, b) -> str:
+    """'43-44' - the lower FDI first, so either spelling names one contact."""
+    x, y = sorted((int(a), int(b)))
+    return f"{x}-{y}"
+
+
+def normalise_ipr_by_contact(spec) -> dict:
+    """{'43-44': mm} from any of '43-44', '44-43', '43/44', '43_44'.
+    Raises ValueError on a key that is not two FDI numbers or a value that
+    is not a finite, non-negative number - a typo must not become 'no IPR'."""
+    out = {}
+    for k, val in (spec or {}).items():
+        parts = str(k).replace("/", "-").replace("_", "-").split("-")
+        if len(parts) != 2 or not all(p.strip().isdigit() for p in parts):
+            raise ValueError(f"IPR contact {k!r} is not two FDI numbers, "
+                             f"e.g. '43-44'")
+        try:
+            mm = float(val)
+        except (TypeError, ValueError):
+            raise ValueError(f"IPR for {k!r} is not a number: {val!r}")
+        if not np.isfinite(mm) or mm < 0.0:
+            raise ValueError(f"IPR for {k!r} must be finite and >= 0: {mm}")
+        out[contact_key(*parts)] = mm
+    return out
+
+
+def measure_contacts(V0, Vk, contact_spec, ipr_by_contact=None,
+                     tolerance_mm: float = dc.IPR_TOLERANCE_MM) -> dict:
+    """`cg.measure_interproximal_penetration` for each moved tooth against
+    each neighbour, with `measure_penetration=True`.
+
+    `contact_spec`  None when the neighbours cannot be identified (no
+                    segmentation labels) - then NOTHING is measured and the
+                    gate fails, because "no contact found" is not "no
+                    contact". Otherwise a dict:
+        {"contacts": [{"moving_fdi", "neighbour_fdi", "neighbour_moving",
+                       "moving_ids", "neighbour_ids", "neighbour_faces",
+                       "moving_faces", "u_md"}, ...],
+         "unmeasured": [reason, ...]}   - moving teeth with no FDI, etc.
+
+    THE NEIGHBOUR IS ITS REAL ENAMEL. A static neighbour is taken at T0
+    (V0), NOT at its stage position: its contact band is released to blend,
+    and the blend carves that enamel out of the moving crown's way - so
+    measured against the blended surface a crown driven into its neighbour
+    reads as clear (measured: a 0.30 mm push into a merged contact read
+    <= 0.05 mm that way). The overlap with the enamel the patient actually
+    has is the IPR the plan needs. A MOVING neighbour is taken at its stage
+    position, which for its own vertices is its exact rigid transform.
+    """
+    ipr = normalise_ipr_by_contact(ipr_by_contact)
+    if contact_spec is None:
+        return {"measured": False, "tolerance_mm": tolerance_mm, "contacts": [],
+                "reason": ("no segmentation labels, so a moving tooth's "
+                           "neighbours cannot be identified and no contact "
+                           "was measured")}
+    rows, failures = [], list(contact_spec.get("unmeasured") or [])
+    for c in contact_spec.get("contacts") or []:
+        mids = np.asarray(c["moving_ids"], np.int64)
+        nids = np.asarray(c["neighbour_ids"], np.int64)
+        nf = np.asarray(c["neighbour_faces"], np.int64).reshape(-1, 3)
+        name = contact_key(c["moving_fdi"], c["neighbour_fdi"])
+        # the neighbour's own patch, re-indexed compactly
+        remap = -np.ones(int(max(nids.max(initial=-1), nf.max(initial=-1))) + 1,
+                         np.int64)
+        remap[nids] = np.arange(len(nids))
+        local = remap[nf] if len(nf) else nf
+        local = local[(local >= 0).all(axis=1)] if len(local) else local
+        nb = Vk if c.get("neighbour_moving") else V0
+        r = cg.measure_interproximal_penetration(
+            V0[mids], Vk[mids], c.get("moving_faces"), nb[nids], local,
+            c["u_md"], threshold_mm=tolerance_mm, socket_exclusion_mm=0.0,
+            measure_penetration=True)
+        presc = float(ipr.get(name, 0.0))
+        pen = r.get("penetration_mm")
+        if pen is None:
+            failures.append(f"{name}: {r.get('penetration_failure')}")
+        rows.append({
+            "contact": name, "moving_fdi": int(c["moving_fdi"]),
+            "neighbour_fdi": int(c["neighbour_fdi"]),
+            "neighbour_moving": bool(c.get("neighbour_moving")),
+            "penetration_mm": pen,
+            "penetration_t0_mm": r.get("penetration_t0_mm"),
+            "penetration_vertices": r.get("penetration_vertices"),
+            "penetration_at": r.get("penetration_at"),
+            "gap_t0_mm": r.get("gap_t0_mm"), "gap_mm": r.get("gap_mm"),
+            "closure_mm": r.get("max_closure_mm"),
+            "prescribed_ipr_mm": presc,
+            "allowed_mm": max(tolerance_mm, presc),
+            "method": r.get("penetration_method"),
+        })
+    return {"measured": not failures, "tolerance_mm": tolerance_mm,
+            "contacts": rows, "unmeasured": failures,
+            "reason": "; ".join(failures) if failures else None}
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) \
+        and bool(np.isfinite(x))
+
+
+def _contact_gate(c) -> dict:
+    """Every measured contact: penetration <= max(0.05 mm, prescribed IPR
+    for THAT contact). PURE - the allowance is recomputed here from the
+    numbers, never read from a row's own verdict.
+
+    The failure NAMES the contact and the millimetres (step 5).
+    """
+    limit = "penetration <= max(0.05 mm, IPR prescribed for that contact)"
+    if not isinstance(c, dict) or c.get("measured") is not True:
+        why = c.get("reason") if isinstance(c, dict) else None
+        return {"ok": False, "measured": why or "contacts not measured",
+                "limit": limit}
+    rows = c.get("contacts")
+    tol = c.get("tolerance_mm")
+    if not isinstance(rows, list) or not _finite(tol):
+        return {"ok": False, "measured": "contacts not measured", "limit": limit}
+    bad = []
+    for r in rows:
+        pen, presc = r.get("penetration_mm"), r.get("prescribed_ipr_mm")
+        name = r.get("contact")
+        if not _finite(pen) or not _finite(presc):
+            bad.append(f"{name}: not measured")
+            continue
+        allowed = max(float(tol), float(presc))
+        if pen > allowed + 1e-9:
+            bad.append(
+                f"{name}: {pen:.3f} mm penetration with "
+                + (f"{presc:.3f} mm IPR prescribed" if presc > 0
+                   else "no IPR prescribed")
+                + f" (allowed {allowed:.3f} mm)")
+    summary = [{k: r.get(k) for k in ("contact", "penetration_mm",
+                                      "penetration_t0_mm", "gap_t0_mm",
+                                      "gap_mm", "prescribed_ipr_mm")}
+               for r in rows]
+    return {"ok": not bad,
+            "measured": bad if bad else (summary or "no neighbouring teeth"),
+            "limit": limit, "contacts": summary}
+
+
+# ---------------------------------------------------------------------------
 # The aggregate gate - PURE and FAIL-CLOSED
 # ---------------------------------------------------------------------------
 
@@ -366,6 +542,7 @@ def aggregate_gate_v3(record: dict) -> dict:
       "stage_kind":  STAGE_KIND_T0 | STAGE_KIND_MOVED,
       "moving_teeth": int,
       "deformation": the kit's record for dc.aggregate_gate_v2 (moved only),
+      "contacts":    measure_contacts(...)                  (moved only),
       "attachments": {"placed": n, "inside": [bool, ...]}   (moved only),
       "solid":       print_solid.measure_solid(...) or refused_measurement,
     }
@@ -389,6 +566,7 @@ def aggregate_gate_v3(record: dict) -> dict:
         kit_record = dict(r.get(R_DEFORMATION) or {})
         kit = dc.aggregate_gate_v2(kit_record)
         gates.update(gate_evidence(kit, kit_record))
+        gates[CONTACT_GATE] = _contact_gate(r.get(R_CONTACTS))
         gates[ATTACHMENT_GATE] = _attachment_gate(r.get(R_ATTACHMENTS))
         advisory.update(kit.get("advisory") or {})
     else:
@@ -563,12 +741,19 @@ def build_t0_stage(case_plan: CasePlan) -> dict:
 
 def build_stage_v2(case_plan: CasePlan, stage_matrices: dict,
                    prescribed_ipr: float = 0.0, stage: int = 1,
-                   total_stages: int = 1, attachment_shells=()) -> dict:
+                   total_stages: int = 1, attachment_shells=(),
+                   contact_spec=None, ipr_by_contact=None) -> dict:
     """One stage: planned surface, measurements, solid, bytes, verdict. Pure.
 
-    The order: positions -> the kit's construction report -> solidify the
-    planned surface (with any attachment shells) -> write -> measure the
-    RE-READ bytes -> the aggregate gate.
+    The order: positions -> the kit's construction report -> the
+    interproximal contacts (BEFORE solidifying: the solid unions whatever
+    overlaps, so a crown driven into its neighbour is only visible on the
+    planned surface) -> solidify the planned surface (with any attachment
+    shells) -> write -> measure the RE-READ bytes -> the aggregate gate.
+
+    `ipr_by_contact` {'43-44': mm}. It also authorises the kit's implicit-IPR
+    band on the teeth it names: the band gate is judged against the larger of
+    `prescribed_ipr` and any IPR prescribed at a contact of a moving tooth.
     """
     if case_plan.plan is None:
         raise ValueError("this case plan has no movement; use build_t0_stage")
@@ -587,7 +772,19 @@ def build_stage_v2(case_plan: CasePlan, stage_matrices: dict,
                              apply=cg.apply_matrix)
     t_report = time.perf_counter() - t0
 
-    # 3-5. the solid, its bytes, and their measurements
+    # 3. contacts, on the planned surface
+    t0 = time.perf_counter()
+    contacts = measure_contacts(V0, Vk, contact_spec, ipr_by_contact,
+                                tolerance_mm=case_plan.policy.ipr_tolerance_mm)
+    t_contacts = time.perf_counter() - t0
+    ipr = normalise_ipr_by_contact(ipr_by_contact)
+    moving_fdis = {str(c["moving_fdi"]) for c in
+                   ((contact_spec or {}).get("contacts") or [])}
+    band_presc = max([float(prescribed_ipr or 0.0)] +
+                     [mm for k, mm in ipr.items()
+                      if set(k.split("-")) & moving_fdis])
+
+    # 4-6. the solid, its bytes, and their measurements
     solid = _solid_for(case_plan, Vk, attachment_shells)
 
     # 6. the gate
@@ -597,11 +794,12 @@ def build_stage_v2(case_plan: CasePlan, stage_matrices: dict,
         # The face array is the T0 cast's own, never rebuilt - that is what
         # makes the planned surface's topology inherited, not re-derived.
         "index_buffer_unchanged": bool(F is case_plan.F),
-        "prescribed_ipr_mm": float(prescribed_ipr or 0.0),
+        "prescribed_ipr_mm": float(band_presc),
     }
     record = {R_STAGE_KIND: STAGE_KIND_MOVED,
               R_MOVING_TEETH: int(len(plan.tooth_sets)),
               R_DEFORMATION: kit_record,
+              R_CONTACTS: contacts,
               R_ATTACHMENTS: {
                   "placed": int(len(attachment_shells)),
                   "inside": solid["solid"].get("attachment_centroids_inside")},
@@ -614,19 +812,23 @@ def build_stage_v2(case_plan: CasePlan, stage_matrices: dict,
         "tooth_matrices": {str(t): np.asarray(M, float).tolist()
                            for t, M in stage_matrices.items()},
         "prescribed_ipr_mm": float(prescribed_ipr or 0.0),
+        "ipr_by_contact_mm": ipr,
+        "band_ipr_allowance_mm": float(band_presc),
+        "contacts": contacts,
         "planned_surface": {k: v for k, v in report.items()
                             if k != "moved_faces_mask"},
         "planned_surface_digest": dc.stage_digest(
             Vk.astype(np.float32).astype(np.float64), F),
         "seconds": {"positions": round(t_pos, 3),
                     "stage_report": round(t_report, 3),
+                    "contacts": round(t_contacts, 3),
                     "solid": solid["seconds"],
                     "total": round(time.perf_counter() - t_start, 3)},
     })
     return {"blob": solid["blob"], "planned_verts": Vk, "faces": F,
             "gate": gate, "manifest": manifest, "report": report,
             "solid": solid["solid"], "solidify": solid["solidify"],
-            "record": record}
+            "contacts": contacts, "record": record}
 
 
 # ---------------------------------------------------------------------------

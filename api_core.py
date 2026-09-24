@@ -2503,6 +2503,14 @@ class StageExportRequest(BaseModel):
     # unless it was prescribed, so the gate starts at its strictest.
     prescribed_ipr_mm: float = 0.0
 
+    # IPR PRESCRIBED PER CONTACT, e.g. {"43-44": 0.2}, in mm. Only the
+    # deformation construction reads it. Before solidifying, every moved
+    # tooth's penetration into each neighbour is measured (Task 2 step 5):
+    # <= 0.05 mm is tolerance; more needs IPR prescribed for THAT contact, or
+    # the stage is NOT PRINT READY naming the contact and the millimetres. A
+    # key that is not two FDI numbers is refused, never read as "no IPR".
+    ipr_by_contact_mm: dict[str, float] = {}
+
 
 # The per-stage translation limit staging_estimate divides by. Named here so
 # the compensation guard can say what it is comparing against.
@@ -4203,6 +4211,61 @@ def _v2_attachment_solids(teeth, matrices):
     return solids
 
 
+def _v2_contact_spec(f, labels, movers, moving_faces, static_faces, sets):
+    """Each moved tooth paired with its neighbours along the arch (step 5).
+
+    None when there are no segmentation labels: a neighbour is identified by
+    its FDI, and without labels no neighbour can be named - so the contact
+    gate fails as NOT MEASURED rather than passing on "none found". A moving
+    tooth with no FDI is listed as unmeasured, for the same reason.
+
+    Each side is the faces that tooth wholly owns, restricted to the vertices
+    `tooth_vertex_sets` gave it - the same sets the plan was solved on.
+    """
+    if labels is None:
+        return None
+    F = np.asarray(f, np.int64)
+    present = (set(int(x) for x in np.unique(labels)) - {0}) | \
+        {int(t["fdi"]) for t in movers if t["fdi"]}
+    by_fdi = {int(t["fdi"]): t for t in movers if t["fdi"]}
+
+    def patch(mask, ids):
+        own = np.zeros(int(F.max()) + 1, bool)
+        own[np.asarray(ids, np.int64)] = True
+        faces = F[np.asarray(mask, bool)]
+        return faces[own[faces].all(axis=1)]
+
+    contacts, unmeasured = [], []
+    for t in movers:
+        if not t["fdi"]:
+            unmeasured.append(f"tooth {t['tid']} has no FDI label, so its "
+                              f"neighbours cannot be identified")
+            continue
+        fdi = int(t["fdi"])
+        mids = sets["moving"][t["tid"]]
+        for n in mfg2.arch_neighbours(fdi, present):
+            if n in by_fdi:
+                other = by_fdi[n]
+                nids = sets["moving"][other["tid"]]
+                nfaces = patch(moving_faces[other["tid"]], nids)
+            elif f"fdi{n}" in static_faces:
+                nids = sets["static_by_tooth"][f"fdi{n}"]
+                nfaces = patch(static_faces[f"fdi{n}"], nids)
+            else:
+                continue
+            if not len(nfaces):
+                unmeasured.append(f"{mfg2.contact_key(fdi, n)}: the neighbour "
+                                  f"has no surface of its own to measure")
+                continue
+            contacts.append({"moving_fdi": fdi, "neighbour_fdi": int(n),
+                             "neighbour_moving": n in by_fdi,
+                             "moving_ids": mids,
+                             "moving_faces": patch(moving_faces[t["tid"]], mids),
+                             "neighbour_ids": nids, "neighbour_faces": nfaces,
+                             "u_md": np.asarray(t["rec"]["frame"]["u_md"], float)})
+    return {"contacts": contacts, "unmeasured": unmeasured}
+
+
 def build_stage_bundle_v2(sid: str, req: StageExportRequest,
                           only_stage: str | None = None) -> dict:
     """The deformation construction, printed as a voxel-solidified SOLID.
@@ -4355,6 +4418,17 @@ def build_stage_bundle_v2(sid: str, req: StageExportRequest,
             "construction": "deformation",
             "vertex_sets": sets["diagnostics"]}))
 
+    # --- step 5: who touches whom ------------------------------------------
+    try:
+        ipr_by_contact = mfg2.normalise_ipr_by_contact(
+            getattr(req, "ipr_by_contact_mm", None) or {})
+    except ValueError as e:
+        raise HTTPException(422, _jsonable({
+            "error": f"ipr_by_contact_mm: {e}", "construction": "deformation"}))
+    contact_spec = (_v2_contact_spec(f, labels, movers, moving_faces,
+                                     static_faces, sets)
+                    if movers else None)
+
     # --- the stages -------------------------------------------------------
     prescribed_ipr = float(getattr(req, "prescribed_ipr_mm", 0.0) or 0.0)
     blobs, stage_meta = {}, []
@@ -4373,7 +4447,9 @@ def build_stage_bundle_v2(sid: str, req: StageExportRequest,
             out = mfg2.build_stage_v2(plan, matrices,
                                       prescribed_ipr=prescribed_ipr,
                                       stage=k, total_stages=total,
-                                      attachment_shells=shells)
+                                      attachment_shells=shells,
+                                      contact_spec=contact_spec,
+                                      ipr_by_contact=ipr_by_contact)
         name = f"{arch}_Stage_{k:02d}.stl"
         gate = out["gate"]
         m = out["solid"]
@@ -4408,6 +4484,8 @@ def build_stage_bundle_v2(sid: str, req: StageExportRequest,
                 "self_colliding": m.get(ps.K_SELF_COLLIDING),
                 "pairs": m.get(ps.K_SELF_COLLIDING_PAIRS)},
             "crown_deviation": out["manifest"]["crown_deviation"],
+            # The IPR report: every moved tooth against each neighbour.
+            "contacts": out.get("contacts"),
             "solidify": out["solidify"],
             "attachments": {"placed": sum(len(t["rec"].get("attachments") or [])
                                           for t in teeth) if k else 0,
@@ -4679,6 +4757,7 @@ def export_final(sid: str, req: FinalExportRequest):
             "stage_kind": chosen.get("stage_kind"),
             "solidify": chosen.get("solidify"),
             "crown_deviation": chosen.get("crown_deviation"),
+            "contacts": chosen.get("contacts"),
             "self_intersection": chosen.get("self_intersection"),
             "attachments": chosen.get("attachments"),
             "meshlib_version": ps.meshlib_version(),
