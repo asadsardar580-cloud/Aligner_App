@@ -55,6 +55,50 @@ MODEL_HEIGHT_WARN_MM = 19.0
 #: How many worst crown-fidelity locations every manifest carries.
 WORST_LOCATIONS = 20
 
+# ---------------------------------------------------------------------------
+# Measurement keys. Written by `measure_solid`, read by `solid_gate`, and
+# pinned by a producer/consumer test (CLAUDE.md rule 9).
+# ---------------------------------------------------------------------------
+
+K_SOLIDIFIED = "solidified"
+K_SOLIDIFY_REFUSAL = "solidify_refusal"
+K_MANIFOLD_STATUS = "manifold3d_status"
+K_BODIES = "manifold3d_bodies"
+K_VOLUME = "manifold3d_volume_mm3"
+K_SELF_COLLIDING = "meshlib_self_colliding"
+K_SELF_COLLIDING_PAIRS = "meshlib_self_colliding_pairs"
+K_OPEN_EDGES = "file_open_edges"
+K_NONMANIFOLD_EDGES = "file_nonmanifold_edges"
+K_COMPONENTS = "file_components"
+K_WINDING = "file_winding_consistent"
+K_CROWN_POINTS = "crown_points"
+K_CROWN_P95 = "crown_deviation_p95_mm"
+K_CROWN_MAX = "crown_deviation_max_mm"
+K_CROWN_WORST = "crown_worst_locations"
+K_CROWN_FAILURE = "crown_deviation_failure"
+K_HEIGHT = "model_height_mm"
+K_TRIANGLES = "triangles"
+K_REREAD_VERTICES = "reread_vertices"
+
+#: The solid's gates, in report order. Every one is REQUIRED.
+SOLID_GATES = (
+    "solidified",                    # solidify produced a solid (no refusal)
+    "solid_manifold_status_ok",      # manifold3d status() is NoError
+    "solid_single_body",             # decompose() gives exactly 1 body
+    "solid_positive_volume",         # volume > 0
+    "solid_no_self_intersection",    # MeshLib findSelfCollidingTriangles is False
+    "file_zero_open_edges",          # re-read + weld: 0 open edges
+    "file_zero_nonmanifold_edges",   # re-read + weld: 0 non-manifold edges
+    "file_single_component",         # re-read + weld: 1 component
+    "file_consistent_winding",       # re-read + weld: every directed edge once
+    "crown_fidelity_p95",            # planned tooth surface -> solid, p95
+    "crown_fidelity_max",            # planned tooth surface -> solid, max
+)
+
+#: Reported, never refusing.
+SOLID_ADVISORY = ("model_height_over_limit",)
+
+
 class SolidifyRefused(Exception):
     """The cast cannot be solidified. Carries the measurements that refused it."""
 
@@ -216,3 +260,220 @@ def solidify(verts, faces, voxel_size_mm: float | None = None,
                     "total": round(time.perf_counter() - t_all, 3)},
     }
     return Vs, Fs, report
+
+
+# ---------------------------------------------------------------------------
+# Step 3 - measure the WRITTEN bytes
+# ---------------------------------------------------------------------------
+
+def face_components(faces) -> int:
+    """Connected components over shared EDGES (not shared vertices).
+
+    Two bodies touching at one vertex are two components to a printer and one
+    to a vertex graph, so adjacency is by edge. Same answer as
+    `manufacturing.components`, vectorised: that one walks a Python dict and a
+    million-triangle solid takes it far too long to be on an export path.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    f = np.asarray(faces, np.int64)
+    if not len(f):
+        return 0
+    e = np.vstack([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+    e.sort(axis=1)
+    fid = np.tile(np.arange(len(f)), 3)
+    n = int(f.max()) + 1
+    key = e[:, 0] * n + e[:, 1]
+    order = np.argsort(key, kind="stable")
+    key, fid = key[order], fid[order]
+    same = key[1:] == key[:-1]
+    a, b = fid[:-1][same], fid[1:][same]
+    g = coo_matrix((np.ones(len(a), np.int8), (a, b)), shape=(len(f), len(f)))
+    return int(connected_components(g, directed=False)[0])
+
+
+def _crown_deviation(points, ids, labels, wv, wf):
+    """Exact point-to-TRIANGLE distance from each planned tooth point to the
+    solid, via the project's Open3D BVH (`manufacturing._point_to_surface`).
+
+    NaN, not 0.0, when it cannot be measured (CLAUDE.md rule 6), and an EMPTY
+    point set cannot be measured either - "no tooth deviated" over zero teeth
+    is a vacuous pass.
+    """
+    import manufacturing as mfg
+    pts = np.asarray(points, float).reshape(-1, 3) if points is not None \
+        else np.zeros((0, 3))
+    if not len(pts):
+        return {K_CROWN_POINTS: 0, K_CROWN_P95: None, K_CROWN_MAX: None,
+                K_CROWN_WORST: [],
+                K_CROWN_FAILURE: "no tooth vertices were supplied"}
+    d = mfg._point_to_surface(pts, wv, wf)
+    if d is None or len(d) != len(pts) or not np.isfinite(d).all():
+        return {K_CROWN_POINTS: int(len(pts)), K_CROWN_P95: None,
+                K_CROWN_MAX: None, K_CROWN_WORST: [],
+                K_CROWN_FAILURE: (getattr(mfg, "LAST_DISTANCE_FAILURE", None)
+                                  or "non-finite distances")}
+    worst = np.argsort(-d, kind="stable")[:WORST_LOCATIONS]
+    ids = np.asarray(ids) if ids is not None else None
+    labels = np.asarray(labels) if labels is not None else None
+    return {
+        K_CROWN_POINTS: int(len(pts)),
+        K_CROWN_P95: float(np.percentile(d, 95)),
+        K_CROWN_MAX: float(d.max()),
+        K_CROWN_WORST: [
+            {"rank": r + 1,
+             "vertex_id": int(ids[i]) if ids is not None else int(i),
+             "tooth": (str(labels[i]) if labels is not None else None),
+             "position": [round(float(x), 4) for x in pts[i]],
+             "deviation_mm": round(float(d[i]), 5)}
+            for r, i in enumerate(worst)],
+        K_CROWN_FAILURE: None,
+    }
+
+
+def measure_solid(blob: bytes, tooth_points=None, tooth_ids=None,
+                  tooth_labels=None, u_occ=None) -> dict:
+    """Every step-3 measurement, on the RE-READ bytes.
+
+    `tooth_points`  the planned (moved) position of every tooth vertex, float64.
+    `tooth_ids` / `tooth_labels`  per point, for naming the worst locations.
+    `u_occ`  the occlusal axis, for the model height (cusp tips to floor).
+    """
+    mr, mn = _meshlib()
+    t_all = time.perf_counter()
+    out: dict = {K_SOLIDIFIED: True, K_SOLIDIFY_REFUSAL: None}
+
+    # the file, as a reader receives it
+    pv, pf = stl_io.parse_stl_bytes(blob)
+    wv, wf, merged = cg.weld_vertices(pv, pf)
+    out[K_REREAD_VERTICES] = int(len(wv))
+    out[K_TRIANGLES] = int(len(wf))
+    out["reader_weld_merged_vertices"] = int(merged)
+
+    # topology of the file
+    t0 = time.perf_counter()
+    mrep = cg.manifold_report(wf)
+    out[K_OPEN_EDGES] = int(mrep["open_edges"])
+    out[K_NONMANIFOLD_EDGES] = int(mrep["nonmanifold_edges"])
+    out[K_COMPONENTS] = face_components(wf)
+    out[K_WINDING] = bool(cg._winding_is_consistent(wf))
+    t_topo = time.perf_counter() - t0
+
+    # manifold3d
+    t0 = time.perf_counter()
+    solid = _manifold(wv, wf)
+    status = _status_name(solid.status())
+    out[K_MANIFOLD_STATUS] = status
+    if status == "NoError":
+        out[K_BODIES] = int(len(solid.decompose()))
+        out[K_VOLUME] = float(solid.volume())
+    else:
+        out[K_BODIES] = None
+        out[K_VOLUME] = None
+    t_m3 = time.perf_counter() - t0
+
+    # MeshLib self-collision - the exact call, then the pairs only if it hit
+    t0 = time.perf_counter()
+    mesh = mn.meshFromFacesVerts(wf.astype(np.int32), wv.astype(np.float32))
+    hit = mr.findSelfCollidingTriangles(mr.MeshPart(mesh), None)
+    out[K_SELF_COLLIDING] = bool(hit)
+    out[K_SELF_COLLIDING_PAIRS] = None
+    if hit:
+        pairs = mr.findSelfCollidingTriangles(mr.MeshPart(mesh))
+        P = np.array([[int(q.aFace), int(q.bFace)] for q in pairs], np.int64)
+        out[K_SELF_COLLIDING_PAIRS] = int(len(P))
+        out["meshlib_self_colliding_examples"] = [
+            {"faces": [int(a), int(b)],
+             "at": [round(float(x), 3) for x in
+                    wv[wf[[a, b]].ravel()].mean(axis=0)]}
+            for a, b in P[:WORST_LOCATIONS]]
+    t_si = time.perf_counter() - t0
+
+    # crown fidelity
+    t0 = time.perf_counter()
+    out.update(_crown_deviation(tooth_points, tooth_ids, tooth_labels, wv, wf))
+    t_crown = time.perf_counter() - t0
+
+    # model height, cusp tips to floor - a warning only
+    if u_occ is not None and len(wv):
+        u = np.asarray(u_occ, float)
+        u = u / np.linalg.norm(u)
+        h = wv @ u
+        out[K_HEIGHT] = float(h.max() - h.min())
+    else:
+        out[K_HEIGHT] = None
+
+    out["seconds"] = {"topology": round(t_topo, 3), "manifold3d": round(t_m3, 3),
+                      "self_collision": round(t_si, 3),
+                      "crown_fidelity": round(t_crown, 3),
+                      "total": round(time.perf_counter() - t_all, 3)}
+    return out
+
+
+def refused_measurement(refusal: SolidifyRefused) -> dict:
+    """The measurement record of a stage whose cast could not be solidified.
+
+    Every other key is ABSENT, so every other gate fails on a missing
+    measurement exactly as it would on a bad one - and `solidified` fails by
+    name, carrying the refusal.
+    """
+    return {K_SOLIDIFIED: False,
+            K_SOLIDIFY_REFUSAL: {"reason": refusal.reason, **refusal.detail}}
+
+
+# ---------------------------------------------------------------------------
+# The solid's gate - PURE, FAIL-CLOSED
+# ---------------------------------------------------------------------------
+
+def _finite(x) -> bool:
+    # isinstance before comparing: every comparison against NaN is False, so
+    # `x <= limit` alone would PASS a NaN on the negated form (CLAUDE.md).
+    return isinstance(x, (int, float)) and not isinstance(x, bool) \
+        and bool(np.isfinite(x))
+
+
+def solid_gate(m: dict) -> dict:
+    """{gate: {"ok", "measured", "limit"}} for every SOLID_GATES entry, plus
+    the failed names and the advisory warnings. A missing key fails."""
+    m = m or {}
+    p95, mx = m.get(K_CROWN_P95), m.get(K_CROWN_MAX)
+    vol = m.get(K_VOLUME)
+    checks = {
+        "solidified": (m.get(K_SOLIDIFIED) is True,
+                       m.get(K_SOLIDIFY_REFUSAL) or m.get(K_SOLIDIFIED),
+                       "a solid, no refusal"),
+        "solid_manifold_status_ok": (m.get(K_MANIFOLD_STATUS) == "NoError",
+                                     m.get(K_MANIFOLD_STATUS), "NoError"),
+        "solid_single_body": (m.get(K_BODIES) == 1 and not isinstance(m.get(K_BODIES), bool),
+                              m.get(K_BODIES), 1),
+        "solid_positive_volume": (_finite(vol) and vol > 0.0, vol, "> 0"),
+        "solid_no_self_intersection": (m.get(K_SELF_COLLIDING) is False,
+                                       m.get(K_SELF_COLLIDING_PAIRS)
+                                       if m.get(K_SELF_COLLIDING) else m.get(K_SELF_COLLIDING),
+                                       "findSelfCollidingTriangles is False"),
+        "file_zero_open_edges": (m.get(K_OPEN_EDGES) == 0, m.get(K_OPEN_EDGES), 0),
+        "file_zero_nonmanifold_edges": (m.get(K_NONMANIFOLD_EDGES) == 0,
+                                        m.get(K_NONMANIFOLD_EDGES), 0),
+        "file_single_component": (m.get(K_COMPONENTS) == 1, m.get(K_COMPONENTS), 1),
+        "file_consistent_winding": (m.get(K_WINDING) is True, m.get(K_WINDING), True),
+        "crown_fidelity_p95": (_finite(p95) and p95 <= CROWN_DEVIATION_P95_LIMIT_MM,
+                               p95 if p95 is not None else m.get(K_CROWN_FAILURE),
+                               CROWN_DEVIATION_P95_LIMIT_MM),
+        "crown_fidelity_max": (_finite(mx) and mx <= CROWN_DEVIATION_MAX_LIMIT_MM,
+                               mx if mx is not None else m.get(K_CROWN_FAILURE),
+                               CROWN_DEVIATION_MAX_LIMIT_MM),
+    }
+    gates = {name: {"ok": bool(checks[name][0]), "measured": checks[name][1],
+                    "limit": checks[name][2]} for name in SOLID_GATES}
+    h = m.get(K_HEIGHT)
+    advisory = {
+        "model_height_mm": h,
+        "model_height_warn_mm": MODEL_HEIGHT_WARN_MM,
+        # None when unmeasured - a warning that could not be evaluated is not
+        # a clear bill.
+        "model_height_over_limit": (bool(h > MODEL_HEIGHT_WARN_MM)
+                                    if _finite(h) else None),
+    }
+    return {"gates": gates,
+            "failed_gates": [g for g in SOLID_GATES if not gates[g]["ok"]],
+            "advisory": advisory}
