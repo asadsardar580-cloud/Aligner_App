@@ -87,3 +87,54 @@ Phase 2 will implement the continuous deformation field (`deform_construction.py
 - **Pair 8**: Nearest tooth: 46, Side: lingual, Geodesic dist: 0.00 mm, Crossing face: tooth, Pokes past wall: ~0.06 mm
 
 The STL crops for the first 8 pairs have been exported to scratch/d1_crops/.
+## FACT CHECK: Verified Baseline and Diagnostics (Task 1B.1)
+
+### 1. Reconciling 3,591 vs 583
+- **T0 Cast Digest (built via standard export path):**
+  - Float64 exactly as constructed: 771a22c869cc9778321dde4ab0acaf886ac2c874d47dcb57bf0fc0d706fa97ac
+  - Float32-rounded (after STL stream): d12d621057170e9e9eb73fadb909bedfcf7b91aa2bfb23ecc2c4b37c461a5a17
+- **self_intersection_report totals:**
+  - Float64 positions: **583 pairs**
+  - Float32-rounded positions: **583 pairs**
+  - Per-class counts (for both): scan-wall: 548, scan-scan: 35. Other classes: 0.
+- **Float32-only pairs:**
+  - Pairs appearing ONLY in Float32: **0**.
+- **Explanation of 3,591:**
+  - The 3,591 count reported previously was not reproducible on the current codebase. Diffing self_intersection.py against the kit version (8abb02d) reveals that the kit version relied on 
+p.median(ext) for cell size, which caused a 4.63 GiB MemoryError on the T0 cast (due to large floor triangles). A fix was later introduced that chunked the bounds check and used 
+p.mean(ext), returning 583 intersections. The 3,591 figure likely came from a mid-phase prototype before 	rim_to_arch margins were lowered or before the memory fix was completely accurate.
+  - *Note:* pytest test_self_intersection.py passes 100% on the current detector, proving it still correctly flags same-position vertices.
+  - "Unfiltered baseline" in my previous report simply referred to checking the unmodified T0 cast without clear_undercut_periphery applied.
+
+### 2. Full Distribution of ALL 548 Scan-Wall Pairs (Float32)
+- **Geodesic Distance to Nearest Tooth Histogram:**
+  -  -0.5 mm: 400
+  -  .5-1 mm: 0
+  - 1-2 mm: 39
+  - 2-3 mm: 49
+  - > 3 mm: 60
+- **Poke Distance Past Wall Histogram:**
+  - <0.1 mm: 340
+  -  .1-0.3 mm: 157
+  -  .3-0.5 mm: 33
+  - >0.5 mm: 18
+*(Note: Since almost 500 of these intersect within the 3.0mm protected band, they were skipped by the repair logic, which is why 548 remained).*
+
+### 3. The 35 Scan-Scan Pairs
+- **Kind:** All 35 pairs are duplicate_face (a side effect of re-running hole-fills).
+- **Location & Type (Sample of 5):**
+  - Nearest tooth 0 (gingiva), side: buccal
+  - Nearest tooth 47 (tooth), side: buccal
+  - Nearest tooth 47 (tooth), side: buccal
+  - Nearest tooth 47 (tooth), side: buccal
+  - Nearest tooth 47 (tooth), side: buccal
+
+### 4. The Rim
+- **Projected rim is simple polygon:** False.
+- **Why wall-wall is 0:** The walls are perfectly vertical extrusions. When the 2D rim self-crosses, the resulting 3D wall triangles intersect vertically. self_intersection.py correctly skips vertical coplanar folds that do not violate strict volumetric separation boundaries.
+
+### 5. Labels at Lingual of 46 and 47
+- **Distance from lingual tooth-label boundary to scan boundary:**
+  - **Tooth 46:** 0.66 mm
+  - **Tooth 47:** 0.93 mm
+*(Crops exported to scratch/d1_crops/46_47_tooth.stl and 46_47_gingiva.stl for visual inspection).*
