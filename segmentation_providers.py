@@ -425,6 +425,41 @@ _REGISTRY = {p.name: p for p in (ToothGroupNetworkProvider(),
 #: has no such annotation (CLAUDE.md s.17). An unrecognised value is ignored
 #: rather than obeyed: a typo in an environment variable must not silently
 #: change which model segments a patient's arch.
+#: THE PROVIDER THAT DECIDES THE TOOTH/GUM BOUNDARY, chosen by measurement.
+#:
+#: Measured on `case_lower.stl` through the whole corrected path - model,
+#: hybrid step, cleanup - scored on the occlusal band (0-4mm below the cusp
+#: tips, must be >= 85% tooth) and the gingival band (12-18mm, must be >= 90%
+#: gum):
+#:
+#:                     teeth   raw            after cleanup
+#:   ToothGroupNetwork    12   91.86 / 100.0  84.58 / 100.0   FAILS
+#:   CrossTooth           16   93.19 / 100.0  93.66 / 100.0   passes
+#:
+#: BOTH MODELS GET THE BOUNDARY RIGHT; what separates them is that TGN MERGES
+#: TEETH on this scan. Its FDI 37 is two connected regions of 6,822 and 5,134
+#: faces and its FDI 44 is 12,642 and 11,247 - two real teeth under one label
+#: each, which s.24.3 also recorded. The cleanup's first rule keeps one region
+#: per tooth, so on those labels it must discard 16,381 faces of real enamel,
+#: and the occlusal band falls below its bar. CrossTooth has no merged label
+#: at all: its cleanup touched 307 vertices against TGN's 8,814.
+#:
+#: NOT AN ACCURACY CLAIM, and it cannot be one - no segmentation model here
+#: has been scored against an independent annotation and none can be (s.17,
+#: s.25.6). This is the tooth/gum boundary and region structure, both
+#: checkable without ground truth. The FDI NUMBERING is not verified for
+#: either model; the two agree on which side is 3x and which is 4x and
+#: disagree on roughly half the individual numbers (s.26.10).
+#:
+#: >>> COMMERCIAL BLOCKER, UNCHANGED BY THIS CHOICE <<<
+#: `CrossTooth/` carries NO LICENCE, NO COPYING file and no `.git` (s.26.13).
+#: A CVPR paper is not a grant of rights. Making it the default is a
+#: TECHNICAL decision taken on measurements; it does not resolve the licence,
+#: and shipping this model commercially still needs one from the authors.
+#: Set ALIGNER_SEGMENTATION_PROVIDER=toothgroupnetwork to go back.
+DEFAULT_PROVIDER_NAME = CrossToothProvider.name
+
+
 def _default_from_environment():
     import os
     want = (os.environ.get("ALIGNER_SEGMENTATION_PROVIDER") or "").strip().lower()
@@ -433,8 +468,8 @@ def _default_from_environment():
     if want:
         print(f"[segmentation] ALIGNER_SEGMENTATION_PROVIDER={want!r} is not "
               f"a known provider {sorted(_REGISTRY)}; using "
-              f"{ToothGroupNetworkProvider.name}.")
-    return ToothGroupNetworkProvider.name
+              f"{DEFAULT_PROVIDER_NAME}.")
+    return DEFAULT_PROVIDER_NAME
 
 
 DEFAULT_PROVIDER = _default_from_environment()

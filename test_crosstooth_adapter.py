@@ -485,18 +485,67 @@ def test_coherence_says_UNMEASURABLE_rather_than_passing_on_no_teeth():
 # 6. The provider registry and the toggle
 # ===========================================================================
 
-def test_crosstooth_is_registered_and_is_NOT_the_default():
-    """The shipped model stays default until a benchmark says otherwise.
+def test_crosstooth_is_registered_and_is_NOW_the_default():
+    """CHANGED, and on a measurement rather than a preference.
 
-    And there is no such benchmark, because it needs an independent
-    annotation this repository does not have.
+    This test previously asserted the opposite, and its reason was sound at
+    the time: CrossTooth won every geometric measure and was 19x faster, and
+    that is not grounds to pick the model that decides where a clinician cuts
+    (s.25.9). What changed is that a NEW measurement exists which is about
+    the thing the app actually needs from a segmentation - the tooth/gum
+    boundary - and which needs no annotation to take.
+
+    Scored on `case_lower.stl` through the whole path, model then hybrid then
+    cleanup, on the occlusal band (>= 85% tooth) and the gingival band
+    (>= 90% gum):
+
+        ToothGroupNetwork   84.58 / 100.0   FAILS the occlusal band
+        CrossTooth          93.66 / 100.0   passes both
+
+    Both models get the boundary itself right; TGN loses because it MERGES
+    TEETH on this scan - its FDI 37 is two connected regions of 6,822 and
+    5,134 faces, its FDI 44 is 12,642 and 11,247 - so keeping one region per
+    tooth must discard 16,381 faces of real enamel.
+
+    STILL NOT AN ACCURACY CLAIM. No model here has been scored against an
+    independent annotation and none can be (s.17, s.25.6). The FDI NUMBERING
+    remains unverified for both; this is the boundary and the region
+    structure, both checkable without ground truth.
     """
     reg = sp.registry()
     assert "crosstooth" in reg
-    assert sp.DEFAULT_PROVIDER == "toothgroupnetwork"
-    assert [k for k, v in reg.items() if v["default"]] == ["toothgroupnetwork"]
+    assert sp.DEFAULT_PROVIDER == "crosstooth"
+    assert [k for k, v in reg.items() if v["default"]] == ["crosstooth"]
     assert sp.get("crosstooth") is sp.get("CrossTooth")
+    # The shipped model must stay REACHABLE, not merely present: it is the
+    # fallback if the licence question (s.26.13) forces CrossTooth out.
+    assert sp.get("toothgroupnetwork").name == "toothgroupnetwork"
     print(f"PASS  registry {sorted(reg)}, default {sp.DEFAULT_PROVIDER}")
+
+
+def test_the_default_switch_does_not_resolve_the_licence():
+    """s.26.13: `CrossTooth/` carries no LICENSE, no COPYING and no `.git`.
+
+    Making it the default is a TECHNICAL decision taken on measurements. It
+    does not grant any rights, and this test exists so that nobody reads the
+    switch as having settled the question.
+    """
+    import os
+
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CrossTooth")
+    if not os.path.isdir(root):
+        import pytest
+        pytest.skip("CrossTooth/ is not in this checkout")
+    names = {n.lower() for n in os.listdir(root)}
+    assert not {n for n in names if n.startswith(("license", "licence", "copying"))}, (
+        "a licence file has appeared - re-read s.26.13, the commercial "
+        "blocker may be resolved and this test should be updated deliberately")
+    src = sp.__file__
+    with open(src, encoding="utf-8") as fh:
+        text = fh.read()
+    assert "COMMERCIAL BLOCKER" in text, \
+        "the licence caveat was removed from the provider registry"
+    print("PASS  default switched; licence still unresolved and still stated")
 
 
 def test_the_crosstooth_audit_declares_the_quadrant_naming_UNVERIFIED():
@@ -528,10 +577,14 @@ def test_the_environment_default_ignores_a_value_it_does_not_recognise():
     try:
         os.environ["ALIGNER_SEGMENTATION_PROVIDER"] = "crosstooth"
         assert sp._default_from_environment() == "crosstooth"
+        os.environ["ALIGNER_SEGMENTATION_PROVIDER"] = "toothgroupnetwork"
+        assert sp._default_from_environment() == "toothgroupnetwork"
+        # A typo falls back to the module's own default, whatever that is -
+        # the property under test is that it is IGNORED, not which model wins.
         os.environ["ALIGNER_SEGMENTATION_PROVIDER"] = "not-a-model"
-        assert sp._default_from_environment() == "toothgroupnetwork"
+        assert sp._default_from_environment() == sp.DEFAULT_PROVIDER_NAME
         os.environ["ALIGNER_SEGMENTATION_PROVIDER"] = ""
-        assert sp._default_from_environment() == "toothgroupnetwork"
+        assert sp._default_from_environment() == sp.DEFAULT_PROVIDER_NAME
     finally:
         os.environ.pop("ALIGNER_SEGMENTATION_PROVIDER", None)
         if old is not None:
@@ -699,7 +752,7 @@ def test_the_ai_status_payload_carries_the_registry_for_the_picker():
     import api_core
 
     st = api_core.ai_status()
-    assert st["default_provider"] == "toothgroupnetwork"
+    assert st["default_provider"] == sp.DEFAULT_PROVIDER
     assert set(st["providers"]) == set(sp.registry())
     assert st["providers"]["crosstooth"]["available"] is True
     assert st["providers"]["meshsegnet"]["available"] is False

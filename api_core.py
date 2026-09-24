@@ -29,6 +29,7 @@ import segmentation_review
 import segmentation_fallback
 import segmentation_providers
 import segmentation_diagnostics
+import segmentation_cleanup
 import benchmark_segmentation
 import scan_cache_manager
 import clinical_safety
@@ -656,7 +657,28 @@ async def segment(sid: str, provider: str = None):
             arch_centre=centre, occlusal_axis=occ)
         labels = hybrid["labels"]
 
+        # --- CLEANUP: one region per tooth, and no specks -----------------
+        # Two complaints with one cause. A tooth label that falls into
+        # several pieces has exactly one real tooth in it; the rest are stray
+        # triangles on a neighbour or out on the gingiva. And gingiva specks
+        # scattered over a crown are individually tiny and collectively the
+        # first thing a clinician sees - they make the cervical rim ragged
+        # where it matters most.
+        #
+        # AFTER the hybrid step, not before: the hybrid may hand a tooth back
+        # to manual landmarks, and cleaning a region that is about to be
+        # replaced would be work thrown away. Labels only - no vertex moves,
+        # no face is added or removed, and the array comes back the same
+        # length, so every vertex id the client holds keeps its meaning.
+        try:
+            labels, cleanup = segmentation_cleanup.clean_labels(v, f, labels)
+        except Exception as e:                            # noqa: BLE001
+            # Reported, never swallowed: a cleanup that could not run must
+            # not look like a cleanup that found nothing to do.
+            cleanup = {"error": f"{type(e).__name__}: {e}"}
+
         STORE.put(sid, "labels", labels)
+        STORE.put(sid, "segmentation_cleanup", cleanup)
         STORE.put(sid, "segmentation_tiers", hybrid["teeth"])
         # The spatial diagnostic, computed on what the session will actually
         # hold. A label array that is not indexed to this mesh is a different
@@ -667,6 +689,17 @@ async def segment(sid: str, provider: str = None):
         except Exception as e:                            # noqa: BLE001
             diag = {"error": f"{type(e).__name__}: {e}"}
         diag["label_transfer"] = transfer
+        # IS THE GUM LABELLED GUM? A different question from "is this label
+        # spatially coherent", answerable with no annotation, and the one a
+        # clinician notices first. Measured on what the session will actually
+        # hold, against the session's own occlusal frame when there is one.
+        try:
+            diag["bands"] = segmentation_diagnostics.band_report(
+                v, f, labels, u_occ=occ)
+        except Exception as e:                            # noqa: BLE001
+            diag["bands"] = {"measured": False,
+                             "reason": f"{type(e).__name__}: {e}"}
+        diag["cleanup"] = cleanup
         # THE PROVIDER THAT ACTUALLY RAN, not the configured default. Those
         # were the same value for as long as there was one provider, and
         # recording the default would now mislabel every A/B run.
@@ -696,6 +729,8 @@ async def segment(sid: str, provider: str = None):
             "segmentation_confidence_breakdown": _jsonable(
                 benchmark_segmentation.confidence_breakdown(
                     labels, v, f, arch, centre, occ)),
+            "cleanup": _jsonable(cleanup),
+            "bands": _jsonable(diag.get("bands")),
             "fallback": _jsonable({k: hybrid[k] for k in
                                    ("teeth", "repaired_count", "needs_review",
                                     "tiers", "threshold", "limitation")}),

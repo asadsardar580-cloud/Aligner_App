@@ -181,14 +181,24 @@ def test_the_audit_says_what_is_NOT_verified_rather_than_guessing():
     print("PASS  the MeshSegNet audit names its own gaps")
 
 
-def test_the_registry_has_exactly_one_default_and_it_is_the_shipped_model():
+def test_the_registry_has_EXACTLY_ONE_default_and_get_resolves_to_it():
+    """The property is that there is ONE default and `get()` returns it.
+
+    It used to name the model as well, which made it a second place to edit
+    every time the choice is revisited on a measurement - and the choice is
+    now CrossTooth, on the tooth/gum band scores in
+    `test_crosstooth_adapter.test_crosstooth_is_registered_and_is_NOW_the_default`.
+    Which model wins belongs in that one test, with its numbers; this one
+    guards the invariant.
+    """
     reg = sp.registry()
     defaults = [k for k, v in reg.items() if v["default"]]
-    assert defaults == ["toothgroupnetwork"], defaults
-    assert sp.get() is sp.get("toothgroupnetwork")
+    assert len(defaults) == 1, defaults
+    assert defaults == [sp.DEFAULT_PROVIDER], (defaults, sp.DEFAULT_PROVIDER)
+    assert sp.get() is sp.get(sp.DEFAULT_PROVIDER)
     with pytest.raises(KeyError):
         sp.get("tcatseg")
-    print(f"PASS  registry: {sorted(reg)}, default {defaults[0]}")
+    print(f"PASS  registry: {sorted(reg)}, exactly one default {defaults[0]}")
 
 
 # ===========================================================================
